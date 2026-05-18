@@ -12,6 +12,7 @@ use crate::domain::projection::{MemberSummaryProjection, ProjectionCheckpoint};
 use crate::domain::role_catalog::RoleCatalogEntry;
 use crate::domain::shared::ids::{GlobalMemberId, OutboxEventId, RoleId};
 use crate::domain::shared::metadata::CommandMetadata;
+use crate::domain::shared::pagination::NormalizedPageRequest;
 use crate::domain::timeline::LifecycleHistoryEntry;
 use crate::error::IdentityError;
 
@@ -145,6 +146,13 @@ pub trait AuditTraceRepository {
         &mut self,
         entry: &AuditTraceEntry,
     ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
+
+    /// Lists one member's audit traces in reverse chronological order.
+    fn list_by_member(
+        &mut self,
+        global_member_id: &GlobalMemberId,
+        page: &NormalizedPageRequest,
+    ) -> impl std::future::Future<Output = Result<Vec<AuditTraceEntry>, IdentityError>> + Send;
 }
 
 /// Provides idempotency lookup and success recording within the local transaction boundary.

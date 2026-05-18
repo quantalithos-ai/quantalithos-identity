@@ -28,6 +28,7 @@ use crate::domain::shared::ids::{
     ProjectId, RoleId,
 };
 use crate::domain::shared::metadata::CommandMetadata;
+use crate::domain::shared::pagination::NormalizedPageRequest;
 use crate::domain::timeline::{LifecycleEventType, LifecycleHistoryEntry};
 use crate::error::IdentityError;
 
@@ -848,6 +849,102 @@ impl AuditTraceRepository for SqlxAuditTraceRepository<'_, '_> {
         .map_err(IdentityError::DatabasePool)?;
 
         Ok(())
+    }
+
+    async fn list_by_member(
+        &mut self,
+        global_member_id: &GlobalMemberId,
+        page: &NormalizedPageRequest,
+    ) -> Result<Vec<AuditTraceEntry>, IdentityError> {
+        let limit = i64::from(page.limit);
+
+        let rows = if let Some(cursor_audit_trace_id) = page.cursor.as_deref() {
+            let cursor_row = sqlx::query(
+                r#"
+                SELECT created_at, audit_trace_id
+                FROM audit_trace_entries
+                WHERE audit_trace_id = $1
+                "#,
+            )
+            .bind(cursor_audit_trace_id)
+            .fetch_optional(self.transaction.as_mut())
+            .await
+            .map_err(IdentityError::DatabasePool)?;
+
+            let Some(cursor_row) = cursor_row else {
+                return Ok(Vec::new());
+            };
+            let cursor_created_at: PrimitiveDateTime = cursor_row.get("created_at");
+            let cursor_audit_trace_id: String = cursor_row.get("audit_trace_id");
+
+            sqlx::query(
+                r#"
+                SELECT
+                    audit_trace_id,
+                    trace_id,
+                    action,
+                    actor_json,
+                    target_ref_json,
+                    source_module,
+                    result,
+                    reason,
+                    created_at
+                FROM audit_trace_entries
+                WHERE (
+                    target_ref_json ->> 'global_member_id' = $1
+                    OR (
+                        target_ref_json ->> 'kind' = 'global_member'
+                        AND target_ref_json ->> 'id' = $1
+                    )
+                )
+                  AND (
+                    created_at < $2
+                    OR (created_at = $2 AND audit_trace_id < $3)
+                  )
+                ORDER BY created_at DESC, audit_trace_id DESC
+                LIMIT $4
+                "#,
+            )
+            .bind(global_member_id.as_str())
+            .bind(cursor_created_at)
+            .bind(cursor_audit_trace_id)
+            .bind(limit)
+            .fetch_all(self.transaction.as_mut())
+            .await
+            .map_err(IdentityError::DatabasePool)?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT
+                    audit_trace_id,
+                    trace_id,
+                    action,
+                    actor_json,
+                    target_ref_json,
+                    source_module,
+                    result,
+                    reason,
+                    created_at
+                FROM audit_trace_entries
+                WHERE (
+                    target_ref_json ->> 'global_member_id' = $1
+                    OR (
+                        target_ref_json ->> 'kind' = 'global_member'
+                        AND target_ref_json ->> 'id' = $1
+                    )
+                )
+                ORDER BY created_at DESC, audit_trace_id DESC
+                LIMIT $2
+                "#,
+            )
+            .bind(global_member_id.as_str())
+            .bind(limit)
+            .fetch_all(self.transaction.as_mut())
+            .await
+            .map_err(IdentityError::DatabasePool)?
+        };
+
+        rows.into_iter().map(map_audit_trace_row).collect()
     }
 }
 
@@ -1739,8 +1836,7 @@ fn _map_lifecycle_history_row(
     })
 }
 
-#[allow(dead_code)]
-fn _map_audit_trace_row(row: sqlx::postgres::PgRow) -> Result<AuditTraceEntry, IdentityError> {
+fn map_audit_trace_row(row: sqlx::postgres::PgRow) -> Result<AuditTraceEntry, IdentityError> {
     let result_value: String = row.get("result");
     let result = AuditResult::from_db(&result_value).ok_or(IdentityError::PersistenceData {
         message: format!("unknown audit result `{result_value}`"),
