@@ -1019,6 +1019,7 @@ mod tests {
                 idempotency_records,
                 audit_trace_entries,
                 lifecycle_history_entries,
+                memory_refs,
                 capability_profiles,
                 global_members,
                 role_catalog_entries

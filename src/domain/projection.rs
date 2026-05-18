@@ -123,6 +123,48 @@ impl MemberSummaryProjection {
 
                 Ok(Some(projection))
             }
+            "identity.memory_refs.updated" => {
+                let payload: MemoryRefsUpdatedProjectionPayload =
+                    serde_json::from_value(event.payload_json.clone()).map_err(|error| {
+                        IdentityError::PersistenceData {
+                            message: format!(
+                                "invalid memory-refs outbox payload for `{}`: {error}",
+                                event.outbox_event_id.as_str()
+                            ),
+                        }
+                    })?;
+                let lifecycle = GlobalMemberLifecycle::from_db(payload.lifecycle.as_str()).ok_or(
+                    IdentityError::PersistenceData {
+                        message: format!(
+                            "invalid lifecycle `{}` in memory-refs outbox payload for `{}`",
+                            payload.lifecycle,
+                            event.outbox_event_id.as_str()
+                        ),
+                    },
+                )?;
+
+                let mut projection = existing_projection.unwrap_or(Self {
+                    global_member_id: GlobalMemberId::new(payload.global_member_id.clone()),
+                    display_name: payload.display_name.clone(),
+                    lifecycle,
+                    main_role_id: Some(RoleId::new(payload.main_role_id.clone())),
+                    main_role_name: None,
+                    capability_summary_json: json!({}),
+                    career_summary_json: json!({}),
+                    memory_ref_summary_json: json!({}),
+                    projection_version: payload.version,
+                    updated_at: rebuilt_at,
+                });
+                projection.global_member_id = GlobalMemberId::new(payload.global_member_id);
+                projection.display_name = payload.display_name;
+                projection.lifecycle = lifecycle;
+                projection.main_role_id = Some(RoleId::new(payload.main_role_id));
+                projection.memory_ref_summary_json = payload.memory_ref_summary_json;
+                projection.projection_version = payload.version;
+                projection.updated_at = rebuilt_at;
+
+                Ok(Some(projection))
+            }
             "identity.role_catalog.synced" => Ok(None),
             other => Err(IdentityError::PersistenceData {
                 message: format!(
@@ -244,5 +286,15 @@ struct CapabilityProfileUpdatedProjectionPayload {
     lifecycle: String,
     main_role_id: String,
     capability_summary_json: Value,
+    version: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryRefsUpdatedProjectionPayload {
+    global_member_id: String,
+    display_name: String,
+    lifecycle: String,
+    main_role_id: String,
+    memory_ref_summary_json: Value,
     version: i64,
 }

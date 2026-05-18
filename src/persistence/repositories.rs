@@ -7,13 +7,14 @@ use time::{OffsetDateTime, PrimitiveDateTime};
 use crate::application::persistence::{
     AuditTraceRepository, CapabilityProfileRepository, GlobalMemberRepository, IdempotencyStore,
     InboundDeadLetterStore, LifecycleHistoryRepository, MemberSummaryProjectionRepository,
-    OutboxStore, ProjectionCheckpointRepository, RoleCatalogRepository,
+    MemoryRefsRepository, OutboxStore, ProjectionCheckpointRepository, RoleCatalogRepository,
 };
 use crate::domain::audit::{AuditResult, AuditTraceEntry};
 use crate::domain::capability_profile::{ArtifactRef, CapabilityItem, CapabilityProfile};
 use crate::domain::dead_letter::{DeadLetterReplayStatus, InboundDeadLetter};
 use crate::domain::idempotency::{IdempotencyRecord, IdempotencyScope, IdempotencyStatus};
 use crate::domain::member::{GlobalMember, GlobalMemberLifecycle};
+use crate::domain::memory_refs::{ArchiveRef, ArchiveStatus, MemoryRef, MemoryRefs};
 use crate::domain::outbox::{OutboxEvent, OutboxStatus};
 use crate::domain::projection::{
     MemberSummaryProjection, ProjectionCheckpoint, ProjectionCheckpointStatus,
@@ -21,7 +22,7 @@ use crate::domain::projection::{
 use crate::domain::role_catalog::{RoleCatalogEntry, RoleCatalogStatus};
 use crate::domain::shared::context::ActorContext;
 use crate::domain::shared::ids::{
-    CapabilityProfileId, EventId, GlobalMemberId, OutboxEventId, RoleId,
+    CapabilityProfileId, EventId, GlobalMemberId, MemoryRefsId, OutboxEventId, RoleId,
 };
 use crate::domain::shared::metadata::CommandMetadata;
 use crate::domain::timeline::{LifecycleEventType, LifecycleHistoryEntry};
@@ -447,6 +448,187 @@ impl CapabilityProfileRepository for SqlxCapabilityProfileRepository<'_, '_> {
         if result.rows_affected() == 0 {
             return Err(IdentityError::VersionConflict {
                 entity: "capability_profile".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+/// Memory-refs repository bound to an open SQL transaction.
+pub struct SqlxMemoryRefsRepository<'tx, 'db> {
+    transaction: &'tx mut Transaction<'db, Postgres>,
+}
+
+impl<'tx, 'db> SqlxMemoryRefsRepository<'tx, 'db> {
+    /// Creates a repository facade over the provided SQL transaction.
+    pub fn new(transaction: &'tx mut Transaction<'db, Postgres>) -> Self {
+        Self { transaction }
+    }
+}
+
+impl MemoryRefsRepository for SqlxMemoryRefsRepository<'_, '_> {
+    async fn get_by_member(
+        &mut self,
+        global_member_id: &GlobalMemberId,
+    ) -> Result<Option<MemoryRefs>, IdentityError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                memory_refs_id,
+                global_member_id,
+                semantic_memory_ref_json,
+                episodic_memory_refs_json,
+                archive_ref_json,
+                archive_status,
+                version,
+                updated_at
+            FROM memory_refs
+            WHERE global_member_id = $1
+            "#,
+        )
+        .bind(global_member_id.as_str())
+        .fetch_optional(self.transaction.as_mut())
+        .await
+        .map_err(IdentityError::DatabasePool)?;
+
+        row.map(map_memory_refs_row).transpose()
+    }
+
+    async fn get_for_update_by_member(
+        &mut self,
+        global_member_id: &GlobalMemberId,
+    ) -> Result<Option<MemoryRefs>, IdentityError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                memory_refs_id,
+                global_member_id,
+                semantic_memory_ref_json,
+                episodic_memory_refs_json,
+                archive_ref_json,
+                archive_status,
+                version,
+                updated_at
+            FROM memory_refs
+            WHERE global_member_id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(global_member_id.as_str())
+        .fetch_optional(self.transaction.as_mut())
+        .await
+        .map_err(IdentityError::DatabasePool)?;
+
+        row.map(map_memory_refs_row).transpose()
+    }
+
+    async fn insert(&mut self, memory_refs: &MemoryRefs) -> Result<(), IdentityError> {
+        let semantic_memory_ref_json = memory_refs
+            .semantic_memory_ref
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| IdentityError::PersistenceData {
+                message: format!("serialize semantic memory ref: {error}"),
+            })?;
+        let episodic_memory_refs_json = serde_json::to_value(&memory_refs.episodic_memory_refs)
+            .map_err(|error| IdentityError::PersistenceData {
+                message: format!("serialize episodic memory refs: {error}"),
+            })?;
+        let archive_ref_json = memory_refs
+            .archive_ref
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| IdentityError::PersistenceData {
+                message: format!("serialize archive ref: {error}"),
+            })?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO memory_refs (
+                memory_refs_id,
+                global_member_id,
+                semantic_memory_ref_json,
+                episodic_memory_refs_json,
+                archive_ref_json,
+                archive_status,
+                version,
+                updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            "#,
+        )
+        .bind(memory_refs.memory_refs_id.as_str())
+        .bind(memory_refs.global_member_id.as_str())
+        .bind(semantic_memory_ref_json)
+        .bind(episodic_memory_refs_json)
+        .bind(archive_ref_json)
+        .bind(memory_refs.archive_status.as_db())
+        .bind(memory_refs.version)
+        .bind(memory_refs.updated_at)
+        .execute(self.transaction.as_mut())
+        .await
+        .map_err(IdentityError::DatabasePool)?;
+
+        Ok(())
+    }
+
+    async fn save(
+        &mut self,
+        memory_refs: &MemoryRefs,
+        expected_version: i64,
+    ) -> Result<(), IdentityError> {
+        let semantic_memory_ref_json = memory_refs
+            .semantic_memory_ref
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| IdentityError::PersistenceData {
+                message: format!("serialize semantic memory ref: {error}"),
+            })?;
+        let episodic_memory_refs_json = serde_json::to_value(&memory_refs.episodic_memory_refs)
+            .map_err(|error| IdentityError::PersistenceData {
+                message: format!("serialize episodic memory refs: {error}"),
+            })?;
+        let archive_ref_json = memory_refs
+            .archive_ref
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| IdentityError::PersistenceData {
+                message: format!("serialize archive ref: {error}"),
+            })?;
+
+        let result = sqlx::query(
+            r#"
+            UPDATE memory_refs
+            SET
+                semantic_memory_ref_json = $2,
+                episodic_memory_refs_json = $3,
+                archive_ref_json = $4,
+                archive_status = $5,
+                version = $6,
+                updated_at = $7
+            WHERE memory_refs_id = $1
+              AND version = $8
+            "#,
+        )
+        .bind(memory_refs.memory_refs_id.as_str())
+        .bind(semantic_memory_ref_json)
+        .bind(episodic_memory_refs_json)
+        .bind(archive_ref_json)
+        .bind(memory_refs.archive_status.as_db())
+        .bind(memory_refs.version)
+        .bind(memory_refs.updated_at)
+        .bind(expected_version)
+        .execute(self.transaction.as_mut())
+        .await
+        .map_err(IdentityError::DatabasePool)?;
+
+        if result.rows_affected() == 0 {
+            return Err(IdentityError::VersionConflict {
+                entity: "memory_refs".to_string(),
             });
         }
 
@@ -1185,6 +1367,46 @@ fn map_capability_profile_row(
         global_member_id: GlobalMemberId::new(row.get::<String, _>("global_member_id")),
         capabilities,
         evidence_refs,
+        version: row.get("version"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn map_memory_refs_row(row: sqlx::postgres::PgRow) -> Result<MemoryRefs, IdentityError> {
+    let semantic_memory_ref_json: Option<Value> = row.get("semantic_memory_ref_json");
+    let episodic_memory_refs_json: Value = row.get("episodic_memory_refs_json");
+    let archive_ref_json: Option<Value> = row.get("archive_ref_json");
+    let archive_status_value: String = row.get("archive_status");
+    let archive_status =
+        ArchiveStatus::from_db(&archive_status_value).ok_or(IdentityError::PersistenceData {
+            message: format!("unknown archive status `{archive_status_value}`"),
+        })?;
+    let semantic_memory_ref = semantic_memory_ref_json
+        .filter(|value| !value.is_null())
+        .map(serde_json::from_value::<MemoryRef>)
+        .transpose()
+        .map_err(|error| IdentityError::PersistenceData {
+            message: format!("decode semantic memory ref json: {error}"),
+        })?;
+    let episodic_memory_refs: Vec<MemoryRef> = serde_json::from_value(episodic_memory_refs_json)
+        .map_err(|error| IdentityError::PersistenceData {
+            message: format!("decode episodic memory refs json: {error}"),
+        })?;
+    let archive_ref = archive_ref_json
+        .filter(|value| !value.is_null())
+        .map(serde_json::from_value::<ArchiveRef>)
+        .transpose()
+        .map_err(|error| IdentityError::PersistenceData {
+            message: format!("decode archive ref json: {error}"),
+        })?;
+
+    Ok(MemoryRefs {
+        memory_refs_id: MemoryRefsId::new(row.get::<String, _>("memory_refs_id")),
+        global_member_id: GlobalMemberId::new(row.get::<String, _>("global_member_id")),
+        semantic_memory_ref,
+        episodic_memory_refs,
+        archive_ref,
+        archive_status,
         version: row.get("version"),
         updated_at: row.get("updated_at"),
     })

@@ -284,6 +284,17 @@ impl GlobalMember {
         self.updated_at = current_timestamp();
     }
 
+    /// Links the stable memory-refs id onto the member write model.
+    pub fn link_memory_refs(&mut self, memory_refs_id: MemoryRefsId) {
+        if self.memory_refs_id.as_ref() == Some(&memory_refs_id) {
+            return;
+        }
+
+        self.memory_refs_id = Some(memory_refs_id);
+        self.version += 1;
+        self.updated_at = current_timestamp();
+    }
+
     fn apply_lifecycle_transition(&mut self, target_lifecycle: GlobalMemberLifecycle) {
         self.lifecycle = target_lifecycle;
         self.version += 1;

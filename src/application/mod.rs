@@ -2,6 +2,7 @@
 
 pub mod capability_profile;
 pub mod member_lifecycle;
+pub mod memory_refs;
 pub mod persistence;
 pub mod query_projection;
 pub mod role_catalog_sync;

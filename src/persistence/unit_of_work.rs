@@ -7,8 +7,8 @@ use crate::error::IdentityError;
 use crate::persistence::repositories::{
     SqlxAuditTraceRepository, SqlxCapabilityProfileRepository, SqlxGlobalMemberRepository,
     SqlxIdempotencyStore, SqlxInboundDeadLetterStore, SqlxLifecycleHistoryRepository,
-    SqlxMemberSummaryProjectionRepository, SqlxOutboxStore, SqlxProjectionCheckpointRepository,
-    SqlxRoleCatalogRepository,
+    SqlxMemberSummaryProjectionRepository, SqlxMemoryRefsRepository, SqlxOutboxStore,
+    SqlxProjectionCheckpointRepository, SqlxRoleCatalogRepository,
 };
 
 /// Creates PostgreSQL transaction-scoped units of work for write-model operations.
@@ -47,6 +47,10 @@ impl<'db> crate::application::persistence::UnitOfWork for SqlxUnitOfWork<'db> {
         Self: 'a;
     type CapabilityProfiles<'a>
         = SqlxCapabilityProfileRepository<'a, 'db>
+    where
+        Self: 'a;
+    type MemoryRefs<'a>
+        = SqlxMemoryRefsRepository<'a, 'db>
     where
         Self: 'a;
     type LifecycleHistory<'a>
@@ -88,6 +92,10 @@ impl<'db> crate::application::persistence::UnitOfWork for SqlxUnitOfWork<'db> {
 
     fn capability_profiles(&mut self) -> Self::CapabilityProfiles<'_> {
         SqlxCapabilityProfileRepository::new(&mut self.transaction)
+    }
+
+    fn memory_refs(&mut self) -> Self::MemoryRefs<'_> {
+        SqlxMemoryRefsRepository::new(&mut self.transaction)
     }
 
     fn lifecycle_history(&mut self) -> Self::LifecycleHistory<'_> {
@@ -160,8 +168,8 @@ mod tests {
     use crate::application::persistence::{
         AuditTraceRepository, CapabilityProfileRepository, GlobalMemberRepository,
         IdempotencyStore, InboundDeadLetterStore, LifecycleHistoryRepository,
-        MemberSummaryProjectionRepository, OutboxStore, ProjectionCheckpointRepository,
-        RoleCatalogRepository, UnitOfWork, UnitOfWorkFactory,
+        MemberSummaryProjectionRepository, MemoryRefsRepository, OutboxStore,
+        ProjectionCheckpointRepository, RoleCatalogRepository, UnitOfWork, UnitOfWorkFactory,
     };
     use crate::config::AppConfig;
     use crate::domain::audit::{AuditResult, AuditTraceEntry};
@@ -169,12 +177,13 @@ mod tests {
     use crate::domain::dead_letter::{DeadLetterReplayStatus, InboundDeadLetter};
     use crate::domain::idempotency::{IdempotencyScope, IdempotencyStatus};
     use crate::domain::member::{GlobalMember, GlobalMemberLifecycle};
+    use crate::domain::memory_refs::{ArchiveStatus, MemoryRef, MemoryRefs};
     use crate::domain::outbox::{OutboxEvent, OutboxStatus};
     use crate::domain::projection::{MemberSummaryProjection, ProjectionCheckpointStatus};
     use crate::domain::role_catalog::{RoleCatalogEntry, RoleCatalogStatus};
     use crate::domain::shared::context::{ActorContext, ActorKind};
     use crate::domain::shared::ids::{
-        CapabilityProfileId, DeadLetterId, GlobalMemberId, OutboxEventId, RoleId,
+        CapabilityProfileId, DeadLetterId, GlobalMemberId, MemoryRefsId, OutboxEventId, RoleId,
     };
     use crate::domain::shared::metadata::CommandMetadata;
     use crate::domain::timeline::{LifecycleEventType, LifecycleHistoryEntry};
@@ -415,6 +424,74 @@ mod tests {
         assert!(matches!(
             save_result,
             Err(IdentityError::VersionConflict { entity }) if entity == "capability_profile"
+        ));
+        uow.rollback().await.expect("rollback optimistic-lock test");
+    }
+
+    #[tokio::test]
+    async fn memory_refs_store_round_trips_and_uses_optimistic_locking() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool).await;
+
+        let factory = SqlxUnitOfWorkFactory::new(pool.clone());
+        let actor = ActorContext::new("human/admin-4", ActorKind::HumanUser, None);
+        let member = sample_member(actor);
+        let timestamp = now();
+
+        {
+            let mut uow = factory.begin().await.expect("begin insert transaction");
+            uow.global_members()
+                .insert(&member)
+                .await
+                .expect("insert member for memory refs");
+            uow.memory_refs()
+                .insert(&MemoryRefs {
+                    memory_refs_id: MemoryRefsId::new("memory-refs:member-001"),
+                    global_member_id: member.global_member_id.clone(),
+                    semantic_memory_ref: Some(MemoryRef {
+                        memory_id: "memory-semantic-001".to_string(),
+                        memory_kind: "semantic".to_string(),
+                        memory_version: Some("v1".to_string()),
+                    }),
+                    episodic_memory_refs: vec![MemoryRef {
+                        memory_id: "memory-episodic-001".to_string(),
+                        memory_kind: "episodic".to_string(),
+                        memory_version: Some("v1".to_string()),
+                    }],
+                    archive_ref: None,
+                    archive_status: ArchiveStatus::None,
+                    version: 2,
+                    updated_at: timestamp,
+                })
+                .await
+                .expect("insert memory refs");
+            uow.commit().await.expect("commit memory refs insert");
+        }
+
+        let mut uow = factory.begin().await.expect("begin load transaction");
+        let mut memory_refs = uow
+            .memory_refs()
+            .get_for_update_by_member(&member.global_member_id)
+            .await
+            .expect("load memory refs")
+            .expect("memory refs should exist");
+        assert!(memory_refs.semantic_memory_ref.is_some());
+        assert_eq!(memory_refs.episodic_memory_refs.len(), 1);
+
+        memory_refs.version += 1;
+        memory_refs.updated_at = now();
+        memory_refs.episodic_memory_refs.push(MemoryRef {
+            memory_id: "memory-episodic-002".to_string(),
+            memory_kind: "episodic".to_string(),
+            memory_version: Some("v2".to_string()),
+        });
+        let save_result = uow.memory_refs().save(&memory_refs, 999).await;
+        assert!(matches!(
+            save_result,
+            Err(IdentityError::VersionConflict { entity }) if entity == "memory_refs"
         ));
         uow.rollback().await.expect("rollback optimistic-lock test");
     }
@@ -783,6 +860,7 @@ mod tests {
                 idempotency_records,
                 audit_trace_entries,
                 lifecycle_history_entries,
+                memory_refs,
                 capability_profiles,
                 global_members,
                 projection_checkpoints,

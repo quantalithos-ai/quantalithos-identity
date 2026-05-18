@@ -5,6 +5,7 @@ use crate::domain::capability_profile::CapabilityProfile;
 use crate::domain::dead_letter::InboundDeadLetter;
 use crate::domain::idempotency::{IdempotencyRecord, IdempotencyScope};
 use crate::domain::member::GlobalMember;
+use crate::domain::memory_refs::MemoryRefs;
 use crate::domain::outbox::OutboxEvent;
 use crate::domain::projection::{MemberSummaryProjection, ProjectionCheckpoint};
 use crate::domain::role_catalog::RoleCatalogEntry;
@@ -80,6 +81,34 @@ pub trait CapabilityProfileRepository {
     fn save(
         &mut self,
         profile: &CapabilityProfile,
+        expected_version: i64,
+    ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
+}
+
+/// Exposes memory-refs persistence required by memory ref update flows.
+pub trait MemoryRefsRepository {
+    /// Loads the current memory refs aggregate for the provided member, if any.
+    fn get_by_member(
+        &mut self,
+        global_member_id: &GlobalMemberId,
+    ) -> impl std::future::Future<Output = Result<Option<MemoryRefs>, IdentityError>> + Send;
+
+    /// Loads and locks the current memory refs aggregate for the provided member, if any.
+    fn get_for_update_by_member(
+        &mut self,
+        global_member_id: &GlobalMemberId,
+    ) -> impl std::future::Future<Output = Result<Option<MemoryRefs>, IdentityError>> + Send;
+
+    /// Inserts a newly-created memory refs aggregate.
+    fn insert(
+        &mut self,
+        memory_refs: &MemoryRefs,
+    ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
+
+    /// Persists an updated memory refs aggregate using optimistic locking.
+    fn save(
+        &mut self,
+        memory_refs: &MemoryRefs,
         expected_version: i64,
     ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
 }
@@ -210,6 +239,11 @@ pub trait UnitOfWork {
     where
         Self: 'a;
 
+    /// Memory-refs repository bound to the current transaction.
+    type MemoryRefs<'a>: MemoryRefsRepository
+    where
+        Self: 'a;
+
     /// Lifecycle history repository bound to the current transaction.
     type LifecycleHistory<'a>: LifecycleHistoryRepository
     where
@@ -253,6 +287,9 @@ pub trait UnitOfWork {
 
     /// Returns a repository handle for capability-profile persistence.
     fn capability_profiles(&mut self) -> Self::CapabilityProfiles<'_>;
+
+    /// Returns a repository handle for memory-refs persistence.
+    fn memory_refs(&mut self) -> Self::MemoryRefs<'_>;
 
     /// Returns a repository handle for lifecycle history writes.
     fn lifecycle_history(&mut self) -> Self::LifecycleHistory<'_>;

@@ -258,6 +258,7 @@ async fn reset_tables(pool: &sqlx::postgres::PgPool) {
             idempotency_records,
             audit_trace_entries,
             lifecycle_history_entries,
+            memory_refs,
             capability_profiles,
             global_members,
             role_catalog_entries

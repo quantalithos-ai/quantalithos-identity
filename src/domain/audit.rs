@@ -6,6 +6,7 @@ use time::PrimitiveDateTime;
 
 use crate::domain::capability_profile::CapabilityProfile;
 use crate::domain::member::GlobalMember;
+use crate::domain::memory_refs::MemoryRefs;
 use crate::domain::shared::context::ActorContext;
 
 /// Enumerates the supported terminal results for an audit trace entry.
@@ -121,6 +122,31 @@ impl AuditTraceEntry {
                 "kind": "capability_profile",
                 "id": profile.capability_profile_id.as_str(),
                 "global_member_id": profile.global_member_id.as_str(),
+            })),
+            source_module: None,
+            result: AuditResult::Success,
+            reason: None,
+            created_at,
+        }
+    }
+
+    /// Creates an audit trace row for a successful memory refs update command.
+    pub fn for_memory_refs_command(
+        audit_trace_id: impl Into<String>,
+        memory_refs: &MemoryRefs,
+        actor: &ActorContext,
+        trace_id: impl Into<String>,
+        created_at: PrimitiveDateTime,
+    ) -> Self {
+        Self {
+            audit_trace_id: audit_trace_id.into(),
+            trace_id: trace_id.into(),
+            action: "UpdateMemoryRefs".to_string(),
+            actor_json: Some(json!(actor)),
+            target_ref_json: Some(json!({
+                "kind": "memory_refs",
+                "id": memory_refs.memory_refs_id.as_str(),
+                "global_member_id": memory_refs.global_member_id.as_str(),
             })),
             source_module: None,
             result: AuditResult::Success,
