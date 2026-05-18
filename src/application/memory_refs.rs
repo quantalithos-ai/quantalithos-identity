@@ -1,21 +1,26 @@
 //! Application service for explicit memory refs updates.
 
 use serde_json::json;
+use time::PrimitiveDateTime;
 
 use crate::application::persistence::{
-    AuditTraceRepository, GlobalMemberRepository, IdempotencyStore, MemoryRefsRepository,
-    OutboxStore, UnitOfWork, UnitOfWorkFactory,
+    AuditTraceRepository, GlobalMemberRepository, IdempotencyStore, InboundDeadLetterStore,
+    MemoryRefsRepository, OutboxStore, UnitOfWork, UnitOfWorkFactory,
 };
-use crate::domain::audit::AuditTraceEntry;
+use crate::domain::audit::{AuditResult, AuditTraceEntry};
+use crate::domain::dead_letter::{DeadLetterReplayStatus, InboundDeadLetter};
 use crate::domain::idempotency::{IdempotencyRecord, IdempotencyScope, IdempotencyStatus};
 use crate::domain::memory_refs::{
-    MemoryRef, MemoryRefs, MemoryRefsSummary, UpdateMemoryRefsCommand,
+    ArchiveStatus, MemoryRef, MemoryRefs, MemoryRefsSummary, UpdateMemoryRefsCommand,
 };
 use crate::domain::outbox::OutboxEvent;
 use crate::domain::shared::context::ActorContext;
-use crate::domain::shared::ids::{GlobalMemberId, OutboxEventId};
+use crate::domain::shared::ids::{DeadLetterId, GlobalMemberId, OutboxEventId};
 use crate::domain::shared::metadata::CommandMetadata;
 use crate::error::IdentityError;
+use crate::inbound::events::{
+    InboundEventEnvelope, InboundMemoryArchiveEvent, MemoryArchiveEventParser,
+};
 use crate::outbound::MemoryArchivePort;
 
 /// Coordinates memory refs writes over the shared transaction boundary.
@@ -23,6 +28,7 @@ use crate::outbound::MemoryArchivePort;
 pub struct MemoryRefsCommandService<UowFactory, MemoryArchiveValidator> {
     unit_of_work_factory: UowFactory,
     memory_archive_validator: MemoryArchiveValidator,
+    archive_event_parser: MemoryArchiveEventParser,
 }
 
 impl<UowFactory, MemoryArchiveValidator>
@@ -36,8 +42,20 @@ impl<UowFactory, MemoryArchiveValidator>
         Self {
             unit_of_work_factory,
             memory_archive_validator,
+            archive_event_parser: MemoryArchiveEventParser,
         }
     }
+}
+
+/// Summarizes the result of handling one inbound memory/archive status event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryArchiveEventOutcome {
+    /// One archive status update was applied successfully.
+    Updated { memory_refs_id: String },
+    /// The inbound event had already been consumed successfully with the same payload hash.
+    SkippedDuplicate { memory_refs_id: Option<String> },
+    /// The inbound event was retained into dead-letter storage instead of mutating write models.
+    DeadLettered,
 }
 
 impl<UowFactory, MemoryArchiveValidator>
@@ -170,6 +188,7 @@ where
                     "archive_ref": summary.archive_ref.clone(),
                     "archive_status": summary.archive_status.as_db(),
                     "version": summary.version,
+                    "updated_at": summary.updated_at,
                 }),
             )
             .await?;
@@ -218,6 +237,333 @@ where
         uow.rollback().await?;
         Ok(summary)
     }
+
+    /// Consumes one trusted archive status event and updates local memory refs state.
+    pub async fn handle_archive_event(
+        &self,
+        event: InboundMemoryArchiveEvent,
+    ) -> Result<MemoryArchiveEventOutcome, IdentityError> {
+        self.handle_archive_event_internal(event.envelope, DeadLetterRetention::CreateNew)
+            .await
+    }
+
+    /// Replays one existing dead-letter row through the normal archive-event consumer logic.
+    pub async fn replay_archive_dead_letter(
+        &self,
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+        event: InboundMemoryArchiveEvent,
+    ) -> Result<MemoryArchiveEventOutcome, IdentityError> {
+        self.handle_archive_event_internal(
+            event.envelope,
+            DeadLetterRetention::UpdateExisting {
+                dead_letter_id,
+                created_at,
+            },
+        )
+        .await
+    }
+
+    async fn handle_archive_event_internal(
+        &self,
+        envelope: InboundEventEnvelope,
+        dead_letter_retention: DeadLetterRetention,
+    ) -> Result<MemoryArchiveEventOutcome, IdentityError> {
+        let mut uow = self.unit_of_work_factory.begin().await?;
+        let existing_record = {
+            let mut idempotency = uow.idempotency();
+            idempotency
+                .get(
+                    envelope.source_event_id.as_str(),
+                    IdempotencyScope::InboundEvent,
+                )
+                .await?
+        };
+
+        if let Some(existing_record) = existing_record {
+            return self
+                .handle_existing_archive_record(
+                    existing_record,
+                    &envelope,
+                    dead_letter_retention,
+                    uow,
+                )
+                .await;
+        }
+
+        let archive_update = match self.archive_event_parser.parse(envelope.payload.clone()) {
+            Ok(archive_update) => archive_update,
+            Err(error) => {
+                retain_archive_dead_letter(
+                    &mut uow,
+                    &dead_letter_retention,
+                    &envelope,
+                    error.to_string(),
+                )
+                .await?;
+                uow.commit().await?;
+                return Ok(MemoryArchiveEventOutcome::DeadLettered);
+            }
+        };
+
+        let mut memory_refs = match {
+            let mut repository = uow.memory_refs();
+            repository
+                .get_for_update_by_member(&archive_update.global_member_id)
+                .await?
+        } {
+            Some(memory_refs) => memory_refs,
+            None => {
+                retain_archive_dead_letter(
+                    &mut uow,
+                    &dead_letter_retention,
+                    &envelope,
+                    format!(
+                        "IDENTITY_MEMORY_REFS_NOT_FOUND_TO_DEAD_LETTER: memory refs for member `{}` were not found",
+                        archive_update.global_member_id.as_str()
+                    ),
+                )
+                .await?;
+                uow.commit().await?;
+                return Ok(MemoryArchiveEventOutcome::DeadLettered);
+            }
+        };
+        let expected_version = memory_refs.version;
+
+        let next_status = match parse_archive_status(&archive_update.status) {
+            Ok(next_status) => next_status,
+            Err(error) => {
+                retain_archive_dead_letter(
+                    &mut uow,
+                    &dead_letter_retention,
+                    &envelope,
+                    error.to_string(),
+                )
+                .await?;
+                uow.commit().await?;
+                return Ok(MemoryArchiveEventOutcome::DeadLettered);
+            }
+        };
+        if memory_refs.rejects_archive_update(next_status, envelope.occurred_at) {
+            uow.rollback().await?;
+            return Ok(MemoryArchiveEventOutcome::SkippedDuplicate {
+                memory_refs_id: Some(memory_refs.memory_refs_id.as_str().to_string()),
+            });
+        }
+
+        match next_status {
+            ArchiveStatus::Pending => {
+                memory_refs.mark_archive_pending(archive_update.archive_ref)?;
+            }
+            ArchiveStatus::Archived => {
+                memory_refs.mark_archived(archive_update.archive_ref)?;
+            }
+            ArchiveStatus::Failed => {
+                memory_refs.mark_archive_failed(
+                    archive_update.archive_ref,
+                    archive_update
+                        .reason
+                        .as_deref()
+                        .unwrap_or("archive event reported failure"),
+                )?;
+            }
+            ArchiveStatus::None => {
+                retain_archive_dead_letter(
+                    &mut uow,
+                    &dead_letter_retention,
+                    &envelope,
+                    "IDENTITY_EVENT_UNSUPPORTED: archive status `none` is not supported for inbound archive updates"
+                        .to_string(),
+                )
+                .await?;
+                uow.commit().await?;
+                return Ok(MemoryArchiveEventOutcome::DeadLettered);
+            }
+        }
+
+        let member = {
+            let mut repository = uow.global_members();
+            repository.get(&archive_update.global_member_id).await?
+        }
+        .ok_or_else(|| IdentityError::RuleViolation {
+            code: "IDENTITY_MEMBER_NOT_FOUND",
+            message: format!(
+                "global member `{}` was not found",
+                archive_update.global_member_id.as_str()
+            ),
+        })?;
+
+        let now = memory_refs.updated_at;
+        let metadata = CommandMetadata::new(
+            envelope.source_event_id.as_str(),
+            envelope.source_event_id.as_str(),
+            envelope.payload_hash.clone(),
+        );
+        let audit_entry = AuditTraceEntry::for_inbound_event(
+            format!("audit:{}", envelope.source_event_id.as_str()),
+            "HandleMemoryArchiveEvent",
+            envelope.source_module.clone(),
+            envelope.source_event_id.as_str(),
+            Some(json!({
+                "kind": "memory_refs",
+                "id": memory_refs.memory_refs_id.as_str(),
+                "global_member_id": memory_refs.global_member_id.as_str(),
+                "archive_status": memory_refs.archive_status.as_db(),
+            })),
+            AuditResult::Success,
+            archive_update.reason.clone(),
+            now,
+        );
+        let outbox_event = OutboxEvent::for_memory_archive_status_changed(
+            OutboxEventId::new(format!("outbox:{}", envelope.source_event_id.as_str())),
+            &member,
+            &memory_refs,
+            envelope.source_event_id.as_str(),
+            now,
+        );
+        let summary = memory_refs.summary();
+
+        uow.memory_refs()
+            .save(&memory_refs, expected_version)
+            .await?;
+        uow.audit_traces().append(&audit_entry).await?;
+        uow.outbox().append(&outbox_event).await?;
+        uow.idempotency()
+            .record_success(
+                &metadata,
+                IdempotencyScope::InboundEvent,
+                json!({
+                    "kind": "memory_refs",
+                    "id": summary.memory_refs_id.as_str(),
+                    "global_member_id": summary.global_member_id.as_str(),
+                    "archive_ref": summary.archive_ref.clone(),
+                    "archive_status": summary.archive_status.as_db(),
+                    "version": summary.version,
+                    "updated_at": summary.updated_at,
+                }),
+            )
+            .await?;
+        uow.commit().await?;
+
+        Ok(MemoryArchiveEventOutcome::Updated {
+            memory_refs_id: summary.memory_refs_id.as_str().to_string(),
+        })
+    }
+
+    async fn handle_existing_archive_record<Uow>(
+        &self,
+        existing_record: IdempotencyRecord,
+        envelope: &InboundEventEnvelope,
+        dead_letter_retention: DeadLetterRetention,
+        mut uow: Uow,
+    ) -> Result<MemoryArchiveEventOutcome, IdentityError>
+    where
+        Uow: UnitOfWork,
+    {
+        if existing_record.request_hash != envelope.payload_hash {
+            let error = IdentityError::PersistenceData {
+                message: format!(
+                    "idempotency conflict for inbound event `{}` with different payload hash",
+                    envelope.source_event_id.as_str()
+                ),
+            };
+            retain_archive_dead_letter(
+                &mut uow,
+                &dead_letter_retention,
+                envelope,
+                error.to_string(),
+            )
+            .await?;
+            uow.commit().await?;
+            return Err(error);
+        }
+
+        let memory_refs_id = existing_record
+            .result_ref_json
+            .as_ref()
+            .and_then(|value| value.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string);
+
+        match existing_record.status {
+            IdempotencyStatus::Succeeded => {
+                uow.rollback().await?;
+                Ok(MemoryArchiveEventOutcome::SkippedDuplicate { memory_refs_id })
+            }
+            IdempotencyStatus::Processing | IdempotencyStatus::Failed => {
+                uow.rollback().await?;
+                Err(IdentityError::PersistenceData {
+                    message: format!(
+                        "inbound event `{}` exists with non-succeeded idempotency status",
+                        envelope.source_event_id.as_str()
+                    ),
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum DeadLetterRetention {
+    CreateNew,
+    UpdateExisting {
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+    },
+}
+
+async fn retain_archive_dead_letter<Uow>(
+    uow: &mut Uow,
+    retention: &DeadLetterRetention,
+    envelope: &InboundEventEnvelope,
+    failure_reason: String,
+) -> Result<(), IdentityError>
+where
+    Uow: UnitOfWork,
+{
+    match retention {
+        DeadLetterRetention::CreateNew => {
+            uow.inbound_dead_letters()
+                .append(&InboundDeadLetter {
+                    dead_letter_id: DeadLetterId::new(format!(
+                        "dead-letter:{}:{}",
+                        envelope.source_module,
+                        envelope.source_event_id.as_str()
+                    )),
+                    source_event_id: Some(envelope.source_event_id.clone()),
+                    source_module: envelope.source_module.clone(),
+                    event_type: envelope.event_type.clone(),
+                    payload_json: envelope.payload.clone(),
+                    failure_reason,
+                    replay_status: DeadLetterReplayStatus::Pending,
+                    created_at: current_timestamp(),
+                })
+                .await
+        }
+        DeadLetterRetention::UpdateExisting {
+            dead_letter_id,
+            created_at,
+        } => {
+            uow.inbound_dead_letters()
+                .save(&InboundDeadLetter {
+                    dead_letter_id: dead_letter_id.clone(),
+                    source_event_id: Some(envelope.source_event_id.clone()),
+                    source_module: envelope.source_module.clone(),
+                    event_type: envelope.event_type.clone(),
+                    payload_json: envelope.payload.clone(),
+                    failure_reason,
+                    replay_status: DeadLetterReplayStatus::Pending,
+                    created_at: *created_at,
+                })
+                .await
+        }
+    }
+}
+
+fn parse_archive_status(status: &str) -> Result<ArchiveStatus, IdentityError> {
+    ArchiveStatus::from_db(status).ok_or(IdentityError::PersistenceData {
+        message: format!("unknown archive status `{status}`"),
+    })
 }
 
 fn summary_from_result_ref(
@@ -240,6 +586,10 @@ fn summary_from_result_ref(
         .as_str()
         .and_then(crate::domain::memory_refs::ArchiveStatus::from_db)?;
     let version = result_ref_json.get("version")?.as_i64()?;
+    let updated_at = result_ref_json
+        .get("updated_at")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())?;
 
     Some(MemoryRefsSummary {
         memory_refs_id: crate::domain::shared::ids::MemoryRefsId::new(memory_refs_id),
@@ -249,10 +599,10 @@ fn summary_from_result_ref(
         archive_ref,
         archive_status,
         version,
+        updated_at,
     })
 }
 
-#[cfg(test)]
 fn current_timestamp() -> time::PrimitiveDateTime {
     let now = time::OffsetDateTime::now_utc();
     time::PrimitiveDateTime::new(now.date(), now.time())
@@ -264,7 +614,7 @@ mod tests {
 
     use serde_json::json;
     use sqlx::{Executor, Row, postgres::PgPoolOptions};
-    use time::Duration;
+    use time::{Duration, PrimitiveDateTime};
 
     use crate::application::member_lifecycle::MemberLifecycleCommandService;
     use crate::application::query_projection::{GetMemberSummaryQuery, QueryProjectionService};
@@ -272,16 +622,17 @@ mod tests {
     use crate::domain::member::HireGlobalMemberCommand;
     use crate::domain::memory_refs::{MemoryRef, UpdateMemoryRefsCommand};
     use crate::domain::shared::context::{ActorContext, ActorKind};
-    use crate::domain::shared::ids::RoleId;
+    use crate::domain::shared::ids::{DeadLetterId, EventId, RoleId};
     use crate::domain::shared::metadata::CommandMetadata;
     use crate::error::IdentityError;
+    use crate::inbound::events::{InboundEventEnvelope, InboundMemoryArchiveEvent};
     use crate::operations::ProjectionRebuildJob;
     use crate::outbound::MemoryArchivePort;
     use crate::persistence::database::run_migrations;
     use crate::persistence::test_support::DB_TEST_MUTEX;
     use crate::persistence::unit_of_work::SqlxUnitOfWorkFactory;
 
-    use super::{MemoryRefsCommandService, current_timestamp};
+    use super::{MemoryArchiveEventOutcome, MemoryRefsCommandService, current_timestamp};
 
     #[derive(Debug, Clone, Default)]
     struct StubMemoryArchiveValidator {
@@ -601,6 +952,502 @@ mod tests {
         assert_eq!(idempotency_count, 0);
     }
 
+    #[tokio::test]
+    async fn handle_archive_event_updates_status_writes_outbox_and_refreshes_projection() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let factory = SqlxUnitOfWorkFactory::new(pool.clone());
+        let hire_service = MemberLifecycleCommandService::new(factory.clone());
+        let service =
+            MemoryRefsCommandService::new(factory.clone(), StubMemoryArchiveValidator::accepting());
+        let rebuild_job = ProjectionRebuildJob::new(factory.clone());
+        let query_service = QueryProjectionService::new(factory);
+        let actor = ActorContext::new("human/admin-memory-archive-1", ActorKind::HumanUser, None);
+
+        let member = hire_service
+            .hire_global_member(
+                HireGlobalMemberCommand {
+                    display_name: "Archive Member".to_string(),
+                    main_role_id: RoleId::new("role.member.operator"),
+                    secondary_role_ids: Vec::new(),
+                },
+                actor.clone(),
+                CommandMetadata::new(
+                    "idem-hire-memory-archive-001",
+                    "trace-hire-memory-archive-001",
+                    "hash-hire-memory-archive-001",
+                ),
+            )
+            .await
+            .expect("hire member for archive event");
+
+        service
+            .update_memory_refs(
+                UpdateMemoryRefsCommand {
+                    global_member_id: member.global_member_id.clone(),
+                    semantic_memory_ref: Some(sample_semantic_memory_ref()),
+                    episodic_memory_refs: vec![sample_episodic_memory_ref()],
+                },
+                actor.clone(),
+                CommandMetadata::new(
+                    "idem-memory-archive-001",
+                    "trace-memory-archive-001",
+                    "hash-memory-archive-001",
+                ),
+            )
+            .await
+            .expect("seed memory refs before archive event");
+
+        let outcome = service
+            .handle_archive_event(sample_memory_archive_event(
+                "memory-archive-event-001",
+                "memory-archive-event-hash-001",
+                member.global_member_id.as_str(),
+                "archived",
+                current_timestamp() + Duration::seconds(2),
+            ))
+            .await
+            .expect("archive event should succeed");
+
+        sqlx::query("UPDATE outbox_events SET created_at = $2 WHERE outbox_event_id = $1")
+            .bind("outbox:idem-hire-memory-archive-001")
+            .bind(current_timestamp())
+            .execute(&pool)
+            .await
+            .expect("stabilize hire outbox created_at");
+        sqlx::query("UPDATE outbox_events SET created_at = $2 WHERE outbox_event_id = $1")
+            .bind("outbox:idem-memory-archive-001")
+            .bind(current_timestamp() + Duration::seconds(1))
+            .execute(&pool)
+            .await
+            .expect("stabilize memory refs outbox created_at");
+        sqlx::query("UPDATE outbox_events SET created_at = $2 WHERE outbox_event_id = $1")
+            .bind("outbox:memory-archive-event-001")
+            .bind(current_timestamp() + Duration::seconds(2))
+            .execute(&pool)
+            .await
+            .expect("stabilize archive outbox created_at");
+
+        rebuild_job
+            .rebuild_member_summary_projection("member-summary-rebuild", 20)
+            .await
+            .expect("projection rebuild should succeed");
+        let query_summary = query_service
+            .get_member_summary(
+                GetMemberSummaryQuery {
+                    global_member_id: member.global_member_id.clone(),
+                },
+                actor,
+            )
+            .await
+            .expect("member summary query should succeed after archive rebuild");
+
+        let memory_refs_row = sqlx::query(
+            r#"
+            SELECT archive_status, archive_ref_json, version
+            FROM memory_refs
+            WHERE global_member_id = $1
+            "#,
+        )
+        .bind(member.global_member_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load archived memory refs row");
+        let audit_row = sqlx::query(
+            "SELECT action, source_module, result, reason FROM audit_trace_entries WHERE audit_trace_id = $1",
+        )
+        .bind("audit:memory-archive-event-001")
+        .fetch_one(&pool)
+        .await
+        .expect("load archive event audit row");
+        let outbox_row = sqlx::query(
+            "SELECT event_type, payload_json FROM outbox_events WHERE outbox_event_id = $1",
+        )
+        .bind("outbox:memory-archive-event-001")
+        .fetch_one(&pool)
+        .await
+        .expect("load archive event outbox row");
+        let idempotency_row = sqlx::query(
+            "SELECT status, result_ref_json FROM idempotency_records WHERE idempotency_key = $1",
+        )
+        .bind("memory-archive-event-001")
+        .fetch_one(&pool)
+        .await
+        .expect("load archive idempotency row");
+
+        assert_eq!(
+            outcome,
+            MemoryArchiveEventOutcome::Updated {
+                memory_refs_id: format!("memory-refs:{}", member.global_member_id.as_str()),
+            }
+        );
+        assert_eq!(
+            memory_refs_row.get::<String, _>("archive_status"),
+            "archived"
+        );
+        assert_eq!(
+            memory_refs_row.get::<Option<serde_json::Value>, _>("archive_ref_json"),
+            Some(json!({
+                "archive_id": format!("archive-{}", member.global_member_id.as_str()),
+                "archive_kind": "member_memory_archive",
+                "archive_version": "v1",
+            }))
+        );
+        assert_eq!(
+            audit_row.get::<String, _>("action"),
+            "HandleMemoryArchiveEvent"
+        );
+        assert_eq!(
+            audit_row.get::<String, _>("source_module"),
+            "memory-archive"
+        );
+        assert_eq!(audit_row.get::<String, _>("result"), "success");
+        assert_eq!(audit_row.get::<Option<String>, _>("reason"), None);
+        assert_eq!(
+            outbox_row.get::<String, _>("event_type"),
+            "identity.memory_refs.archive_status_changed"
+        );
+        assert_eq!(
+            outbox_row
+                .get::<serde_json::Value, _>("payload_json")
+                .get("memory_ref_summary_json")
+                .and_then(|value| value.get("archive_status"))
+                .and_then(serde_json::Value::as_str),
+            Some("archived")
+        );
+        assert_eq!(idempotency_row.get::<String, _>("status"), "succeeded");
+        assert_eq!(
+            idempotency_row
+                .get::<serde_json::Value, _>("result_ref_json")
+                .get("updated_at")
+                .is_some(),
+            true
+        );
+        assert_eq!(
+            query_summary
+                .memory_ref_summary_json
+                .get("archive_status")
+                .and_then(serde_json::Value::as_str),
+            Some("archived")
+        );
+        assert_eq!(
+            query_summary
+                .memory_ref_summary_json
+                .get("archive_ref")
+                .and_then(serde_json::Value::as_object)
+                .is_some(),
+            true
+        );
+        assert_eq!(memory_refs_row.get::<i64, _>("version"), 3);
+    }
+
+    #[tokio::test]
+    async fn handle_archive_event_dead_letters_invalid_status_payload() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let factory = SqlxUnitOfWorkFactory::new(pool.clone());
+        let hire_service = MemberLifecycleCommandService::new(factory.clone());
+        let service =
+            MemoryRefsCommandService::new(factory.clone(), StubMemoryArchiveValidator::accepting());
+        let actor = ActorContext::new("human/admin-memory-archive-2", ActorKind::HumanUser, None);
+
+        let member = hire_service
+            .hire_global_member(
+                HireGlobalMemberCommand {
+                    display_name: "Archive Invalid".to_string(),
+                    main_role_id: RoleId::new("role.member.operator"),
+                    secondary_role_ids: Vec::new(),
+                },
+                actor.clone(),
+                CommandMetadata::new(
+                    "idem-hire-memory-archive-002",
+                    "trace-hire-memory-archive-002",
+                    "hash-hire-memory-archive-002",
+                ),
+            )
+            .await
+            .expect("hire member for invalid archive event");
+
+        service
+            .update_memory_refs(
+                UpdateMemoryRefsCommand {
+                    global_member_id: member.global_member_id.clone(),
+                    semantic_memory_ref: Some(sample_semantic_memory_ref()),
+                    episodic_memory_refs: Vec::new(),
+                },
+                actor,
+                CommandMetadata::new(
+                    "idem-memory-archive-002",
+                    "trace-memory-archive-002",
+                    "hash-memory-archive-002",
+                ),
+            )
+            .await
+            .expect("seed memory refs before invalid archive event");
+
+        let outcome = service
+            .handle_archive_event(sample_memory_archive_event(
+                "memory-archive-event-002",
+                "memory-archive-event-hash-002",
+                member.global_member_id.as_str(),
+                "unknown_status",
+                current_timestamp() + Duration::seconds(2),
+            ))
+            .await
+            .expect("invalid archive event should dead-letter");
+
+        let dead_letter_row = sqlx::query(
+            "SELECT source_module, event_type, failure_reason, replay_status FROM inbound_dead_letters WHERE source_event_id = $1",
+        )
+        .bind("memory-archive-event-002")
+        .fetch_one(&pool)
+        .await
+        .expect("load invalid archive dead-letter row");
+        let outbox_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM outbox_events WHERE idempotency_key = $1")
+                .bind("memory-archive-event-002")
+                .fetch_one(&pool)
+                .await
+                .expect("count invalid archive outbox rows");
+        let idempotency_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM idempotency_records WHERE idempotency_key = $1",
+        )
+        .bind("memory-archive-event-002")
+        .fetch_one(&pool)
+        .await
+        .expect("count invalid archive idempotency rows");
+
+        assert_eq!(outcome, MemoryArchiveEventOutcome::DeadLettered);
+        assert_eq!(
+            dead_letter_row.get::<String, _>("source_module"),
+            "memory-archive"
+        );
+        assert_eq!(
+            dead_letter_row.get::<String, _>("event_type"),
+            "memory.archive.status.changed"
+        );
+        assert_eq!(dead_letter_row.get::<String, _>("replay_status"), "pending");
+        assert!(
+            dead_letter_row
+                .get::<String, _>("failure_reason")
+                .contains("unknown archive status `unknown_status`")
+        );
+        assert_eq!(outbox_count, 0);
+        assert_eq!(idempotency_count, 0);
+    }
+
+    #[tokio::test]
+    async fn handle_archive_event_skips_out_of_order_terminal_regression() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let factory = SqlxUnitOfWorkFactory::new(pool.clone());
+        let hire_service = MemberLifecycleCommandService::new(factory.clone());
+        let service =
+            MemoryRefsCommandService::new(factory.clone(), StubMemoryArchiveValidator::accepting());
+        let actor = ActorContext::new("human/admin-memory-archive-3", ActorKind::HumanUser, None);
+
+        let member = hire_service
+            .hire_global_member(
+                HireGlobalMemberCommand {
+                    display_name: "Archive Out Of Order".to_string(),
+                    main_role_id: RoleId::new("role.member.operator"),
+                    secondary_role_ids: Vec::new(),
+                },
+                actor.clone(),
+                CommandMetadata::new(
+                    "idem-hire-memory-archive-003",
+                    "trace-hire-memory-archive-003",
+                    "hash-hire-memory-archive-003",
+                ),
+            )
+            .await
+            .expect("hire member for out-of-order archive test");
+
+        service
+            .update_memory_refs(
+                UpdateMemoryRefsCommand {
+                    global_member_id: member.global_member_id.clone(),
+                    semantic_memory_ref: Some(sample_semantic_memory_ref()),
+                    episodic_memory_refs: Vec::new(),
+                },
+                actor,
+                CommandMetadata::new(
+                    "idem-memory-archive-003",
+                    "trace-memory-archive-003",
+                    "hash-memory-archive-003",
+                ),
+            )
+            .await
+            .expect("seed memory refs before out-of-order archive test");
+
+        let first_outcome = service
+            .handle_archive_event(sample_memory_archive_event(
+                "memory-archive-event-003a",
+                "memory-archive-event-hash-003a",
+                member.global_member_id.as_str(),
+                "archived",
+                current_timestamp() + Duration::seconds(3),
+            ))
+            .await
+            .expect("first archive event should succeed");
+        let second_outcome = service
+            .handle_archive_event(sample_memory_archive_event(
+                "memory-archive-event-003b",
+                "memory-archive-event-hash-003b",
+                member.global_member_id.as_str(),
+                "pending",
+                current_timestamp() - Duration::seconds(30),
+            ))
+            .await
+            .expect("out-of-order archive event should be skipped");
+
+        let memory_refs_row =
+            sqlx::query("SELECT archive_status FROM memory_refs WHERE global_member_id = $1")
+                .bind(member.global_member_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load memory refs after out-of-order event");
+        let outbox_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM outbox_events WHERE event_type = 'identity.memory_refs.archive_status_changed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count archive status outbox rows");
+
+        assert!(matches!(
+            first_outcome,
+            MemoryArchiveEventOutcome::Updated { .. }
+        ));
+        assert!(matches!(
+            second_outcome,
+            MemoryArchiveEventOutcome::SkippedDuplicate { .. }
+        ));
+        assert_eq!(
+            memory_refs_row.get::<String, _>("archive_status"),
+            "archived"
+        );
+        assert_eq!(outbox_count, 1);
+    }
+
+    #[tokio::test]
+    async fn replay_archive_dead_letter_reuses_existing_row_after_refs_are_restored() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let factory = SqlxUnitOfWorkFactory::new(pool.clone());
+        let hire_service = MemberLifecycleCommandService::new(factory.clone());
+        let service =
+            MemoryRefsCommandService::new(factory.clone(), StubMemoryArchiveValidator::accepting());
+        let actor = ActorContext::new("human/admin-memory-archive-4", ActorKind::HumanUser, None);
+
+        let member = hire_service
+            .hire_global_member(
+                HireGlobalMemberCommand {
+                    display_name: "Archive Replay".to_string(),
+                    main_role_id: RoleId::new("role.member.operator"),
+                    secondary_role_ids: Vec::new(),
+                },
+                actor.clone(),
+                CommandMetadata::new(
+                    "idem-hire-memory-archive-004",
+                    "trace-hire-memory-archive-004",
+                    "hash-hire-memory-archive-004",
+                ),
+            )
+            .await
+            .expect("hire member for archive replay");
+
+        let dead_letter_outcome = service
+            .handle_archive_event(sample_memory_archive_event(
+                "memory-archive-event-004",
+                "memory-archive-event-hash-004",
+                member.global_member_id.as_str(),
+                "failed",
+                current_timestamp() + Duration::seconds(2),
+            ))
+            .await
+            .expect("missing memory refs should dead-letter");
+        assert_eq!(dead_letter_outcome, MemoryArchiveEventOutcome::DeadLettered);
+
+        let dead_letter_row = sqlx::query(
+            "SELECT dead_letter_id, created_at FROM inbound_dead_letters WHERE source_event_id = $1",
+        )
+        .bind("memory-archive-event-004")
+        .fetch_one(&pool)
+        .await
+        .expect("load archive replay dead-letter row");
+        let dead_letter_id = dead_letter_row.get::<String, _>("dead_letter_id");
+        let created_at = dead_letter_row.get::<time::PrimitiveDateTime, _>("created_at");
+
+        service
+            .update_memory_refs(
+                UpdateMemoryRefsCommand {
+                    global_member_id: member.global_member_id.clone(),
+                    semantic_memory_ref: Some(sample_semantic_memory_ref()),
+                    episodic_memory_refs: Vec::new(),
+                },
+                actor,
+                CommandMetadata::new(
+                    "idem-memory-archive-004",
+                    "trace-memory-archive-004",
+                    "hash-memory-archive-004",
+                ),
+            )
+            .await
+            .expect("seed memory refs before replay");
+
+        let replay_outcome = service
+            .replay_archive_dead_letter(
+                DeadLetterId::new(dead_letter_id.clone()),
+                created_at,
+                sample_memory_archive_event(
+                    "memory-archive-event-004",
+                    "memory-archive-event-hash-004",
+                    member.global_member_id.as_str(),
+                    "failed",
+                    current_timestamp() + Duration::seconds(4),
+                ),
+            )
+            .await
+            .expect("archive replay should succeed");
+
+        let memory_refs_row =
+            sqlx::query("SELECT archive_status FROM memory_refs WHERE global_member_id = $1")
+                .bind(member.global_member_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load memory refs after replay");
+        let dead_letter_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inbound_dead_letters WHERE source_event_id = $1",
+        )
+        .bind("memory-archive-event-004")
+        .fetch_one(&pool)
+        .await
+        .expect("count archive replay dead letters");
+
+        assert!(matches!(
+            replay_outcome,
+            MemoryArchiveEventOutcome::Updated { .. }
+        ));
+        assert_eq!(memory_refs_row.get::<String, _>("archive_status"), "failed");
+        assert_eq!(dead_letter_count, 1);
+    }
+
     async fn test_pool() -> sqlx::postgres::PgPool {
         let config = AppConfig {
             listen_addr: "127.0.0.1:8080".to_string(),
@@ -685,6 +1532,40 @@ mod tests {
             memory_id: "memory-episodic-001".to_string(),
             memory_kind: "episodic".to_string(),
             memory_version: Some("v1".to_string()),
+        }
+    }
+
+    fn sample_memory_archive_event(
+        source_event_id: &str,
+        payload_hash: &str,
+        global_member_id: &str,
+        status: &str,
+        occurred_at: PrimitiveDateTime,
+    ) -> InboundMemoryArchiveEvent {
+        InboundMemoryArchiveEvent {
+            envelope: InboundEventEnvelope {
+                source_event_id: EventId::new(source_event_id),
+                source_module: "memory-archive".to_string(),
+                event_type: "memory.archive.status.changed".to_string(),
+                occurred_at,
+                payload_hash: payload_hash.to_string(),
+                payload: json!({
+                    "archive_status_snapshot": {
+                        "global_member_id": global_member_id,
+                        "archive_ref": {
+                            "archive_id": format!("archive-{global_member_id}"),
+                            "archive_kind": "member_memory_archive",
+                            "archive_version": "v1",
+                        },
+                        "status": status,
+                        "reason": if status == "failed" {
+                            Some("archive validation failed")
+                        } else {
+                            Option::<&str>::None
+                        },
+                    }
+                }),
+            },
         }
     }
 }

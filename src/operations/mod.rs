@@ -3,6 +3,7 @@
 use time::{OffsetDateTime, PrimitiveDateTime};
 
 use crate::application::career_event::CareerEventOutcome;
+use crate::application::memory_refs::MemoryArchiveEventOutcome;
 use crate::application::persistence::{
     AuditTraceRepository, IdempotencyStore, InboundDeadLetterStore,
     MemberSummaryProjectionRepository, OutboxStore, ProjectionCheckpointRepository,
@@ -18,8 +19,8 @@ use crate::domain::projection::{MemberSummaryProjection, ProjectionCheckpoint};
 use crate::domain::shared::ids::{DeadLetterId, OutboxEventId};
 use crate::error::IdentityError;
 use crate::inbound::events::{
-    InboundEventEnvelope, InboundGateDecisionEvent, InboundProcessFactEvent,
-    InboundRoleCatalogEvent, InboundWorkFactEvent, RoleDefinitionSnapshot,
+    InboundEventEnvelope, InboundGateDecisionEvent, InboundMemoryArchiveEvent,
+    InboundProcessFactEvent, InboundRoleCatalogEvent, InboundWorkFactEvent, RoleDefinitionSnapshot,
 };
 use crate::outbound::{BusPublisherPort, MethodLibraryRoleCatalogPort};
 
@@ -162,30 +163,55 @@ pub trait GateDecisionDeadLetterReplayPort {
     ) -> impl std::future::Future<Output = Result<GateDecisionOutcome, IdentityError>>;
 }
 
+/// Replays one dead-lettered memory/archive event through the application-service boundary.
+pub trait MemoryArchiveDeadLetterReplayPort {
+    /// Replays one stored memory/archive dead letter.
+    fn replay_dead_letter(
+        &self,
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+        event: InboundMemoryArchiveEvent,
+    ) -> impl std::future::Future<Output = Result<MemoryArchiveEventOutcome, IdentityError>>;
+}
+
 /// Replays pending inbound dead letters through the same application services used in normal flow.
 #[derive(Debug, Clone)]
-pub struct InboundDeadLetterReplayJob<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
-{
+pub struct InboundDeadLetterReplayJob<
+    UowFactory,
+    RoleCatalogReplayer,
+    CareerReplayer,
+    MemoryArchiveReplayer,
+    GateReplayer,
+> {
     unit_of_work_factory: UowFactory,
     role_catalog_replayer: RoleCatalogReplayer,
     career_replayer: CareerReplayer,
+    memory_archive_replayer: MemoryArchiveReplayer,
     gate_replayer: GateReplayer,
 }
 
-impl<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
-    InboundDeadLetterReplayJob<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
+impl<UowFactory, RoleCatalogReplayer, CareerReplayer, MemoryArchiveReplayer, GateReplayer>
+    InboundDeadLetterReplayJob<
+        UowFactory,
+        RoleCatalogReplayer,
+        CareerReplayer,
+        MemoryArchiveReplayer,
+        GateReplayer,
+    >
 {
     /// Creates a new inbound dead-letter replay job bound to the provided handlers.
     pub fn new(
         unit_of_work_factory: UowFactory,
         role_catalog_replayer: RoleCatalogReplayer,
         career_replayer: CareerReplayer,
+        memory_archive_replayer: MemoryArchiveReplayer,
         gate_replayer: GateReplayer,
     ) -> Self {
         Self {
             unit_of_work_factory,
             role_catalog_replayer,
             career_replayer,
+            memory_archive_replayer,
             gate_replayer,
         }
     }
@@ -270,28 +296,42 @@ where
 
 /// Replays one pending inbound dead-letter row manually through the normal application boundary.
 #[derive(Debug, Clone)]
-pub struct ReplayInboundDeadLetterJob<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
-{
+pub struct ReplayInboundDeadLetterJob<
+    UowFactory,
+    RoleCatalogReplayer,
+    CareerReplayer,
+    MemoryArchiveReplayer,
+    GateReplayer,
+> {
     unit_of_work_factory: UowFactory,
     role_catalog_replayer: RoleCatalogReplayer,
     career_replayer: CareerReplayer,
+    memory_archive_replayer: MemoryArchiveReplayer,
     gate_replayer: GateReplayer,
 }
 
-impl<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
-    ReplayInboundDeadLetterJob<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
+impl<UowFactory, RoleCatalogReplayer, CareerReplayer, MemoryArchiveReplayer, GateReplayer>
+    ReplayInboundDeadLetterJob<
+        UowFactory,
+        RoleCatalogReplayer,
+        CareerReplayer,
+        MemoryArchiveReplayer,
+        GateReplayer,
+    >
 {
     /// Creates a new single dead-letter replay job bound to the provided handlers.
     pub fn new(
         unit_of_work_factory: UowFactory,
         role_catalog_replayer: RoleCatalogReplayer,
         career_replayer: CareerReplayer,
+        memory_archive_replayer: MemoryArchiveReplayer,
         gate_replayer: GateReplayer,
     ) -> Self {
         Self {
             unit_of_work_factory,
             role_catalog_replayer,
             career_replayer,
+            memory_archive_replayer,
             gate_replayer,
         }
     }
@@ -302,12 +342,19 @@ impl<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
     }
 }
 
-impl<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
-    ReplayInboundDeadLetterJob<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
+impl<UowFactory, RoleCatalogReplayer, CareerReplayer, MemoryArchiveReplayer, GateReplayer>
+    ReplayInboundDeadLetterJob<
+        UowFactory,
+        RoleCatalogReplayer,
+        CareerReplayer,
+        MemoryArchiveReplayer,
+        GateReplayer,
+    >
 where
     UowFactory: UnitOfWorkFactory + Clone,
     RoleCatalogReplayer: RoleCatalogDeadLetterReplayPort,
     CareerReplayer: CareerDeadLetterReplayPort,
+    MemoryArchiveReplayer: MemoryArchiveDeadLetterReplayPort,
     GateReplayer: GateDecisionDeadLetterReplayPort,
 {
     /// Replays one pending inbound dead-letter row manually.
@@ -480,6 +527,27 @@ where
                     ),
                 })
             }
+            "memory-archive" => {
+                let outcome = self
+                    .memory_archive_replayer
+                    .replay_dead_letter(
+                        dead_letter.dead_letter_id.clone(),
+                        dead_letter.created_at,
+                        InboundMemoryArchiveEvent { envelope },
+                    )
+                    .await?;
+                Ok(match outcome {
+                    MemoryArchiveEventOutcome::Updated { .. }
+                    | MemoryArchiveEventOutcome::SkippedDuplicate { .. } => {
+                        DeadLetterReplayDisposition::Replayed
+                    }
+                    MemoryArchiveEventOutcome::DeadLettered => {
+                        DeadLetterReplayDisposition::StillPending(
+                            "replay still failed and remained dead-lettered".to_string(),
+                        )
+                    }
+                })
+            }
             other => Ok(DeadLetterReplayDisposition::StillPending(format!(
                 "automatic replay is not supported for source_module `{other}`"
             ))),
@@ -487,12 +555,19 @@ where
     }
 }
 
-impl<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
-    InboundDeadLetterReplayJob<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
+impl<UowFactory, RoleCatalogReplayer, CareerReplayer, MemoryArchiveReplayer, GateReplayer>
+    InboundDeadLetterReplayJob<
+        UowFactory,
+        RoleCatalogReplayer,
+        CareerReplayer,
+        MemoryArchiveReplayer,
+        GateReplayer,
+    >
 where
     UowFactory: UnitOfWorkFactory,
     RoleCatalogReplayer: RoleCatalogDeadLetterReplayPort,
     CareerReplayer: CareerDeadLetterReplayPort,
+    MemoryArchiveReplayer: MemoryArchiveDeadLetterReplayPort,
     GateReplayer: GateDecisionDeadLetterReplayPort,
 {
     /// Replays one batch of pending inbound dead letters.
@@ -644,6 +719,27 @@ where
                     ),
                 })
             }
+            "memory-archive" => {
+                let outcome = self
+                    .memory_archive_replayer
+                    .replay_dead_letter(
+                        dead_letter.dead_letter_id.clone(),
+                        dead_letter.created_at,
+                        InboundMemoryArchiveEvent { envelope },
+                    )
+                    .await?;
+                Ok(match outcome {
+                    MemoryArchiveEventOutcome::Updated { .. }
+                    | MemoryArchiveEventOutcome::SkippedDuplicate { .. } => {
+                        DeadLetterReplayDisposition::Replayed
+                    }
+                    MemoryArchiveEventOutcome::DeadLettered => {
+                        DeadLetterReplayDisposition::StillPending(
+                            "replay still failed and remained dead-lettered".to_string(),
+                        )
+                    }
+                })
+            }
             other => Ok(DeadLetterReplayDisposition::StillPending(format!(
                 "automatic replay is not supported for source_module `{other}`"
             ))),
@@ -735,6 +831,29 @@ where
             Governance,
             ArchiveRequester,
         >::replay_dead_letter(self, dead_letter_id, created_at, event)
+        .await
+    }
+}
+
+impl<UowFactory, MemoryArchiveValidator> MemoryArchiveDeadLetterReplayPort
+    for crate::application::memory_refs::MemoryRefsCommandService<
+        UowFactory,
+        MemoryArchiveValidator,
+    >
+where
+    UowFactory: UnitOfWorkFactory,
+    MemoryArchiveValidator: crate::outbound::MemoryArchivePort,
+{
+    async fn replay_dead_letter(
+        &self,
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+        event: InboundMemoryArchiveEvent,
+    ) -> Result<MemoryArchiveEventOutcome, IdentityError> {
+        crate::application::memory_refs::MemoryRefsCommandService::<
+            UowFactory,
+            MemoryArchiveValidator,
+        >::replay_archive_dead_letter(self, dead_letter_id, created_at, event)
         .await
     }
 }
@@ -1515,6 +1634,7 @@ where
             | "identity.capability_profile.updated"
             | "identity.career_history.appended"
             | "identity.memory_refs.updated"
+            | "identity.memory_refs.archive_status_changed"
     ) {
         let global_member_id = event
             .payload_json
@@ -1564,12 +1684,13 @@ mod tests {
     use time::{Duration, OffsetDateTime, PrimitiveDateTime};
 
     use crate::application::career_event::CareerEventConsumerService;
+    use crate::application::memory_refs::MemoryRefsCommandService;
     use crate::application::role_catalog_sync::{RoleCatalogSyncOutcome, RoleCatalogSyncService};
     use crate::application::tombstone_flow::TombstoneFlowService;
     use crate::config::AppConfig;
     use crate::domain::dead_letter::InboundDeadLetter;
     use crate::domain::idempotency::{IdempotencyScope, IdempotencyStatus};
-    use crate::domain::memory_refs::ArchiveRef;
+    use crate::domain::memory_refs::{ArchiveRef, ArchiveStatus};
     use crate::domain::outbox::{OutboxEvent, OutboxStatus};
     use crate::domain::shared::context::{ActorContext, ActorKind};
     use crate::domain::shared::ids::{
@@ -1579,10 +1700,12 @@ mod tests {
     use crate::error::IdentityError;
     use crate::inbound::events::RoleDefinitionSnapshot;
     use crate::inbound::events::{
-        InboundEventEnvelope, InboundProcessFactEvent, InboundRoleCatalogEvent,
+        InboundEventEnvelope, InboundMemoryArchiveEvent, InboundProcessFactEvent,
+        InboundRoleCatalogEvent,
     };
     use crate::outbound::{
-        ArchiveRequestPort, BusPublisherPort, GovernancePort, MethodLibraryRoleCatalogPort,
+        ArchiveRequestPort, BusPublisherPort, GovernancePort, MemoryArchivePort,
+        MethodLibraryRoleCatalogPort,
     };
     use crate::persistence::database::run_migrations;
     use crate::persistence::test_support::DB_TEST_MUTEX;
@@ -1682,6 +1805,18 @@ mod tests {
             Err(IdentityError::PersistenceData {
                 message: "noop archive requester should not be called in this test".to_string(),
             })
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct NoopMemoryArchivePort;
+
+    impl MemoryArchivePort for NoopMemoryArchivePort {
+        async fn validate_ref(
+            &self,
+            _memory_ref: &crate::domain::memory_refs::MemoryRef,
+        ) -> Result<(), IdentityError> {
+            Ok(())
         }
     }
 
@@ -2140,6 +2275,8 @@ mod tests {
         let factory = SqlxUnitOfWorkFactory::new(pool.clone());
         let career_service = CareerEventConsumerService::new(factory.clone());
         let role_service = RoleCatalogSyncService::new(factory.clone());
+        let memory_archive_service =
+            MemoryRefsCommandService::new(factory.clone(), NoopMemoryArchivePort);
         let tombstone_service =
             TombstoneFlowService::new(factory.clone(), NoopGovernancePort, NoopArchiveRequester);
 
@@ -2169,6 +2306,7 @@ mod tests {
             factory.clone(),
             role_service,
             career_service,
+            memory_archive_service,
             tombstone_service,
         );
         let summary = replay_job
@@ -2217,6 +2355,8 @@ mod tests {
         let factory = SqlxUnitOfWorkFactory::new(pool.clone());
         let role_service = RoleCatalogSyncService::new(factory.clone());
         let career_service = CareerEventConsumerService::new(factory.clone());
+        let memory_archive_service =
+            MemoryRefsCommandService::new(factory.clone(), NoopMemoryArchivePort);
         let tombstone_service =
             TombstoneFlowService::new(factory.clone(), NoopGovernancePort, NoopArchiveRequester);
 
@@ -2251,6 +2391,7 @@ mod tests {
             factory.clone(),
             role_service,
             career_service,
+            memory_archive_service,
             tombstone_service,
         );
         let summary = replay_job
@@ -2298,6 +2439,8 @@ mod tests {
         let factory = SqlxUnitOfWorkFactory::new(pool.clone());
         let career_service = CareerEventConsumerService::new(factory.clone());
         let role_service = RoleCatalogSyncService::new(factory.clone());
+        let memory_archive_service =
+            MemoryRefsCommandService::new(factory.clone(), NoopMemoryArchivePort);
         let tombstone_service =
             TombstoneFlowService::new(factory.clone(), NoopGovernancePort, NoopArchiveRequester);
 
@@ -2328,6 +2471,7 @@ mod tests {
             factory.clone(),
             role_service,
             career_service,
+            memory_archive_service,
             tombstone_service,
         );
         let result = replay_job
@@ -2380,6 +2524,7 @@ mod tests {
             factory.clone(),
             RoleCatalogSyncService::new(factory.clone()),
             CareerEventConsumerService::new(factory.clone()),
+            MemoryRefsCommandService::new(factory.clone(), NoopMemoryArchivePort),
             TombstoneFlowService::new(factory.clone(), NoopGovernancePort, NoopArchiveRequester),
         );
         let error = replay_job
@@ -2409,6 +2554,8 @@ mod tests {
         let factory = SqlxUnitOfWorkFactory::new(pool.clone());
         let role_service = RoleCatalogSyncService::new(factory.clone());
         let career_service = CareerEventConsumerService::new(factory.clone());
+        let memory_archive_service =
+            MemoryRefsCommandService::new(factory.clone(), NoopMemoryArchivePort);
         let tombstone_service =
             TombstoneFlowService::new(factory.clone(), NoopGovernancePort, NoopArchiveRequester);
 
@@ -2444,6 +2591,7 @@ mod tests {
             factory.clone(),
             role_service,
             career_service,
+            memory_archive_service,
             tombstone_service,
         );
         let error = replay_job
@@ -2472,6 +2620,111 @@ mod tests {
             other => panic!("unexpected error: {other}"),
         }
         assert_eq!(replay_row.get::<String, _>("replay_status"), "pending");
+    }
+
+    #[tokio::test]
+    async fn replay_inbound_dead_letters_replays_memory_archive_event_after_memory_refs_exist() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let factory = SqlxUnitOfWorkFactory::new(pool.clone());
+        let role_service = RoleCatalogSyncService::new(factory.clone());
+        let career_service = CareerEventConsumerService::new(factory.clone());
+        let memory_archive_service =
+            MemoryRefsCommandService::new(factory.clone(), NoopMemoryArchivePort);
+        let tombstone_service =
+            TombstoneFlowService::new(factory.clone(), NoopGovernancePort, NoopArchiveRequester);
+
+        let outcome = memory_archive_service
+            .handle_archive_event(sample_memory_archive_event(
+                "memory-archive-replay-001",
+                "memory-archive-replay-hash-001",
+                "member-memory-replay-001",
+                "archived",
+                now() + Duration::seconds(5),
+            ))
+            .await
+            .expect("missing memory refs should dead-letter");
+        assert!(matches!(
+            outcome,
+            crate::application::memory_refs::MemoryArchiveEventOutcome::DeadLettered
+        ));
+        let original_created_at: PrimitiveDateTime =
+            sqlx::query("SELECT created_at FROM inbound_dead_letters WHERE source_event_id = $1")
+                .bind("memory-archive-replay-001")
+                .fetch_one(&pool)
+                .await
+                .expect("load archive dead-letter timestamp")
+                .get("created_at");
+
+        insert_member(&pool, "member-memory-replay-001", "Memory Replay Member").await;
+        insert_memory_refs(&pool, "member-memory-replay-001", ArchiveStatus::None, None).await;
+
+        let replay_job = InboundDeadLetterReplayJob::new(
+            factory.clone(),
+            role_service,
+            career_service,
+            memory_archive_service,
+            tombstone_service,
+        );
+        let summary = replay_job
+            .replay_inbound_dead_letters(10)
+            .await
+            .expect("archive replay should succeed after refs exist");
+
+        let replay_row = sqlx::query(
+            "SELECT replay_status, created_at FROM inbound_dead_letters WHERE source_event_id = $1",
+        )
+        .bind("memory-archive-replay-001")
+        .fetch_one(&pool)
+        .await
+        .expect("load archive replay row");
+        let memory_refs_row = sqlx::query(
+            "SELECT archive_status, archive_ref_json FROM memory_refs WHERE global_member_id = $1",
+        )
+        .bind("member-memory-replay-001")
+        .fetch_one(&pool)
+        .await
+        .expect("load replayed memory refs row");
+        let outbox_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM outbox_events WHERE event_type = 'identity.memory_refs.archive_status_changed' AND idempotency_key = $1",
+        )
+        .bind("memory-archive-replay-001")
+        .fetch_one(&pool)
+        .await
+        .expect("count archive outbox rows");
+
+        assert_eq!(
+            summary,
+            ReplayInboundDeadLettersSummary {
+                scanned: 1,
+                replayed: 1,
+                still_pending: 0,
+            }
+        );
+        assert_eq!(replay_row.get::<String, _>("replay_status"), "replayed");
+        assert_eq!(
+            replay_row.get::<PrimitiveDateTime, _>("created_at"),
+            original_created_at
+        );
+        assert_eq!(
+            memory_refs_row.get::<String, _>("archive_status"),
+            "archived"
+        );
+        assert_eq!(
+            memory_refs_row
+                .get::<Option<serde_json::Value>, _>("archive_ref_json")
+                .expect("archive ref should exist"),
+            json!({
+                "archive_id": "archive-member-memory-replay-001",
+                "archive_kind": "member_memory_archive",
+                "archive_version": "v1",
+            })
+        );
+        assert_eq!(outbox_count, 1);
     }
 
     #[tokio::test]
@@ -3371,6 +3624,101 @@ mod tests {
                 .expect("failure reason should be recorded")
                 .contains("invalid lifecycle `unknown` in member-created outbox payload")
         );
+    }
+
+    #[tokio::test]
+    async fn rebuild_member_summary_projection_applies_archive_status_changed_events() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let first_created_at = now();
+        let second_created_at = first_created_at + Duration::seconds(1);
+        seed_outbox_event(
+            &pool,
+            sample_member_created_projection_event(
+                "outbox-member-162",
+                "member-162",
+                "Member One Six Two",
+                "role.member.operator",
+                first_created_at,
+            ),
+        )
+        .await;
+
+        let job = ProjectionRebuildJob::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        job.rebuild_member_summary_projection("member-summary-rebuild", 10)
+            .await
+            .expect("initial projection rebuild should succeed");
+
+        seed_outbox_event(
+            &pool,
+            sample_memory_archive_status_changed_projection_event(
+                "outbox-memory-archive-162",
+                "memory-refs:member-162",
+                "member-162",
+                "Member One Six Two",
+                "role.member.operator",
+                second_created_at,
+            ),
+        )
+        .await;
+
+        let summary = job
+            .rebuild_member_summary_projection("member-summary-rebuild", 10)
+            .await
+            .expect("archive-status projection rebuild should succeed");
+
+        let projection_row = sqlx::query(
+            r#"
+            SELECT
+                memory_ref_summary_json,
+                projection_version
+            FROM member_summary_projection
+            WHERE global_member_id = $1
+            "#,
+        )
+        .bind("member-162")
+        .fetch_one(&pool)
+        .await
+        .expect("load projection after archive status update");
+
+        assert_eq!(
+            summary,
+            RebuildMemberSummaryProjectionSummary {
+                scanned: 1,
+                rebuilt: 1,
+                skipped: 0,
+            }
+        );
+        assert_eq!(
+            projection_row.get::<serde_json::Value, _>("memory_ref_summary_json"),
+            json!({
+                "memory_refs_id": "memory-refs:member-162",
+                "semantic_memory_ref": {
+                    "memory_id": "memory-semantic-162",
+                    "memory_kind": "semantic",
+                    "memory_version": "v1",
+                },
+                "episodic_memory_refs": [
+                    {
+                        "memory_id": "memory-episodic-162",
+                        "memory_kind": "episodic",
+                        "memory_version": "v1",
+                    }
+                ],
+                "archive_ref": {
+                    "archive_id": "archive-member-162",
+                    "archive_kind": "member_memory_archive",
+                    "archive_version": "v1",
+                },
+                "archive_status": "archived",
+                "version": 3,
+            })
+        );
+        assert_eq!(projection_row.get::<i64, _>("projection_version"), 3);
     }
 
     #[tokio::test]
@@ -4503,6 +4851,57 @@ mod tests {
         .expect("insert member");
     }
 
+    async fn insert_memory_refs(
+        pool: &sqlx::postgres::PgPool,
+        global_member_id: &str,
+        archive_status: ArchiveStatus,
+        archive_ref: Option<ArchiveRef>,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO memory_refs (
+                memory_refs_id,
+                global_member_id,
+                semantic_memory_ref_json,
+                episodic_memory_refs_json,
+                archive_ref_json,
+                archive_status,
+                version,
+                updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            "#,
+        )
+        .bind(format!("memory-refs:{global_member_id}"))
+        .bind(global_member_id)
+        .bind(json!({
+            "memory_id": format!("memory-semantic-{global_member_id}"),
+            "memory_kind": "semantic",
+            "memory_version": "v1",
+        }))
+        .bind(json!([
+            {
+                "memory_id": format!("memory-episodic-{global_member_id}"),
+                "memory_kind": "episodic",
+                "memory_version": "v1",
+            }
+        ]))
+        .bind(archive_ref.map(|value| json!(value)))
+        .bind(archive_status.as_db())
+        .bind(1_i64)
+        .bind(now())
+        .execute(pool)
+        .await
+        .expect("insert memory refs");
+
+        sqlx::query("UPDATE global_members SET memory_refs_id = $2, updated_at = $3 WHERE global_member_id = $1")
+            .bind(global_member_id)
+            .bind(format!("memory-refs:{global_member_id}"))
+            .bind(now())
+            .execute(pool)
+            .await
+            .expect("link member memory refs");
+    }
+
     fn sample_pending_outbox_event(outbox_event_id: &str) -> OutboxEvent {
         OutboxEvent {
             outbox_event_id: OutboxEventId::new(outbox_event_id),
@@ -4548,6 +4947,40 @@ mod tests {
                     "ended_at": now() + Duration::seconds(45),
                     "payload_summary": {
                         "activity_name": "Career review",
+                    }
+                }),
+            },
+        }
+    }
+
+    fn sample_memory_archive_event(
+        source_event_id: &str,
+        payload_hash: &str,
+        global_member_id: &str,
+        status: &str,
+        occurred_at: PrimitiveDateTime,
+    ) -> InboundMemoryArchiveEvent {
+        InboundMemoryArchiveEvent {
+            envelope: InboundEventEnvelope {
+                source_event_id: EventId::new(source_event_id),
+                source_module: "memory-archive".to_string(),
+                event_type: "memory.archive.status.changed".to_string(),
+                occurred_at,
+                payload_hash: payload_hash.to_string(),
+                payload: json!({
+                    "archive_status_snapshot": {
+                        "global_member_id": global_member_id,
+                        "archive_ref": {
+                            "archive_id": format!("archive-{global_member_id}"),
+                            "archive_kind": "member_memory_archive",
+                            "archive_version": "v1",
+                        },
+                        "status": status,
+                        "reason": if status == "failed" {
+                            Some("archive validation failed")
+                        } else {
+                            Option::<&str>::None
+                        },
                     }
                 }),
             },
@@ -4707,6 +5140,60 @@ mod tests {
                     "version": 2,
                 },
                 "version": 2,
+                "updated_at": created_at,
+            }),
+            idempotency_key: format!("idem-{outbox_event_id}"),
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            next_retry_at: None,
+            created_at,
+            published_at: None,
+            failure_reason: None,
+        }
+    }
+
+    fn sample_memory_archive_status_changed_projection_event(
+        outbox_event_id: &str,
+        memory_refs_id: &str,
+        global_member_id: &str,
+        display_name: &str,
+        main_role_id: &str,
+        created_at: PrimitiveDateTime,
+    ) -> OutboxEvent {
+        OutboxEvent {
+            outbox_event_id: OutboxEventId::new(outbox_event_id),
+            aggregate_type: "memory_refs".to_string(),
+            aggregate_id: memory_refs_id.to_string(),
+            event_type: "identity.memory_refs.archive_status_changed".to_string(),
+            payload_json: json!({
+                "memory_refs_id": memory_refs_id,
+                "global_member_id": global_member_id,
+                "display_name": display_name,
+                "lifecycle": "hired",
+                "main_role_id": main_role_id,
+                "memory_ref_summary_json": {
+                    "memory_refs_id": memory_refs_id,
+                    "semantic_memory_ref": {
+                        "memory_id": "memory-semantic-162",
+                        "memory_kind": "semantic",
+                        "memory_version": "v1",
+                    },
+                    "episodic_memory_refs": [
+                        {
+                            "memory_id": "memory-episodic-162",
+                            "memory_kind": "episodic",
+                            "memory_version": "v1",
+                        }
+                    ],
+                    "archive_ref": {
+                        "archive_id": "archive-member-162",
+                        "archive_kind": "member_memory_archive",
+                        "archive_version": "v1",
+                    },
+                    "archive_status": "archived",
+                    "version": 3,
+                },
+                "version": 3,
                 "updated_at": created_at,
             }),
             idempotency_key: format!("idem-{outbox_event_id}"),

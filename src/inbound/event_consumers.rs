@@ -1,12 +1,13 @@
 //! Inbound event consumer entrypoints that delegate into application services.
 
 use crate::application::career_event::{CareerEventConsumerService, CareerEventOutcome};
+use crate::application::memory_refs::{MemoryArchiveEventOutcome, MemoryRefsCommandService};
 use crate::application::role_catalog_sync::{RoleCatalogSyncOutcome, RoleCatalogSyncService};
 use crate::application::tombstone_flow::{GateDecisionOutcome, TombstoneFlowService};
 use crate::error::IdentityError;
 use crate::inbound::events::{
-    InboundGateDecisionEvent, InboundProcessFactEvent, InboundRoleCatalogEvent,
-    InboundWorkFactEvent,
+    InboundGateDecisionEvent, InboundMemoryArchiveEvent, InboundProcessFactEvent,
+    InboundRoleCatalogEvent, InboundWorkFactEvent,
 };
 
 /// Consumer entrypoint for method-library role-catalog events.
@@ -79,14 +80,36 @@ where
     }
 }
 
-/// Placeholder archive event consumer.
-#[derive(Debug, Default)]
-pub struct MemoryArchiveConsumer;
+/// Consumer entrypoint for trusted memory/archive status events.
+#[derive(Debug, Clone)]
+pub struct MemoryArchiveConsumer<Service> {
+    service: Service,
+}
 
-impl MemoryArchiveConsumer {
-    /// Returns a stable placeholder operation name for diagnostics.
+impl<Service> MemoryArchiveConsumer<Service> {
+    /// Creates a memory/archive consumer bound to the provided application service.
+    pub fn new(service: Service) -> Self {
+        Self { service }
+    }
+
+    /// Returns a stable operation name for diagnostics and tests.
     pub fn operation_name(&self) -> &'static str {
         "HandleMemoryArchiveEvent"
+    }
+}
+
+impl<UowFactory, MemoryArchiveValidator>
+    MemoryArchiveConsumer<MemoryRefsCommandService<UowFactory, MemoryArchiveValidator>>
+where
+    UowFactory: crate::application::persistence::UnitOfWorkFactory,
+    MemoryArchiveValidator: crate::outbound::MemoryArchivePort,
+{
+    /// Consumes one archive status event through the application service boundary.
+    pub async fn consume(
+        &self,
+        event: InboundMemoryArchiveEvent,
+    ) -> Result<MemoryArchiveEventOutcome, IdentityError> {
+        self.service.handle_archive_event(event).await
     }
 }
 

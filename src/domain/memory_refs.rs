@@ -156,6 +156,8 @@ pub struct MemoryRefsSummary {
     pub archive_status: ArchiveStatus,
     /// Current memory refs version.
     pub version: i64,
+    /// Last update timestamp retained for event ordering and diagnostics.
+    pub updated_at: PrimitiveDateTime,
 }
 
 impl MemoryRefs {
@@ -227,6 +229,57 @@ impl MemoryRefs {
         Ok(())
     }
 
+    /// Marks the memory refs aggregate as archive failed while keeping the archive ref.
+    pub fn mark_archive_failed(
+        &mut self,
+        archive_ref: ArchiveRef,
+        reason: &str,
+    ) -> Result<(), IdentityError> {
+        archive_ref.validate()?;
+        if reason.trim().is_empty() {
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_INVALID_ARGUMENT",
+                message: "archive failure reason must not be blank".to_string(),
+            });
+        }
+
+        self.archive_ref = Some(archive_ref);
+        self.archive_status = ArchiveStatus::Failed;
+        self.touch();
+        Ok(())
+    }
+
+    /// Returns whether one archive update should be rejected as stale relative to local state.
+    pub fn rejects_archive_update(
+        &self,
+        next_status: ArchiveStatus,
+        occurred_at: PrimitiveDateTime,
+    ) -> bool {
+        if self.archive_status == next_status {
+            return self.archive_ref.is_some();
+        }
+
+        // Once a terminal archive state has already been recorded, older events must not roll it back.
+        if matches!(
+            self.archive_status,
+            ArchiveStatus::Archived | ArchiveStatus::Failed
+        ) && occurred_at < self.updated_at
+        {
+            return true;
+        }
+
+        // A terminal archive state must not regress back into a pending state.
+        if matches!(
+            self.archive_status,
+            ArchiveStatus::Archived | ArchiveStatus::Failed
+        ) && next_status == ArchiveStatus::Pending
+        {
+            return true;
+        }
+
+        false
+    }
+
     /// Returns the command-side summary for the current memory refs aggregate.
     pub fn summary(&self) -> MemoryRefsSummary {
         MemoryRefsSummary {
@@ -237,6 +290,7 @@ impl MemoryRefs {
             archive_ref: self.archive_ref.clone(),
             archive_status: self.archive_status,
             version: self.version,
+            updated_at: self.updated_at,
         }
     }
 

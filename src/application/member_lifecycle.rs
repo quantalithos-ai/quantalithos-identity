@@ -1044,6 +1044,7 @@ mod tests {
                 status,
                 updated_at
             ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (role_id) DO NOTHING
             "#,
         )
         .bind(role_id)

@@ -171,7 +171,7 @@ impl MemberSummaryProjection {
 
                 Ok(Some(projection))
             }
-            "identity.memory_refs.updated" => {
+            "identity.memory_refs.updated" | "identity.memory_refs.archive_status_changed" => {
                 let payload: MemoryRefsUpdatedProjectionPayload =
                     serde_json::from_value(event.payload_json.clone()).map_err(|error| {
                         IdentityError::PersistenceData {

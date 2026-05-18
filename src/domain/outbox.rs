@@ -288,6 +288,39 @@ impl OutboxEvent {
         }
     }
 
+    /// Creates the outbox record produced by a successful archive-status inbound event.
+    pub fn for_memory_archive_status_changed(
+        outbox_event_id: OutboxEventId,
+        member: &GlobalMember,
+        memory_refs: &MemoryRefs,
+        idempotency_key: &str,
+        created_at: PrimitiveDateTime,
+    ) -> Self {
+        Self {
+            outbox_event_id,
+            aggregate_type: "memory_refs".to_string(),
+            aggregate_id: memory_refs.memory_refs_id.as_str().to_string(),
+            event_type: "identity.memory_refs.archive_status_changed".to_string(),
+            payload_json: json!({
+                "memory_refs_id": memory_refs.memory_refs_id.as_str(),
+                "global_member_id": memory_refs.global_member_id.as_str(),
+                "display_name": member.display_name,
+                "lifecycle": member.lifecycle.as_db(),
+                "main_role_id": member.main_role_id.as_str(),
+                "memory_ref_summary_json": memory_refs.summary_json(),
+                "version": memory_refs.version,
+                "updated_at": memory_refs.updated_at,
+            }),
+            idempotency_key: idempotency_key.to_string(),
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            next_retry_at: None,
+            created_at,
+            published_at: None,
+            failure_reason: None,
+        }
+    }
+
     /// Creates the outbox record produced by a successful career-history append.
     pub fn for_career_history_appended(
         outbox_event_id: OutboxEventId,

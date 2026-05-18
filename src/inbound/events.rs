@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::PrimitiveDateTime;
 
-use crate::domain::shared::ids::{EventId, RoleId};
+use crate::domain::memory_refs::ArchiveRef;
+use crate::domain::shared::ids::{EventId, GlobalMemberId, RoleId};
 use crate::domain::tombstone::{GateDecision, GateDecisionRef};
 use crate::error::IdentityError;
 
@@ -63,6 +64,26 @@ pub struct InboundProcessFactEvent {
     pub envelope: InboundEventEnvelope,
 }
 
+/// Minimal memory/archive status snapshot consumable by identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryArchiveStatusSnapshot {
+    /// Member whose memory refs aggregate should be updated.
+    pub global_member_id: GlobalMemberId,
+    /// Ref-only archive result snapshot.
+    pub archive_ref: ArchiveRef,
+    /// Source archive status mapped onto the local memory refs status model.
+    pub status: String,
+    /// Optional failure reason retained for failed archive completion.
+    pub reason: Option<String>,
+}
+
+/// Raw inbound memory/archive status event routed into memory refs status updates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InboundMemoryArchiveEvent {
+    /// Standardized envelope metadata extracted by the transport boundary.
+    pub envelope: InboundEventEnvelope,
+}
+
 /// Raw inbound governance gate-decision event routed into tombstone evidence recording.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InboundGateDecisionEvent {
@@ -92,6 +113,32 @@ impl RoleCatalogEventParser {
 
         serde_json::from_value(role_snapshot).map_err(|error| IdentityError::PersistenceData {
             message: format!("decode role catalog snapshot payload: {error}"),
+        })
+    }
+}
+
+/// Parses memory/archive status payloads into the minimal identity-local archive update view.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MemoryArchiveEventParser;
+
+impl MemoryArchiveEventParser {
+    /// Parses the inbound payload into a validated archive status snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload is malformed or missing `archive_status_snapshot`.
+    pub fn parse(&self, payload: Value) -> Result<MemoryArchiveStatusSnapshot, IdentityError> {
+        let archive_status_snapshot = payload.get("archive_status_snapshot").cloned().ok_or(
+            IdentityError::InvalidConfiguration {
+                key: "InboundMemoryArchiveEvent.payload.archive_status_snapshot".to_string(),
+                reason: "field is required".to_string(),
+            },
+        )?;
+
+        serde_json::from_value(archive_status_snapshot).map_err(|error| {
+            IdentityError::PersistenceData {
+                message: format!("decode memory archive status payload: {error}"),
+            }
         })
     }
 }
