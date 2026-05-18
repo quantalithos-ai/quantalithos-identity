@@ -1,7 +1,7 @@
 //! Audit trace records appended by command and event handling flows.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use time::PrimitiveDateTime;
 
 /// Enumerates the supported terminal results for an audit trace entry.
@@ -58,4 +58,34 @@ pub struct AuditTraceEntry {
     pub reason: Option<String>,
     /// Timestamp when the audit row was captured.
     pub created_at: PrimitiveDateTime,
+}
+
+impl AuditTraceEntry {
+    /// Creates an audit trace row for a handled inbound event.
+    pub fn for_inbound_event(
+        audit_trace_id: impl Into<String>,
+        action: impl Into<String>,
+        source_module: impl Into<String>,
+        trace_id: impl Into<String>,
+        target_ref_json: Option<Value>,
+        result: AuditResult,
+        reason: Option<String>,
+        created_at: PrimitiveDateTime,
+    ) -> Self {
+        Self {
+            audit_trace_id: audit_trace_id.into(),
+            trace_id: trace_id.into(),
+            action: action.into(),
+            actor_json: Some(json!({
+                "actor_ref": "system/inbound-event",
+                "actor_kind": "system",
+                "global_member_id": null,
+            })),
+            target_ref_json,
+            source_module: Some(source_module.into()),
+            result,
+            reason,
+            created_at,
+        }
+    }
 }

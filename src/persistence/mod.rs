@@ -2,4 +2,6 @@
 
 pub mod database;
 pub mod repositories;
+#[cfg(test)]
+pub mod test_support;
 pub mod unit_of_work;

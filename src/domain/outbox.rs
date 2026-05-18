@@ -1,9 +1,10 @@
 //! Outbox records used to persist durable event publication state.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use time::PrimitiveDateTime;
 
+use crate::domain::role_catalog::RoleCatalogEntry;
 use crate::domain::shared::ids::OutboxEventId;
 
 /// Enumerates the lifecycle states allowed for persisted outbox events.
@@ -66,4 +67,37 @@ pub struct OutboxEvent {
     pub published_at: Option<PrimitiveDateTime>,
     /// Most recent failure reason captured by the publisher workflow.
     pub failure_reason: Option<String>,
+}
+
+impl OutboxEvent {
+    /// Creates the outbox record produced by a successful role-catalog synchronization.
+    pub fn for_role_catalog_sync(
+        outbox_event_id: OutboxEventId,
+        entry: &RoleCatalogEntry,
+        idempotency_key: &str,
+        created_at: PrimitiveDateTime,
+    ) -> Self {
+        Self {
+            outbox_event_id,
+            aggregate_type: "role_catalog_entry".to_string(),
+            aggregate_id: entry.role_id.as_str().to_string(),
+            event_type: "identity.role_catalog.synced".to_string(),
+            payload_json: json!({
+                "role_id": entry.role_id.as_str(),
+                "role_name": entry.role_name,
+                "role_version": entry.role_version,
+                "source_ref": entry.source_ref_json,
+                "fingerprint": entry.fingerprint,
+                "status": entry.status.as_db(),
+                "updated_at": entry.updated_at,
+            }),
+            idempotency_key: idempotency_key.to_string(),
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            next_retry_at: None,
+            created_at,
+            published_at: None,
+            failure_reason: None,
+        }
+    }
 }

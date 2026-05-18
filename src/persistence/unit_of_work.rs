@@ -143,12 +143,11 @@ impl UnitOfWorkFactory for SqlxUnitOfWorkFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::LazyLock;
+    use std::sync::Arc;
 
     use serde_json::json;
     use sqlx::{Executor, Row, postgres::PgPoolOptions};
     use time::{OffsetDateTime, PrimitiveDateTime};
-    use tokio::sync::Mutex;
 
     use crate::application::persistence::{
         AuditTraceRepository, GlobalMemberRepository, IdempotencyStore, InboundDeadLetterStore,
@@ -169,14 +168,14 @@ mod tests {
     use crate::domain::timeline::{LifecycleEventType, LifecycleHistoryEntry};
     use crate::error::IdentityError;
     use crate::persistence::database::run_migrations;
+    use crate::persistence::test_support::DB_TEST_MUTEX;
 
     use super::SqlxUnitOfWorkFactory;
 
-    static DB_TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
     #[tokio::test]
     async fn unit_of_work_commits_member_history_audit_and_idempotency() {
-        let _guard = DB_TEST_MUTEX.lock().await;
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
         let pool = test_pool().await;
         reset_tables(&pool).await;
         seed_role(&pool).await;
@@ -270,7 +269,8 @@ mod tests {
 
     #[tokio::test]
     async fn unit_of_work_rollback_discards_all_pending_writes() {
-        let _guard = DB_TEST_MUTEX.lock().await;
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
         let pool = test_pool().await;
         reset_tables(&pool).await;
         seed_role(&pool).await;
@@ -296,7 +296,8 @@ mod tests {
 
     #[tokio::test]
     async fn global_member_save_uses_optimistic_locking() {
-        let _guard = DB_TEST_MUTEX.lock().await;
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
         let pool = test_pool().await;
         reset_tables(&pool).await;
         seed_role(&pool).await;
@@ -336,7 +337,8 @@ mod tests {
 
     #[tokio::test]
     async fn role_catalog_round_trip_and_idempotency_lookup_work_inside_unit_of_work() {
-        let _guard = DB_TEST_MUTEX.lock().await;
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
         let pool = test_pool().await;
         reset_tables(&pool).await;
 
@@ -396,7 +398,8 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_store_lists_pending_and_saves_publish_status() {
-        let _guard = DB_TEST_MUTEX.lock().await;
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
         let pool = test_pool().await;
         reset_tables(&pool).await;
 
@@ -487,7 +490,8 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_store_lists_rows_after_checkpoint_cursor() {
-        let _guard = DB_TEST_MUTEX.lock().await;
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
         let pool = test_pool().await;
         reset_tables(&pool).await;
 
@@ -542,7 +546,8 @@ mod tests {
 
     #[tokio::test]
     async fn projection_and_dead_letter_stores_round_trip() {
-        let _guard = DB_TEST_MUTEX.lock().await;
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
         let pool = test_pool().await;
         reset_tables(&pool).await;
 

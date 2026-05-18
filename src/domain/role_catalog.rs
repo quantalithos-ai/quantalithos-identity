@@ -5,6 +5,8 @@ use serde_json::Value;
 use time::PrimitiveDateTime;
 
 use crate::domain::shared::ids::RoleId;
+use crate::error::IdentityError;
+use crate::inbound::events::RoleDefinitionSnapshot;
 
 /// Enumerates the states allowed for a local role catalog entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,4 +58,32 @@ pub struct RoleCatalogEntry {
     pub status: RoleCatalogStatus,
     /// Last successful synchronization timestamp.
     pub updated_at: PrimitiveDateTime,
+}
+
+impl RoleCatalogEntry {
+    /// Creates a local role catalog entry from the minimal method-library snapshot view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the upstream status cannot be mapped to the local status model.
+    pub fn from_role_definition_snapshot(
+        snapshot: RoleDefinitionSnapshot,
+        updated_at: PrimitiveDateTime,
+    ) -> Result<Self, IdentityError> {
+        let status = RoleCatalogStatus::from_db(snapshot.status.as_str()).ok_or(
+            IdentityError::PersistenceData {
+                message: format!("unknown role catalog status `{}`", snapshot.status),
+            },
+        )?;
+
+        Ok(Self {
+            role_id: snapshot.role_id,
+            role_name: snapshot.role_name,
+            role_version: snapshot.role_version,
+            source_ref_json: snapshot.source_ref,
+            fingerprint: snapshot.fingerprint,
+            status,
+            updated_at,
+        })
+    }
 }
