@@ -53,6 +53,11 @@ pub trait RoleCatalogRepository {
         role_id: &RoleId,
     ) -> impl std::future::Future<Output = Result<Option<RoleCatalogEntry>, IdentityError>> + Send;
 
+    /// Lists every local role catalog row for reconciliation and diagnostics.
+    fn list_all(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Vec<RoleCatalogEntry>, IdentityError>> + Send;
+
     /// Inserts or updates a role catalog entry based on its stable role id.
     fn upsert(
         &mut self,

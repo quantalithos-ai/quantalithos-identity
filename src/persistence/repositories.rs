@@ -273,6 +273,28 @@ impl RoleCatalogRepository for SqlxRoleCatalogRepository<'_, '_> {
         row.map(map_role_catalog_row).transpose()
     }
 
+    async fn list_all(&mut self) -> Result<Vec<RoleCatalogEntry>, IdentityError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                role_id,
+                role_name,
+                role_version,
+                source_ref_json,
+                fingerprint,
+                status,
+                updated_at
+            FROM role_catalog_entries
+            ORDER BY role_id
+            "#,
+        )
+        .fetch_all(self.transaction.as_mut())
+        .await
+        .map_err(IdentityError::DatabasePool)?;
+
+        rows.into_iter().map(map_role_catalog_row).collect()
+    }
+
     async fn upsert(&mut self, entry: &RoleCatalogEntry) -> Result<(), IdentityError> {
         sqlx::query(
             r#"

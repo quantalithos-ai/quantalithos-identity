@@ -227,4 +227,31 @@ impl AuditTraceEntry {
             created_at,
         }
     }
+
+    /// Creates an audit trace row for an operations job execution.
+    pub fn for_operations_job(
+        audit_trace_id: impl Into<String>,
+        action: impl Into<String>,
+        trace_id: impl Into<String>,
+        target_ref_json: Option<Value>,
+        result: AuditResult,
+        reason: Option<String>,
+        created_at: PrimitiveDateTime,
+    ) -> Self {
+        Self {
+            audit_trace_id: audit_trace_id.into(),
+            trace_id: trace_id.into(),
+            action: action.into(),
+            actor_json: Some(json!({
+                "actor_ref": "system/operations",
+                "actor_kind": "system",
+                "global_member_id": null,
+            })),
+            target_ref_json,
+            source_module: Some("operations".to_string()),
+            result,
+            reason,
+            created_at,
+        }
+    }
 }

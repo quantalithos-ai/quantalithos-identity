@@ -8,6 +8,7 @@ use crate::domain::shared::context::ActorContext;
 use crate::domain::shared::ids::GlobalMemberId;
 use crate::domain::tombstone::GateDecisionRef;
 use crate::error::IdentityError;
+use crate::inbound::events::RoleDefinitionSnapshot;
 
 /// Validates external artifact refs without copying artifact bodies into identity.
 pub trait ArtifactPort {
@@ -57,4 +58,12 @@ pub trait BusPublisherPort {
         &self,
         event: &OutboxEvent,
     ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
+}
+
+/// Reads the authoritative method-library role catalog for reconciliation jobs.
+pub trait MethodLibraryRoleCatalogPort {
+    /// Lists the authoritative role snapshots that identity may index locally.
+    fn list_role_catalog(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<RoleDefinitionSnapshot>, IdentityError>> + Send;
 }

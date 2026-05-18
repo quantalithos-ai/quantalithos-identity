@@ -4,11 +4,13 @@ use time::{OffsetDateTime, PrimitiveDateTime};
 
 use crate::application::career_event::CareerEventOutcome;
 use crate::application::persistence::{
-    IdempotencyStore, InboundDeadLetterStore, MemberSummaryProjectionRepository, OutboxStore,
-    ProjectionCheckpointRepository, RoleCatalogRepository, UnitOfWork, UnitOfWorkFactory,
+    AuditTraceRepository, IdempotencyStore, InboundDeadLetterStore,
+    MemberSummaryProjectionRepository, OutboxStore, ProjectionCheckpointRepository,
+    RoleCatalogRepository, UnitOfWork, UnitOfWorkFactory,
 };
 use crate::application::role_catalog_sync::RoleCatalogSyncOutcome;
 use crate::application::tombstone_flow::GateDecisionOutcome;
+use crate::domain::audit::{AuditResult, AuditTraceEntry};
 use crate::domain::dead_letter::InboundDeadLetter;
 use crate::domain::idempotency::{IdempotencyScope, IdempotencyStatus};
 use crate::domain::outbox::OutboxEvent;
@@ -17,9 +19,9 @@ use crate::domain::shared::ids::{DeadLetterId, OutboxEventId};
 use crate::error::IdentityError;
 use crate::inbound::events::{
     InboundEventEnvelope, InboundGateDecisionEvent, InboundProcessFactEvent,
-    InboundRoleCatalogEvent, InboundWorkFactEvent,
+    InboundRoleCatalogEvent, InboundWorkFactEvent, RoleDefinitionSnapshot,
 };
-use crate::outbound::BusPublisherPort;
+use crate::outbound::{BusPublisherPort, MethodLibraryRoleCatalogPort};
 
 /// Summary returned after one publisher pass over the pending outbox batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +100,25 @@ pub struct IgnoreInboundDeadLetterResult {
 pub struct ReplayInboundDeadLetterResult {
     /// Identifier of the dead-letter row that was replayed successfully.
     pub dead_letter_id: String,
+}
+
+/// Summary returned after one role-catalog reconciliation pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileRoleCatalogSummary {
+    /// Number of authoritative source roles scanned during the pass.
+    pub scanned: usize,
+    /// Number of local rows inserted because the source role was missing locally.
+    pub missing: usize,
+    /// Number of local rows refreshed from matching-fingerprint source snapshots.
+    pub refreshed: usize,
+    /// Number of local rows updated to `deprecated`.
+    pub deprecated: usize,
+    /// Number of local rows marked `source_drift`.
+    pub drifted: usize,
+    /// Number of local rows that were not present in the authoritative source snapshot.
+    pub local_only: usize,
+    /// Number of local rows that already matched the source snapshot.
+    pub unchanged: usize,
 }
 
 /// Replays one dead-lettered role-catalog event through the application-service boundary.
@@ -1222,14 +1243,62 @@ where
     }
 }
 
-/// Placeholder role reconciliation job.
-#[derive(Debug, Default)]
-pub struct RoleReconciliationJob;
+/// Reconciles the local role-catalog index against the authoritative method-library catalog.
+#[derive(Debug, Clone)]
+pub struct RoleReconciliationJob<UowFactory, RoleCatalogPort> {
+    unit_of_work_factory: UowFactory,
+    role_catalog_port: RoleCatalogPort,
+}
 
-impl RoleReconciliationJob {
-    /// Returns a stable placeholder operation name for diagnostics.
+impl<UowFactory, RoleCatalogPort> RoleReconciliationJob<UowFactory, RoleCatalogPort> {
+    /// Creates a new role-catalog reconciliation job.
+    pub fn new(unit_of_work_factory: UowFactory, role_catalog_port: RoleCatalogPort) -> Self {
+        Self {
+            unit_of_work_factory,
+            role_catalog_port,
+        }
+    }
+
+    /// Returns a stable operations name for diagnostics and tests.
     pub fn operation_name(&self) -> &'static str {
         "ReconcileRoleCatalog"
+    }
+}
+
+impl<UowFactory, RoleCatalogPort> RoleReconciliationJob<UowFactory, RoleCatalogPort>
+where
+    UowFactory: UnitOfWorkFactory,
+    RoleCatalogPort: MethodLibraryRoleCatalogPort,
+{
+    /// Reconciles local role-index rows against the authoritative method-library catalog.
+    ///
+    /// CAUTION: This job only repairs the local index and append-only audit evidence.
+    /// It must not mutate any external source of truth.
+    pub async fn reconcile_role_catalog(
+        &self,
+    ) -> Result<ReconcileRoleCatalogSummary, IdentityError> {
+        let now = current_timestamp();
+        let authoritative_roles = match self.role_catalog_port.list_role_catalog().await {
+            Ok(snapshots) => snapshots,
+            Err(error) => {
+                append_failed_reconciliation_audit(
+                    &self.unit_of_work_factory,
+                    self.operation_name(),
+                    now,
+                    error.to_string(),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+        let summary = reconcile_role_catalog_entries(
+            &self.unit_of_work_factory,
+            &authoritative_roles,
+            now,
+            self.operation_name(),
+        )
+        .await?;
+        Ok(summary)
     }
 }
 
@@ -1240,6 +1309,196 @@ fn current_timestamp() -> PrimitiveDateTime {
 
 fn replay_payload_hash(payload_json: &serde_json::Value) -> String {
     payload_json.to_string()
+}
+
+async fn reconcile_role_catalog_entries<UowFactory>(
+    unit_of_work_factory: &UowFactory,
+    authoritative_roles: &[RoleDefinitionSnapshot],
+    now: PrimitiveDateTime,
+    action_name: &str,
+) -> Result<ReconcileRoleCatalogSummary, IdentityError>
+where
+    UowFactory: UnitOfWorkFactory,
+{
+    let mut uow = unit_of_work_factory.begin().await?;
+    let summary =
+        reconcile_role_catalog_entries_in_uow(&mut uow, authoritative_roles, now, action_name)
+            .await;
+
+    match summary {
+        Ok(summary) => {
+            uow.commit().await?;
+            Ok(summary)
+        }
+        Err(error) => {
+            uow.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
+async fn reconcile_role_catalog_entries_in_uow<Uow>(
+    uow: &mut Uow,
+    authoritative_roles: &[RoleDefinitionSnapshot],
+    now: PrimitiveDateTime,
+    action_name: &str,
+) -> Result<ReconcileRoleCatalogSummary, IdentityError>
+where
+    Uow: UnitOfWork,
+{
+    let local_entries = uow.role_catalog().list_all().await?;
+    let mut local_by_role_id = std::collections::HashMap::with_capacity(local_entries.len());
+    for entry in local_entries {
+        local_by_role_id.insert(entry.role_id.as_str().to_string(), entry);
+    }
+
+    let mut summary = ReconcileRoleCatalogSummary {
+        scanned: authoritative_roles.len(),
+        missing: 0,
+        refreshed: 0,
+        deprecated: 0,
+        drifted: 0,
+        local_only: 0,
+        unchanged: 0,
+    };
+
+    for snapshot in authoritative_roles {
+        match local_by_role_id.remove(snapshot.role_id.as_str()) {
+            None => {
+                let entry =
+                    crate::domain::role_catalog::RoleCatalogEntry::from_role_definition_snapshot_ref(
+                        snapshot, now,
+                    )?;
+                uow.role_catalog().upsert(&entry).await?;
+                summary.missing += 1;
+            }
+            Some(mut entry) => {
+                if entry.matches_snapshot(snapshot)? {
+                    summary.unchanged += 1;
+                    continue;
+                }
+
+                match snapshot.status.as_str() {
+                    "deprecated" => {
+                        entry.role_version = snapshot.role_version.clone();
+                        entry.source_ref_json = snapshot.source_ref.clone();
+                        entry.fingerprint = snapshot.fingerprint.clone();
+                        entry.mark_deprecated(now);
+                        if entry.role_name != snapshot.role_name {
+                            entry.rename(snapshot.role_name.clone(), now);
+                        }
+                        uow.role_catalog().upsert(&entry).await?;
+                        summary.deprecated += 1;
+                    }
+                    "active" | "source_drift" => {
+                        if entry.fingerprint != snapshot.fingerprint {
+                            entry.mark_source_drift(snapshot.fingerprint.clone(), now);
+                            uow.role_catalog().upsert(&entry).await?;
+                            summary.drifted += 1;
+                        } else {
+                            entry.apply_snapshot(snapshot, now)?;
+                            uow.role_catalog().upsert(&entry).await?;
+                            summary.refreshed += 1;
+                        }
+                    }
+                    other => {
+                        return Err(IdentityError::PersistenceData {
+                            message: format!(
+                                "unknown authoritative role catalog status `{other}` during reconciliation"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    summary.local_only = local_by_role_id.len();
+    let mut local_only_role_ids = local_by_role_id.keys().cloned().collect::<Vec<_>>();
+    local_only_role_ids.sort();
+
+    let audit_entry = AuditTraceEntry::for_operations_job(
+        build_operations_audit_id(action_name, now),
+        action_name,
+        build_operations_trace_id(action_name, now),
+        Some(serde_json::json!({
+            "kind": "role_catalog_reconciliation_report",
+            "scanned": summary.scanned,
+            "missing": summary.missing,
+            "refreshed": summary.refreshed,
+            "deprecated": summary.deprecated,
+            "drifted": summary.drifted,
+            "local_only": summary.local_only,
+            "unchanged": summary.unchanged,
+            "local_only_role_ids": local_only_role_ids,
+        })),
+        AuditResult::Success,
+        if summary.local_only == 0 {
+            None
+        } else {
+            Some(format!(
+                "{} local role catalog entries are absent from the authoritative source snapshot",
+                summary.local_only
+            ))
+        },
+        now,
+    );
+    uow.audit_traces().append(&audit_entry).await?;
+    Ok(summary)
+}
+
+async fn append_failed_reconciliation_audit<UowFactory>(
+    unit_of_work_factory: &UowFactory,
+    action_name: &str,
+    now: PrimitiveDateTime,
+    reason: String,
+) -> Result<(), IdentityError>
+where
+    UowFactory: UnitOfWorkFactory,
+{
+    let mut uow = unit_of_work_factory.begin().await?;
+    let audit_entry = AuditTraceEntry::for_operations_job(
+        build_operations_audit_id(action_name, now),
+        action_name,
+        build_operations_trace_id(action_name, now),
+        Some(serde_json::json!({
+            "kind": "role_catalog_reconciliation_report",
+            "scanned": 0,
+            "missing": 0,
+            "refreshed": 0,
+            "deprecated": 0,
+            "drifted": 0,
+            "local_only": 0,
+            "unchanged": 0,
+            "local_only_role_ids": [],
+        })),
+        AuditResult::Failed,
+        Some(reason),
+        now,
+    );
+
+    let append_result = {
+        let mut audit_repository = uow.audit_traces();
+        audit_repository.append(&audit_entry).await
+    };
+
+    match append_result {
+        Ok(()) => uow.commit().await,
+        Err(error) => {
+            uow.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
+fn build_operations_trace_id(action_name: &str, now: PrimitiveDateTime) -> String {
+    format!("{action_name}:{}", now.assume_utc().unix_timestamp_nanos())
+}
+
+fn build_operations_audit_id(action_name: &str, now: PrimitiveDateTime) -> String {
+    format!(
+        "audit:{action_name}:{}",
+        now.assume_utc().unix_timestamp_nanos()
+    )
 }
 
 async fn apply_member_summary_projection_event<Uow>(
@@ -1318,10 +1577,13 @@ mod tests {
     };
     use crate::domain::tombstone::GateDecisionRef;
     use crate::error::IdentityError;
+    use crate::inbound::events::RoleDefinitionSnapshot;
     use crate::inbound::events::{
         InboundEventEnvelope, InboundProcessFactEvent, InboundRoleCatalogEvent,
     };
-    use crate::outbound::{ArchiveRequestPort, BusPublisherPort, GovernancePort};
+    use crate::outbound::{
+        ArchiveRequestPort, BusPublisherPort, GovernancePort, MethodLibraryRoleCatalogPort,
+    };
     use crate::persistence::database::run_migrations;
     use crate::persistence::test_support::DB_TEST_MUTEX;
     use crate::persistence::unit_of_work::SqlxUnitOfWorkFactory;
@@ -1331,9 +1593,9 @@ mod tests {
         IgnoreInboundDeadLetterResult, InboundDeadLetterReplayJob, OutboxPublisherJob,
         ProjectionRebuildJob, PublishOutboxEventsSummary, RebuildMemberProjectionJob,
         RebuildMemberProjectionResult, RebuildMemberSummaryProjectionSummary,
-        ReplayDeadOutboxEventJob, ReplayDeadOutboxEventResult, ReplayInboundDeadLetterJob,
-        ReplayInboundDeadLetterResult, ReplayInboundDeadLettersSummary,
-        ResetProjectionCheckpointJob, ResetProjectionCheckpointResult,
+        ReconcileRoleCatalogSummary, ReplayDeadOutboxEventJob, ReplayDeadOutboxEventResult,
+        ReplayInboundDeadLetterJob, ReplayInboundDeadLetterResult, ReplayInboundDeadLettersSummary,
+        ResetProjectionCheckpointJob, ResetProjectionCheckpointResult, RoleReconciliationJob,
     };
 
     #[derive(Debug, Clone)]
@@ -1420,6 +1682,41 @@ mod tests {
             Err(IdentityError::PersistenceData {
                 message: "noop archive requester should not be called in this test".to_string(),
             })
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct StubMethodLibraryRoleCatalogPort {
+        snapshots: Vec<RoleDefinitionSnapshot>,
+        error: Option<String>,
+    }
+
+    impl StubMethodLibraryRoleCatalogPort {
+        fn succeed(snapshots: Vec<RoleDefinitionSnapshot>) -> Self {
+            Self {
+                snapshots,
+                error: None,
+            }
+        }
+
+        fn fail(message: &str) -> Self {
+            Self {
+                snapshots: Vec::new(),
+                error: Some(message.to_string()),
+            }
+        }
+    }
+
+    impl MethodLibraryRoleCatalogPort for StubMethodLibraryRoleCatalogPort {
+        async fn list_role_catalog(&self) -> Result<Vec<RoleDefinitionSnapshot>, IdentityError> {
+            if let Some(message) = self.error.as_ref() {
+                return Err(IdentityError::RuleViolation {
+                    code: "IDENTITY_METHOD_LIBRARY_UNAVAILABLE",
+                    message: message.clone(),
+                });
+            }
+
+            Ok(self.snapshots.clone())
         }
     }
 
@@ -3155,6 +3452,362 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconcile_role_catalog_marks_fingerprint_drift_and_writes_audit_report() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let job = RoleReconciliationJob::new(
+            SqlxUnitOfWorkFactory::new(pool.clone()),
+            StubMethodLibraryRoleCatalogPort::succeed(vec![sample_role_snapshot(
+                "role.member.operator",
+                "Member Operator",
+                "v2",
+                "fingerprint-role.member.operator-upstream",
+                "active",
+            )]),
+        );
+
+        let summary = job
+            .reconcile_role_catalog()
+            .await
+            .expect("reconciliation should succeed");
+
+        let role_row = sqlx::query(
+            "SELECT fingerprint, status, role_version FROM role_catalog_entries WHERE role_id = $1",
+        )
+        .bind("role.member.operator")
+        .fetch_one(&pool)
+        .await
+        .expect("load reconciled role row");
+        let audit_row = sqlx::query(
+            "SELECT action, source_module, result, target_ref_json FROM audit_trace_entries WHERE action = $1",
+        )
+        .bind("ReconcileRoleCatalog")
+        .fetch_one(&pool)
+        .await
+        .expect("load reconciliation audit trace");
+
+        assert_eq!(
+            summary,
+            ReconcileRoleCatalogSummary {
+                scanned: 1,
+                missing: 0,
+                refreshed: 0,
+                deprecated: 0,
+                drifted: 1,
+                local_only: 0,
+                unchanged: 0,
+            }
+        );
+        assert_eq!(
+            role_row.get::<String, _>("fingerprint"),
+            "fingerprint-role.member.operator-upstream"
+        );
+        assert_eq!(role_row.get::<String, _>("status"), "source_drift");
+        assert_eq!(role_row.get::<String, _>("role_version"), "v1");
+        assert_eq!(audit_row.get::<String, _>("action"), "ReconcileRoleCatalog");
+        assert_eq!(
+            audit_row.get::<Option<String>, _>("source_module"),
+            Some("operations".to_string())
+        );
+        assert_eq!(audit_row.get::<String, _>("result"), "success");
+        assert_eq!(
+            audit_row.get::<serde_json::Value, _>("target_ref_json"),
+            json!({
+                "kind": "role_catalog_reconciliation_report",
+                "scanned": 1,
+                "missing": 0,
+                "refreshed": 0,
+                "deprecated": 0,
+                "drifted": 1,
+                "local_only": 0,
+                "unchanged": 0,
+                "local_only_role_ids": [],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_role_catalog_inserts_missing_local_index_rows_and_marks_deprecated_roles() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_role(&pool, "role.legacy.reviewer", "Legacy Reviewer").await;
+
+        let job = RoleReconciliationJob::new(
+            SqlxUnitOfWorkFactory::new(pool.clone()),
+            StubMethodLibraryRoleCatalogPort::succeed(vec![
+                sample_role_snapshot(
+                    "role.legacy.reviewer",
+                    "Legacy Reviewer",
+                    "v3",
+                    "fingerprint-role.legacy.reviewer-upstream",
+                    "deprecated",
+                ),
+                sample_role_snapshot(
+                    "role.new.architect",
+                    "New Architect",
+                    "v1",
+                    "fingerprint-role.new.architect",
+                    "active",
+                ),
+            ]),
+        );
+
+        let summary = job
+            .reconcile_role_catalog()
+            .await
+            .expect("reconciliation should insert and deprecate rows");
+
+        let deprecated_row = sqlx::query(
+            "SELECT status, fingerprint, role_version FROM role_catalog_entries WHERE role_id = $1",
+        )
+        .bind("role.legacy.reviewer")
+        .fetch_one(&pool)
+        .await
+        .expect("load deprecated role row");
+        let inserted_row = sqlx::query(
+            "SELECT role_name, fingerprint, status FROM role_catalog_entries WHERE role_id = $1",
+        )
+        .bind("role.new.architect")
+        .fetch_one(&pool)
+        .await
+        .expect("load inserted role row");
+
+        assert_eq!(
+            summary,
+            ReconcileRoleCatalogSummary {
+                scanned: 2,
+                missing: 1,
+                refreshed: 0,
+                deprecated: 1,
+                drifted: 0,
+                local_only: 0,
+                unchanged: 0,
+            }
+        );
+        assert_eq!(deprecated_row.get::<String, _>("status"), "deprecated");
+        assert_eq!(
+            deprecated_row.get::<String, _>("fingerprint"),
+            "fingerprint-role.legacy.reviewer-upstream"
+        );
+        assert_eq!(deprecated_row.get::<String, _>("role_version"), "v3");
+        assert_eq!(inserted_row.get::<String, _>("role_name"), "New Architect");
+        assert_eq!(
+            inserted_row.get::<String, _>("fingerprint"),
+            "fingerprint-role.new.architect"
+        );
+        assert_eq!(inserted_row.get::<String, _>("status"), "active");
+    }
+
+    #[tokio::test]
+    async fn reconcile_role_catalog_reports_local_only_rows_without_mutating_them() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_role(&pool, "role.local.orphan", "Local Orphan").await;
+
+        let job = RoleReconciliationJob::new(
+            SqlxUnitOfWorkFactory::new(pool.clone()),
+            StubMethodLibraryRoleCatalogPort::succeed(vec![]),
+        );
+
+        let summary = job
+            .reconcile_role_catalog()
+            .await
+            .expect("reconciliation should still succeed with no source rows");
+
+        let role_row =
+            sqlx::query("SELECT fingerprint, status FROM role_catalog_entries WHERE role_id = $1")
+                .bind("role.local.orphan")
+                .fetch_one(&pool)
+                .await
+                .expect("load local-only role row");
+        let audit_row = sqlx::query(
+            "SELECT reason, target_ref_json FROM audit_trace_entries WHERE action = $1",
+        )
+        .bind("ReconcileRoleCatalog")
+        .fetch_one(&pool)
+        .await
+        .expect("load local-only reconciliation audit");
+
+        assert_eq!(
+            summary,
+            ReconcileRoleCatalogSummary {
+                scanned: 0,
+                missing: 0,
+                refreshed: 0,
+                deprecated: 0,
+                drifted: 0,
+                local_only: 1,
+                unchanged: 0,
+            }
+        );
+        assert_eq!(
+            role_row.get::<String, _>("fingerprint"),
+            "fingerprint-role.local.orphan"
+        );
+        assert_eq!(role_row.get::<String, _>("status"), "active");
+        assert_eq!(
+            audit_row.get::<Option<String>, _>("reason"),
+            Some(
+                "1 local role catalog entries are absent from the authoritative source snapshot"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            audit_row.get::<serde_json::Value, _>("target_ref_json"),
+            json!({
+                "kind": "role_catalog_reconciliation_report",
+                "scanned": 0,
+                "missing": 0,
+                "refreshed": 0,
+                "deprecated": 0,
+                "drifted": 0,
+                "local_only": 1,
+                "unchanged": 0,
+                "local_only_role_ids": ["role.local.orphan"],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_role_catalog_refreshes_local_summary_when_fingerprint_matches() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        sqlx::query(
+            r#"
+            INSERT INTO role_catalog_entries (
+                role_id,
+                role_name,
+                role_version,
+                source_ref_json,
+                fingerprint,
+                status,
+                updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "#,
+        )
+        .bind("role.refreshed")
+        .bind("Old Name")
+        .bind("v1")
+        .bind(json!({ "module": "method-library", "id": "role.refreshed" }))
+        .bind("fingerprint-role.refreshed")
+        .bind("active")
+        .bind(now())
+        .execute(&pool)
+        .await
+        .expect("seed refreshable role row");
+
+        let job = RoleReconciliationJob::new(
+            SqlxUnitOfWorkFactory::new(pool.clone()),
+            StubMethodLibraryRoleCatalogPort::succeed(vec![sample_role_snapshot(
+                "role.refreshed",
+                "Refreshed Name",
+                "v9",
+                "fingerprint-role.refreshed",
+                "active",
+            )]),
+        );
+
+        let summary = job
+            .reconcile_role_catalog()
+            .await
+            .expect("reconciliation should refresh local summary fields");
+
+        let role_row = sqlx::query(
+            "SELECT role_name, role_version, fingerprint, status FROM role_catalog_entries WHERE role_id = $1",
+        )
+        .bind("role.refreshed")
+        .fetch_one(&pool)
+        .await
+        .expect("load refreshed role row");
+
+        assert_eq!(
+            summary,
+            ReconcileRoleCatalogSummary {
+                scanned: 1,
+                missing: 0,
+                refreshed: 1,
+                deprecated: 0,
+                drifted: 0,
+                local_only: 0,
+                unchanged: 0,
+            }
+        );
+        assert_eq!(role_row.get::<String, _>("role_name"), "Refreshed Name");
+        assert_eq!(role_row.get::<String, _>("role_version"), "v9");
+        assert_eq!(
+            role_row.get::<String, _>("fingerprint"),
+            "fingerprint-role.refreshed"
+        );
+        assert_eq!(role_row.get::<String, _>("status"), "active");
+    }
+
+    #[tokio::test]
+    async fn reconcile_role_catalog_surfaces_method_library_failures_with_failed_audit() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+
+        let job = RoleReconciliationJob::new(
+            SqlxUnitOfWorkFactory::new(pool.clone()),
+            StubMethodLibraryRoleCatalogPort::fail("method-library catalog is unavailable"),
+        );
+
+        let error = job
+            .reconcile_role_catalog()
+            .await
+            .expect_err("upstream failures should surface");
+
+        let audit_row = sqlx::query(
+            "SELECT result, reason, target_ref_json FROM audit_trace_entries WHERE action = $1",
+        )
+        .bind("ReconcileRoleCatalog")
+        .fetch_one(&pool)
+        .await
+        .expect("load failed reconciliation audit");
+
+        match error {
+            IdentityError::RuleViolation { code, message } => {
+                assert_eq!(code, "IDENTITY_METHOD_LIBRARY_UNAVAILABLE");
+                assert_eq!(message, "method-library catalog is unavailable");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(audit_row.get::<String, _>("result"), "failed");
+        assert_eq!(
+            audit_row.get::<Option<String>, _>("reason"),
+            Some(
+                "IDENTITY_METHOD_LIBRARY_UNAVAILABLE: method-library catalog is unavailable"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            audit_row.get::<serde_json::Value, _>("target_ref_json"),
+            json!({
+                "kind": "role_catalog_reconciliation_report",
+                "scanned": 0,
+                "missing": 0,
+                "refreshed": 0,
+                "deprecated": 0,
+                "drifted": 0,
+                "local_only": 0,
+                "unchanged": 0,
+                "local_only_role_ids": [],
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn clear_idempotency_record_deletes_failed_record() {
         let db_mutex = Arc::clone(&DB_TEST_MUTEX);
         let _guard = db_mutex.lock().await;
@@ -3756,6 +4409,26 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed role catalog entry");
+    }
+
+    fn sample_role_snapshot(
+        role_id: &str,
+        role_name: &str,
+        role_version: &str,
+        fingerprint: &str,
+        status: &str,
+    ) -> RoleDefinitionSnapshot {
+        RoleDefinitionSnapshot {
+            role_id: role_id.into(),
+            role_name: role_name.to_string(),
+            role_version: role_version.to_string(),
+            source_ref: json!({
+                "module": "method-library",
+                "id": role_id,
+            }),
+            fingerprint: fingerprint.to_string(),
+            status: status.to_string(),
+        }
     }
 
     async fn insert_checkpoint(
