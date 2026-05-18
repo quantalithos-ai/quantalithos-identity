@@ -1,7 +1,7 @@
 //! Append-only lifecycle history records written alongside member state changes.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use time::PrimitiveDateTime;
 
 use crate::domain::member::GlobalMember;
@@ -9,6 +9,7 @@ use crate::domain::member::GlobalMemberLifecycle;
 use crate::domain::shared::context::ActorContext;
 use crate::domain::shared::ids::GlobalMemberId;
 use crate::domain::shared::metadata::CommandMetadata;
+use crate::domain::tombstone::GateDecisionRef;
 
 /// Enumerates the lifecycle history event kinds supported by the initial identity write model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +104,28 @@ impl LifecycleHistoryEntry {
             to_lifecycle: member.lifecycle,
             actor,
             gate_decision_ref_json: None,
+            metadata,
+            created_at: member.updated_at,
+        }
+    }
+
+    /// Creates the append-only history row produced by a successful tombstone command.
+    pub fn for_tombstone(
+        history_entry_id: impl Into<String>,
+        member: &GlobalMember,
+        from_lifecycle: GlobalMemberLifecycle,
+        actor: ActorContext,
+        gate_decision_ref: &GateDecisionRef,
+        metadata: CommandMetadata,
+    ) -> Self {
+        Self {
+            history_entry_id: history_entry_id.into(),
+            global_member_id: member.global_member_id.clone(),
+            event_type: LifecycleEventType::Tombstoned,
+            from_lifecycle: Some(from_lifecycle),
+            to_lifecycle: member.lifecycle,
+            actor,
+            gate_decision_ref_json: Some(json!(gate_decision_ref)),
             metadata,
             created_at: member.updated_at,
         }

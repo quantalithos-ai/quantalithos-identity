@@ -266,7 +266,9 @@ where
 {
     let existing_projection = if matches!(
         event.event_type.as_str(),
-        "identity.capability_profile.updated"
+        "identity.member.lifecycle_changed"
+            | "identity.member.tombstoned"
+            | "identity.capability_profile.updated"
             | "identity.career_history.appended"
             | "identity.memory_refs.updated"
     ) {

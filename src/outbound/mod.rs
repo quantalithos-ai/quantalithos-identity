@@ -1,8 +1,12 @@
 //! Outbound ports and adapter placeholders.
 
 use crate::domain::capability_profile::ArtifactRef;
-use crate::domain::memory_refs::MemoryRef;
+use crate::domain::member::GlobalMember;
+use crate::domain::memory_refs::{ArchiveRef, MemoryRef};
 use crate::domain::outbox::OutboxEvent;
+use crate::domain::shared::context::ActorContext;
+use crate::domain::shared::ids::GlobalMemberId;
+use crate::domain::tombstone::GateDecisionRef;
 use crate::error::IdentityError;
 
 /// Validates external artifact refs without copying artifact bodies into identity.
@@ -21,6 +25,29 @@ pub trait MemoryArchivePort {
         &self,
         memory_ref: &MemoryRef,
     ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
+}
+
+/// Validates or retrieves governance evidence for a protected identity action.
+pub trait GovernancePort {
+    /// Requires governance evidence for the requested protected action.
+    fn require_gate_decision(
+        &self,
+        action_name: &str,
+        member: &GlobalMember,
+        actor: &ActorContext,
+        reason: &str,
+        supplied_gate_ref: Option<&GateDecisionRef>,
+    ) -> impl std::future::Future<Output = Result<GateDecisionRef, IdentityError>> + Send;
+}
+
+/// Requests archive collaboration without copying archive bodies into identity.
+pub trait ArchiveRequestPort {
+    /// Requests an archive operation and returns the resulting archive ref snapshot.
+    fn request_archive(
+        &self,
+        global_member_id: &GlobalMemberId,
+        reason: &str,
+    ) -> impl std::future::Future<Output = Result<ArchiveRef, IdentityError>> + Send;
 }
 
 /// Publishes durable outbox records to the external L0-bus.

@@ -5,6 +5,7 @@ use serde_json::Value;
 use time::PrimitiveDateTime;
 
 use crate::domain::shared::ids::{EventId, RoleId};
+use crate::domain::tombstone::{GateDecision, GateDecisionRef};
 use crate::error::IdentityError;
 
 /// Normalized inbound event envelope used before dispatching into application services.
@@ -62,6 +63,13 @@ pub struct InboundProcessFactEvent {
     pub envelope: InboundEventEnvelope,
 }
 
+/// Raw inbound governance gate-decision event routed into tombstone evidence recording.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InboundGateDecisionEvent {
+    /// Standardized envelope metadata extracted by the transport boundary.
+    pub envelope: InboundEventEnvelope,
+}
+
 /// Parses role-catalog event payloads into the minimal identity-local snapshot view.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RoleCatalogEventParser;
@@ -86,4 +94,34 @@ impl RoleCatalogEventParser {
             message: format!("decode role catalog snapshot payload: {error}"),
         })
     }
+}
+
+/// Parses inbound governance payloads into identity-local gate decision evidence.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct GateDecisionEventParser;
+
+impl GateDecisionEventParser {
+    /// Parses the inbound payload into validated governance evidence.
+    pub fn parse(&self, payload: Value) -> Result<GateDecisionRef, IdentityError> {
+        let parsed: GateDecisionPayload =
+            serde_json::from_value(payload).map_err(|error| IdentityError::PersistenceData {
+                message: format!("decode gate decision payload: {error}"),
+            })?;
+        let gate_ref = GateDecisionRef {
+            gate_decision_id: parsed.gate_decision_id,
+            decision: parsed.decision,
+            policy_ref_json: parsed.policy_ref,
+            decided_at: parsed.decided_at,
+        };
+        gate_ref.validate()?;
+        Ok(gate_ref)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GateDecisionPayload {
+    gate_decision_id: crate::domain::shared::ids::GateDecisionId,
+    decision: GateDecision,
+    policy_ref: Value,
+    decided_at: PrimitiveDateTime,
 }

@@ -4,6 +4,7 @@ use sqlx::{Postgres, Transaction, postgres::PgPool};
 
 use crate::application::persistence::UnitOfWorkFactory;
 use crate::error::IdentityError;
+use crate::persistence::pending_tombstone::SqlxPendingTombstoneRepository;
 use crate::persistence::repositories::{
     SqlxAuditTraceRepository, SqlxCapabilityProfileRepository, SqlxCareerHistoryRepository,
     SqlxGlobalMemberRepository, SqlxIdempotencyStore, SqlxInboundDeadLetterStore,
@@ -58,6 +59,10 @@ impl<'db> crate::application::persistence::UnitOfWork for SqlxUnitOfWork<'db> {
         = SqlxCareerHistoryRepository<'a, 'db>
     where
         Self: 'a;
+    type PendingTombstoneFlows<'a>
+        = SqlxPendingTombstoneRepository<'a, 'db>
+    where
+        Self: 'a;
     type LifecycleHistory<'a>
         = SqlxLifecycleHistoryRepository<'a, 'db>
     where
@@ -105,6 +110,10 @@ impl<'db> crate::application::persistence::UnitOfWork for SqlxUnitOfWork<'db> {
 
     fn career_history(&mut self) -> Self::CareerHistory<'_> {
         SqlxCareerHistoryRepository::new(&mut self.transaction)
+    }
+
+    fn pending_tombstone_flows(&mut self) -> Self::PendingTombstoneFlows<'_> {
+        SqlxPendingTombstoneRepository::new(&mut self.transaction)
     }
 
     fn lifecycle_history(&mut self) -> Self::LifecycleHistory<'_> {

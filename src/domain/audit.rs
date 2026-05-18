@@ -105,6 +105,26 @@ impl AuditTraceEntry {
         )
     }
 
+    /// Creates an audit trace row for a successful tombstone command.
+    pub fn for_tombstone_command(
+        audit_trace_id: impl Into<String>,
+        member: &GlobalMember,
+        actor: &ActorContext,
+        trace_id: impl Into<String>,
+        created_at: PrimitiveDateTime,
+        reason: Option<String>,
+    ) -> Self {
+        Self::for_member_command(
+            audit_trace_id,
+            "TombstoneMember",
+            member,
+            actor,
+            trace_id,
+            created_at,
+            reason,
+        )
+    }
+
     /// Creates an audit trace row for a successful capability-profile update command.
     pub fn for_capability_profile_command(
         audit_trace_id: impl Into<String>,

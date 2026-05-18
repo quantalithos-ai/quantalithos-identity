@@ -14,6 +14,7 @@ use crate::domain::shared::ids::{GlobalMemberId, OutboxEventId, RoleId};
 use crate::domain::shared::metadata::CommandMetadata;
 use crate::domain::shared::pagination::NormalizedPageRequest;
 use crate::domain::timeline::LifecycleHistoryEntry;
+use crate::domain::tombstone::PendingTombstoneFlow;
 use crate::error::IdentityError;
 
 /// Exposes write-model persistence for global member aggregates.
@@ -127,6 +128,33 @@ pub trait CareerHistoryRepository {
     fn save(
         &mut self,
         history: &CareerHistory,
+    ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
+}
+
+/// Exposes pending tombstone-flow persistence required by governance evidence handling.
+pub trait PendingTombstoneRepository {
+    /// Loads and locks the active pending flow for the provided member, when present.
+    fn get_by_member_for_update(
+        &mut self,
+        global_member_id: &GlobalMemberId,
+    ) -> impl std::future::Future<Output = Result<Option<PendingTombstoneFlow>, IdentityError>> + Send;
+
+    /// Loads the pending flow that expects the provided governance decision id, when present.
+    fn get_by_gate_decision(
+        &mut self,
+        gate_decision_id: &crate::domain::shared::ids::GateDecisionId,
+    ) -> impl std::future::Future<Output = Result<Option<PendingTombstoneFlow>, IdentityError>> + Send;
+
+    /// Inserts a newly-opened pending flow.
+    fn insert(
+        &mut self,
+        flow: &PendingTombstoneFlow,
+    ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
+
+    /// Persists updates to an existing pending flow.
+    fn save(
+        &mut self,
+        flow: &PendingTombstoneFlow,
     ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
 }
 
@@ -273,6 +301,11 @@ pub trait UnitOfWork {
     where
         Self: 'a;
 
+    /// Pending tombstone-flow repository bound to the current transaction.
+    type PendingTombstoneFlows<'a>: PendingTombstoneRepository
+    where
+        Self: 'a;
+
     /// Lifecycle history repository bound to the current transaction.
     type LifecycleHistory<'a>: LifecycleHistoryRepository
     where
@@ -322,6 +355,9 @@ pub trait UnitOfWork {
 
     /// Returns a repository handle for append-only career-history persistence.
     fn career_history(&mut self) -> Self::CareerHistory<'_>;
+
+    /// Returns a repository handle for pending tombstone-flow persistence.
+    fn pending_tombstone_flows(&mut self) -> Self::PendingTombstoneFlows<'_>;
 
     /// Returns a repository handle for lifecycle history writes.
     fn lifecycle_history(&mut self) -> Self::LifecycleHistory<'_>;

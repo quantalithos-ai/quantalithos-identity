@@ -6,6 +6,7 @@ use time::{OffsetDateTime, PrimitiveDateTime};
 use crate::domain::role_catalog::RoleCatalogEntry;
 use crate::domain::shared::context::ActorContext;
 use crate::domain::shared::ids::{CapabilityProfileId, GlobalMemberId, MemoryRefsId, RoleId};
+use crate::domain::tombstone::GateDecisionRef;
 use crate::error::IdentityError;
 
 /// Enumerates the only lifecycle states allowed for a global member write model.
@@ -299,6 +300,42 @@ impl GlobalMember {
         self.lifecycle = target_lifecycle;
         self.version += 1;
         self.updated_at = current_timestamp();
+    }
+
+    /// Moves the member into the irreversible `tombstoned` lifecycle when governance approved it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the governance decision is not approved or when the member has
+    /// already entered the tombstoned terminal lifecycle.
+    pub fn tombstone(
+        &mut self,
+        gate_decision_ref: GateDecisionRef,
+        _actor: &ActorContext,
+    ) -> Result<(), IdentityError> {
+        gate_decision_ref.validate()?;
+
+        if !gate_decision_ref.is_approved() {
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_GATE_REJECTED",
+                message: format!(
+                    "member `{}` cannot be tombstoned without an approved gate decision",
+                    self.global_member_id.as_str()
+                ),
+            });
+        }
+        if self.lifecycle == GlobalMemberLifecycle::Tombstoned {
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_LIFECYCLE_TRANSITION_INVALID",
+                message: format!(
+                    "member `{}` is already tombstoned",
+                    self.global_member_id.as_str()
+                ),
+            });
+        }
+
+        self.apply_lifecycle_transition(GlobalMemberLifecycle::Tombstoned);
+        Ok(())
     }
 
     /// Returns the command-side summary for the current member write model.

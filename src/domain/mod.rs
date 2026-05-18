@@ -12,3 +12,4 @@ pub mod projection;
 pub mod role_catalog;
 pub mod shared;
 pub mod timeline;
+pub mod tombstone;

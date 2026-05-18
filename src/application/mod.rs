@@ -7,6 +7,7 @@ pub mod memory_refs;
 pub mod persistence;
 pub mod query_projection;
 pub mod role_catalog_sync;
+pub mod tombstone_flow;
 
 #[cfg(test)]
 mod p0_smoke;

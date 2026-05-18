@@ -10,6 +10,7 @@ use crate::domain::member::GlobalMember;
 use crate::domain::memory_refs::MemoryRefs;
 use crate::domain::role_catalog::RoleCatalogEntry;
 use crate::domain::shared::ids::OutboxEventId;
+use crate::domain::tombstone::{GateDecisionRef, PendingTombstoneFlow};
 
 /// Enumerates the lifecycle states allowed for persisted outbox events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +171,46 @@ impl OutboxEvent {
         }
     }
 
+    /// Creates the outbox record produced by a successful tombstone command.
+    pub fn for_member_tombstoned(
+        outbox_event_id: OutboxEventId,
+        member: &GlobalMember,
+        memory_ref_summary_json: Value,
+        gate_decision_ref: &GateDecisionRef,
+        reason: &str,
+        idempotency_key: &str,
+        created_at: PrimitiveDateTime,
+    ) -> Self {
+        Self {
+            outbox_event_id,
+            aggregate_type: "global_member".to_string(),
+            aggregate_id: member.global_member_id.as_str().to_string(),
+            event_type: "identity.member.tombstoned".to_string(),
+            payload_json: json!({
+                "global_member_id": member.global_member_id.as_str(),
+                "display_name": member.display_name,
+                "lifecycle": member.lifecycle.as_db(),
+                "reason": reason,
+                "main_role_id": member.main_role_id.as_str(),
+                "secondary_role_ids": member.secondary_role_ids.iter().map(|value| value.as_str()).collect::<Vec<_>>(),
+                "capability_profile_id": member.capability_profile_id.as_ref().map(|value| value.as_str()),
+                "memory_refs_id": member.memory_refs_id.as_ref().map(|value| value.as_str()),
+                "memory_ref_summary_json": memory_ref_summary_json,
+                "gate_decision_ref": gate_decision_ref,
+                "version": member.version,
+                "created_at": member.created_at,
+                "updated_at": member.updated_at,
+            }),
+            idempotency_key: idempotency_key.to_string(),
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            next_retry_at: None,
+            created_at,
+            published_at: None,
+            failure_reason: None,
+        }
+    }
+
     /// Creates the outbox record produced by a successful capability-profile update command.
     pub fn for_capability_profile_updated(
         outbox_event_id: OutboxEventId,
@@ -288,6 +329,37 @@ impl OutboxEvent {
                 "fingerprint": entry.fingerprint,
                 "status": entry.status.as_db(),
                 "updated_at": entry.updated_at,
+            }),
+            idempotency_key: idempotency_key.to_string(),
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            next_retry_at: None,
+            created_at,
+            published_at: None,
+            failure_reason: None,
+        }
+    }
+
+    /// Creates the outbox record produced after recording a governance decision for a pending flow.
+    pub fn for_gate_decision_recorded(
+        outbox_event_id: OutboxEventId,
+        pending_flow: &PendingTombstoneFlow,
+        idempotency_key: &str,
+        created_at: PrimitiveDateTime,
+    ) -> Self {
+        Self {
+            outbox_event_id,
+            aggregate_type: "pending_tombstone_flow".to_string(),
+            aggregate_id: pending_flow.pending_flow_id.as_str().to_string(),
+            event_type: "identity.gate_decision.recorded".to_string(),
+            payload_json: json!({
+                "pending_flow_id": pending_flow.pending_flow_id.as_str(),
+                "global_member_id": pending_flow.global_member_id.as_str(),
+                "action_name": pending_flow.action_name,
+                "expected_gate_decision_id": pending_flow.expected_gate_decision_id.as_ref().map(|value| value.as_str()),
+                "gate_decision_ref": pending_flow.gate_decision_ref,
+                "status": pending_flow.status.as_db(),
+                "updated_at": pending_flow.updated_at,
             }),
             idempotency_key: idempotency_key.to_string(),
             status: OutboxStatus::Pending,
