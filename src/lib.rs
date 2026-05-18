@@ -1,5 +1,8 @@
 //! Library entrypoint for the quantalithos-identity service skeleton.
 
+pub mod config;
+pub mod error;
+
 pub mod application;
 pub mod domain;
 pub mod inbound;
