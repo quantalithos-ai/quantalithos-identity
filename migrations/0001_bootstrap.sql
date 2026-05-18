@@ -1,0 +1,2 @@
+-- Bootstrap migration placeholder for Phase 2 database integration.
+-- Business schema is introduced in later commits.
