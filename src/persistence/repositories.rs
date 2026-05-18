@@ -5,12 +5,14 @@ use sqlx::{Postgres, Row, Transaction};
 use time::{OffsetDateTime, PrimitiveDateTime};
 
 use crate::application::persistence::{
-    AuditTraceRepository, CapabilityProfileRepository, GlobalMemberRepository, IdempotencyStore,
-    InboundDeadLetterStore, LifecycleHistoryRepository, MemberSummaryProjectionRepository,
-    MemoryRefsRepository, OutboxStore, ProjectionCheckpointRepository, RoleCatalogRepository,
+    AuditTraceRepository, CapabilityProfileRepository, CareerHistoryRepository,
+    GlobalMemberRepository, IdempotencyStore, InboundDeadLetterStore, LifecycleHistoryRepository,
+    MemberSummaryProjectionRepository, MemoryRefsRepository, OutboxStore,
+    ProjectionCheckpointRepository, RoleCatalogRepository,
 };
 use crate::domain::audit::{AuditResult, AuditTraceEntry};
 use crate::domain::capability_profile::{ArtifactRef, CapabilityItem, CapabilityProfile};
+use crate::domain::career_history::{CareerEntry, CareerHistory, ProcessRef, WorkRef};
 use crate::domain::dead_letter::{DeadLetterReplayStatus, InboundDeadLetter};
 use crate::domain::idempotency::{IdempotencyRecord, IdempotencyScope, IdempotencyStatus};
 use crate::domain::member::{GlobalMember, GlobalMemberLifecycle};
@@ -22,7 +24,8 @@ use crate::domain::projection::{
 use crate::domain::role_catalog::{RoleCatalogEntry, RoleCatalogStatus};
 use crate::domain::shared::context::ActorContext;
 use crate::domain::shared::ids::{
-    CapabilityProfileId, EventId, GlobalMemberId, MemoryRefsId, OutboxEventId, RoleId,
+    CapabilityProfileId, CareerEntryId, EventId, GlobalMemberId, MemoryRefsId, OutboxEventId,
+    ProjectId, RoleId,
 };
 use crate::domain::shared::metadata::CommandMetadata;
 use crate::domain::timeline::{LifecycleEventType, LifecycleHistoryEntry};
@@ -630,6 +633,116 @@ impl MemoryRefsRepository for SqlxMemoryRefsRepository<'_, '_> {
             return Err(IdentityError::VersionConflict {
                 entity: "memory_refs".to_string(),
             });
+        }
+
+        Ok(())
+    }
+}
+
+/// Career-history repository bound to an open SQL transaction.
+pub struct SqlxCareerHistoryRepository<'tx, 'db> {
+    transaction: &'tx mut Transaction<'db, Postgres>,
+}
+
+impl<'tx, 'db> SqlxCareerHistoryRepository<'tx, 'db> {
+    /// Creates a repository facade over the provided SQL transaction.
+    pub fn new(transaction: &'tx mut Transaction<'db, Postgres>) -> Self {
+        Self { transaction }
+    }
+}
+
+impl CareerHistoryRepository for SqlxCareerHistoryRepository<'_, '_> {
+    async fn get_for_update(
+        &mut self,
+        global_member_id: &GlobalMemberId,
+    ) -> Result<CareerHistory, IdentityError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                career_entry_id,
+                global_member_id,
+                source_event_id,
+                source_module,
+                project_id,
+                work_ref_json,
+                process_ref_json,
+                entry_kind,
+                started_at,
+                ended_at,
+                payload_summary_json,
+                created_at
+            FROM career_history_entries
+            WHERE global_member_id = $1
+            ORDER BY created_at ASC, career_entry_id ASC
+            FOR UPDATE
+            "#,
+        )
+        .bind(global_member_id.as_str())
+        .fetch_all(self.transaction.as_mut())
+        .await
+        .map_err(IdentityError::DatabasePool)?;
+
+        let entries = rows
+            .into_iter()
+            .map(map_career_entry_row)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        CareerHistory::rehydrate(global_member_id.clone(), entries)
+    }
+
+    async fn save(&mut self, history: &CareerHistory) -> Result<(), IdentityError> {
+        for entry in &history.entries {
+            let work_ref_json = entry
+                .work_ref
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| IdentityError::PersistenceData {
+                    message: format!("serialize career work ref: {error}"),
+                })?;
+            let process_ref_json = entry
+                .process_ref
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| IdentityError::PersistenceData {
+                    message: format!("serialize career process ref: {error}"),
+                })?;
+
+            sqlx::query(
+                r#"
+                INSERT INTO career_history_entries (
+                    career_entry_id,
+                    global_member_id,
+                    source_event_id,
+                    source_module,
+                    project_id,
+                    work_ref_json,
+                    process_ref_json,
+                    entry_kind,
+                    started_at,
+                    ended_at,
+                    payload_summary_json,
+                    created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                ON CONFLICT (career_entry_id) DO NOTHING
+                "#,
+            )
+            .bind(entry.career_entry_id.as_str())
+            .bind(entry.global_member_id.as_str())
+            .bind(entry.source_event_id.as_str())
+            .bind(entry.source_module.as_str())
+            .bind(entry.project_id.as_ref().map(ProjectId::as_str))
+            .bind(work_ref_json)
+            .bind(process_ref_json)
+            .bind(entry.entry_kind.as_str())
+            .bind(entry.started_at)
+            .bind(entry.ended_at)
+            .bind(entry.payload_summary.clone())
+            .bind(entry.created_at)
+            .execute(self.transaction.as_mut())
+            .await
+            .map_err(IdentityError::DatabasePool)?;
         }
 
         Ok(())
@@ -1409,6 +1522,51 @@ fn map_memory_refs_row(row: sqlx::postgres::PgRow) -> Result<MemoryRefs, Identit
         archive_status,
         version: row.get("version"),
         updated_at: row.get("updated_at"),
+    })
+}
+
+fn map_career_entry_row(row: sqlx::postgres::PgRow) -> Result<CareerEntry, IdentityError> {
+    let work_ref_json: Option<Value> = row.get("work_ref_json");
+    let process_ref_json: Option<Value> = row.get("process_ref_json");
+    let work_ref = work_ref_json
+        .filter(|value| !value.is_null())
+        .map(serde_json::from_value::<WorkRef>)
+        .transpose()
+        .map_err(|error| IdentityError::PersistenceData {
+            message: format!("decode career work ref json: {error}"),
+        })?;
+    let process_ref = process_ref_json
+        .filter(|value| !value.is_null())
+        .map(serde_json::from_value::<ProcessRef>)
+        .transpose()
+        .map_err(|error| IdentityError::PersistenceData {
+            message: format!("decode career process ref json: {error}"),
+        })?;
+
+    if work_ref.is_some() == process_ref.is_some() {
+        return Err(IdentityError::PersistenceData {
+            message: format!(
+                "career entry `{}` must have exactly one source ref",
+                row.get::<String, _>("career_entry_id")
+            ),
+        });
+    }
+
+    Ok(CareerEntry {
+        career_entry_id: CareerEntryId::new(row.get::<String, _>("career_entry_id")),
+        global_member_id: GlobalMemberId::new(row.get::<String, _>("global_member_id")),
+        source_event_id: EventId::new(row.get::<String, _>("source_event_id")),
+        source_module: row.get("source_module"),
+        project_id: row
+            .get::<Option<String>, _>("project_id")
+            .map(ProjectId::new),
+        work_ref,
+        process_ref,
+        entry_kind: row.get("entry_kind"),
+        started_at: row.get("started_at"),
+        ended_at: row.get("ended_at"),
+        payload_summary: row.get("payload_summary_json"),
+        created_at: row.get("created_at"),
     })
 }
 

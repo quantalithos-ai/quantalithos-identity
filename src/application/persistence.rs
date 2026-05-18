@@ -2,6 +2,7 @@
 
 use crate::domain::audit::AuditTraceEntry;
 use crate::domain::capability_profile::CapabilityProfile;
+use crate::domain::career_history::CareerHistory;
 use crate::domain::dead_letter::InboundDeadLetter;
 use crate::domain::idempotency::{IdempotencyRecord, IdempotencyScope};
 use crate::domain::member::GlobalMember;
@@ -110,6 +111,21 @@ pub trait MemoryRefsRepository {
         &mut self,
         memory_refs: &MemoryRefs,
         expected_version: i64,
+    ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
+}
+
+/// Exposes append-only career-history persistence required by inbound career event flows.
+pub trait CareerHistoryRepository {
+    /// Loads and locks one member's append-only career history.
+    fn get_for_update(
+        &mut self,
+        global_member_id: &GlobalMemberId,
+    ) -> impl std::future::Future<Output = Result<CareerHistory, IdentityError>> + Send;
+
+    /// Persists new append-only career entries for the provided member history.
+    fn save(
+        &mut self,
+        history: &CareerHistory,
     ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
 }
 
@@ -244,6 +260,11 @@ pub trait UnitOfWork {
     where
         Self: 'a;
 
+    /// Career-history repository bound to the current transaction.
+    type CareerHistory<'a>: CareerHistoryRepository
+    where
+        Self: 'a;
+
     /// Lifecycle history repository bound to the current transaction.
     type LifecycleHistory<'a>: LifecycleHistoryRepository
     where
@@ -290,6 +311,9 @@ pub trait UnitOfWork {
 
     /// Returns a repository handle for memory-refs persistence.
     fn memory_refs(&mut self) -> Self::MemoryRefs<'_>;
+
+    /// Returns a repository handle for append-only career-history persistence.
+    fn career_history(&mut self) -> Self::CareerHistory<'_>;
 
     /// Returns a repository handle for lifecycle history writes.
     fn lifecycle_history(&mut self) -> Self::LifecycleHistory<'_>;

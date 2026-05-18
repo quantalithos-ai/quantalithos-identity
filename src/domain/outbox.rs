@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use time::{Duration, PrimitiveDateTime};
 
 use crate::domain::capability_profile::CapabilityProfile;
+use crate::domain::career_history::CareerHistory;
 use crate::domain::member::GlobalMember;
 use crate::domain::memory_refs::MemoryRefs;
 use crate::domain::role_catalog::RoleCatalogEntry;
@@ -224,6 +225,38 @@ impl OutboxEvent {
                 "memory_ref_summary_json": memory_refs.summary_json(),
                 "version": memory_refs.version,
                 "updated_at": memory_refs.updated_at,
+            }),
+            idempotency_key: idempotency_key.to_string(),
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            next_retry_at: None,
+            created_at,
+            published_at: None,
+            failure_reason: None,
+        }
+    }
+
+    /// Creates the outbox record produced by a successful career-history append.
+    pub fn for_career_history_appended(
+        outbox_event_id: OutboxEventId,
+        member: &GlobalMember,
+        history: &CareerHistory,
+        idempotency_key: &str,
+        created_at: PrimitiveDateTime,
+    ) -> Self {
+        Self {
+            outbox_event_id,
+            aggregate_type: "career_history".to_string(),
+            aggregate_id: member.global_member_id.as_str().to_string(),
+            event_type: "identity.career_history.appended".to_string(),
+            payload_json: json!({
+                "global_member_id": member.global_member_id.as_str(),
+                "display_name": member.display_name,
+                "lifecycle": member.lifecycle.as_db(),
+                "main_role_id": member.main_role_id.as_str(),
+                "career_summary_json": history.summary_json(),
+                "version": history.version(),
+                "updated_at": history.latest_created_at().unwrap_or(created_at),
             }),
             idempotency_key: idempotency_key.to_string(),
             status: OutboxStatus::Pending,

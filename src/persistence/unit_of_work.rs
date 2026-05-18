@@ -5,10 +5,11 @@ use sqlx::{Postgres, Transaction, postgres::PgPool};
 use crate::application::persistence::UnitOfWorkFactory;
 use crate::error::IdentityError;
 use crate::persistence::repositories::{
-    SqlxAuditTraceRepository, SqlxCapabilityProfileRepository, SqlxGlobalMemberRepository,
-    SqlxIdempotencyStore, SqlxInboundDeadLetterStore, SqlxLifecycleHistoryRepository,
-    SqlxMemberSummaryProjectionRepository, SqlxMemoryRefsRepository, SqlxOutboxStore,
-    SqlxProjectionCheckpointRepository, SqlxRoleCatalogRepository,
+    SqlxAuditTraceRepository, SqlxCapabilityProfileRepository, SqlxCareerHistoryRepository,
+    SqlxGlobalMemberRepository, SqlxIdempotencyStore, SqlxInboundDeadLetterStore,
+    SqlxLifecycleHistoryRepository, SqlxMemberSummaryProjectionRepository,
+    SqlxMemoryRefsRepository, SqlxOutboxStore, SqlxProjectionCheckpointRepository,
+    SqlxRoleCatalogRepository,
 };
 
 /// Creates PostgreSQL transaction-scoped units of work for write-model operations.
@@ -51,6 +52,10 @@ impl<'db> crate::application::persistence::UnitOfWork for SqlxUnitOfWork<'db> {
         Self: 'a;
     type MemoryRefs<'a>
         = SqlxMemoryRefsRepository<'a, 'db>
+    where
+        Self: 'a;
+    type CareerHistory<'a>
+        = SqlxCareerHistoryRepository<'a, 'db>
     where
         Self: 'a;
     type LifecycleHistory<'a>
@@ -96,6 +101,10 @@ impl<'db> crate::application::persistence::UnitOfWork for SqlxUnitOfWork<'db> {
 
     fn memory_refs(&mut self) -> Self::MemoryRefs<'_> {
         SqlxMemoryRefsRepository::new(&mut self.transaction)
+    }
+
+    fn career_history(&mut self) -> Self::CareerHistory<'_> {
+        SqlxCareerHistoryRepository::new(&mut self.transaction)
     }
 
     fn lifecycle_history(&mut self) -> Self::LifecycleHistory<'_> {

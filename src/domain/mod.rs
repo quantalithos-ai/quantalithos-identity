@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod capability_profile;
+pub mod career_history;
 pub mod dead_letter;
 pub mod idempotency;
 pub mod member;

@@ -1,6 +1,7 @@
 //! Application layer modules for repository ports and use-case orchestration.
 
 pub mod capability_profile;
+pub mod career_event;
 pub mod member_lifecycle;
 pub mod memory_refs;
 pub mod persistence;

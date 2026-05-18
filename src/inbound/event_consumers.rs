@@ -1,8 +1,11 @@
 //! Inbound event consumer entrypoints that delegate into application services.
 
+use crate::application::career_event::{CareerEventConsumerService, CareerEventOutcome};
 use crate::application::role_catalog_sync::{RoleCatalogSyncOutcome, RoleCatalogSyncService};
 use crate::error::IdentityError;
-use crate::inbound::events::InboundRoleCatalogEvent;
+use crate::inbound::events::{
+    InboundProcessFactEvent, InboundRoleCatalogEvent, InboundWorkFactEvent,
+};
 
 /// Consumer entrypoint for method-library role-catalog events.
 #[derive(Debug, Clone)]
@@ -35,14 +38,42 @@ where
     }
 }
 
-/// Placeholder career event consumer.
-#[derive(Debug, Default)]
-pub struct CareerEventConsumer;
+/// Consumer entrypoint for work/process facts that append career history.
+#[derive(Debug, Clone)]
+pub struct CareerEventConsumer<Service> {
+    service: Service,
+}
 
-impl CareerEventConsumer {
-    /// Returns a stable placeholder operation name for diagnostics.
+impl<Service> CareerEventConsumer<Service> {
+    /// Creates a career event consumer bound to the provided application service.
+    pub fn new(service: Service) -> Self {
+        Self { service }
+    }
+
+    /// Returns the stable operation name used for diagnostics and tests.
     pub fn operation_name(&self) -> &'static str {
         "AppendCareerEntry"
+    }
+}
+
+impl<UowFactory> CareerEventConsumer<CareerEventConsumerService<UowFactory>>
+where
+    UowFactory: crate::application::persistence::UnitOfWorkFactory,
+{
+    /// Consumes a work fact inbound event through the application service boundary.
+    pub async fn consume_work_event(
+        &self,
+        event: InboundWorkFactEvent,
+    ) -> Result<CareerEventOutcome, IdentityError> {
+        self.service.consume_work_event(event).await
+    }
+
+    /// Consumes a process fact inbound event through the application service boundary.
+    pub async fn consume_process_event(
+        &self,
+        event: InboundProcessFactEvent,
+    ) -> Result<CareerEventOutcome, IdentityError> {
+        self.service.consume_process_event(event).await
     }
 }
 

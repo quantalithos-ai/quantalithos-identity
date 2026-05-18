@@ -266,7 +266,9 @@ where
 {
     let existing_projection = if matches!(
         event.event_type.as_str(),
-        "identity.capability_profile.updated" | "identity.memory_refs.updated"
+        "identity.capability_profile.updated"
+            | "identity.career_history.appended"
+            | "identity.memory_refs.updated"
     ) {
         let global_member_id = event
             .payload_json
@@ -863,6 +865,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebuild_member_summary_projection_merges_career_updates_into_existing_projection() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let first_created_at = now();
+        let second_created_at = first_created_at + Duration::seconds(1);
+        seed_outbox_event(
+            &pool,
+            sample_member_created_projection_event(
+                "outbox-member-156",
+                "member-156",
+                "Member One Five Six",
+                "role.member.operator",
+                first_created_at,
+            ),
+        )
+        .await;
+
+        let job = ProjectionRebuildJob::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        job.rebuild_member_summary_projection("member-summary-rebuild", 10)
+            .await
+            .expect("initial projection rebuild should succeed");
+
+        sqlx::query(
+            r#"
+            UPDATE member_summary_projection
+            SET
+                capability_summary_json = $2,
+                memory_ref_summary_json = $3
+            WHERE global_member_id = $1
+            "#,
+        )
+        .bind("member-156")
+        .bind(json!({ "items": ["capability.design"] }))
+        .bind(json!({ "refs": ["memory-156"] }))
+        .execute(&pool)
+        .await
+        .expect("seed existing projection summaries");
+
+        seed_outbox_event(
+            &pool,
+            sample_career_history_appended_projection_event(
+                "outbox-career-156",
+                "member-156",
+                "Member One Five Six",
+                "role.member.operator",
+                second_created_at,
+            ),
+        )
+        .await;
+
+        let summary = job
+            .rebuild_member_summary_projection("member-summary-rebuild", 10)
+            .await
+            .expect("career projection rebuild should succeed");
+
+        let projection_row = sqlx::query(
+            r#"
+            SELECT
+                display_name,
+                main_role_name,
+                capability_summary_json,
+                career_summary_json,
+                memory_ref_summary_json,
+                projection_version
+            FROM member_summary_projection
+            WHERE global_member_id = $1
+            "#,
+        )
+        .bind("member-156")
+        .fetch_one(&pool)
+        .await
+        .expect("load projection after career update");
+        let checkpoint_row = sqlx::query(
+            "SELECT last_processed_event_id, status FROM projection_checkpoints WHERE checkpoint_name = $1",
+        )
+        .bind("member-summary-rebuild")
+        .fetch_one(&pool)
+        .await
+        .expect("load projection checkpoint after career update");
+
+        assert_eq!(
+            summary,
+            RebuildMemberSummaryProjectionSummary {
+                scanned: 1,
+                rebuilt: 1,
+                skipped: 0,
+            }
+        );
+        assert_eq!(
+            projection_row.get::<String, _>("display_name"),
+            "Member One Five Six"
+        );
+        assert_eq!(
+            projection_row.get::<Option<String>, _>("main_role_name"),
+            Some("Member Operator".to_string())
+        );
+        assert_eq!(
+            projection_row.get::<serde_json::Value, _>("capability_summary_json"),
+            json!({ "items": ["capability.design"] })
+        );
+        assert_eq!(
+            projection_row.get::<serde_json::Value, _>("career_summary_json"),
+            json!({
+                "global_member_id": "member-156",
+                "entry_count": 2,
+                "entries": [
+                    {
+                        "career_entry_id": "career-entry:career-event-156-a",
+                        "source_event_id": "career-event-156-a",
+                        "source_module": "work",
+                        "project_id": "project-156",
+                        "work_ref": {
+                            "work_id": "work-156-a",
+                            "work_kind": "task",
+                            "work_version": "v1",
+                        },
+                        "process_ref": null,
+                        "entry_kind": "assigned",
+                        "started_at": second_created_at,
+                        "ended_at": second_created_at + Duration::seconds(1),
+                        "payload_summary": {
+                            "title": "Design projection merge",
+                        },
+                        "created_at": second_created_at,
+                    },
+                    {
+                        "career_entry_id": "career-entry:career-event-156-b",
+                        "source_event_id": "career-event-156-b",
+                        "source_module": "process",
+                        "project_id": "project-156",
+                        "work_ref": null,
+                        "process_ref": {
+                            "process_id": "process-156-b",
+                            "process_kind": "review",
+                            "process_version": "v2",
+                        },
+                        "entry_kind": "reviewed",
+                        "started_at": second_created_at + Duration::seconds(1),
+                        "ended_at": second_created_at + Duration::seconds(16),
+                        "payload_summary": {
+                            "activity": "Projection QA",
+                        },
+                        "created_at": second_created_at + Duration::seconds(1),
+                    }
+                ]
+            })
+        );
+        assert_eq!(
+            projection_row.get::<serde_json::Value, _>("memory_ref_summary_json"),
+            json!({ "refs": ["memory-156"] })
+        );
+        assert_eq!(projection_row.get::<i64, _>("projection_version"), 2);
+        assert_eq!(
+            checkpoint_row.get::<Option<String>, _>("last_processed_event_id"),
+            Some("outbox-career-156".to_string())
+        );
+        assert_eq!(checkpoint_row.get::<String, _>("status"), "idle");
+    }
+
+    #[tokio::test]
     async fn rebuild_member_summary_projection_merges_memory_ref_updates_into_existing_projection()
     {
         let db_mutex = Arc::clone(&DB_TEST_MUTEX);
@@ -1122,6 +1288,7 @@ mod tests {
                 outbox_events,
                 idempotency_records,
                 audit_trace_entries,
+                career_history_entries,
                 lifecycle_history_entries,
                 memory_refs,
                 capability_profiles,
@@ -1396,6 +1563,82 @@ mod tests {
                 },
                 "version": 2,
                 "updated_at": created_at,
+            }),
+            idempotency_key: format!("idem-{outbox_event_id}"),
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            next_retry_at: None,
+            created_at,
+            published_at: None,
+            failure_reason: None,
+        }
+    }
+
+    fn sample_career_history_appended_projection_event(
+        outbox_event_id: &str,
+        global_member_id: &str,
+        display_name: &str,
+        main_role_id: &str,
+        created_at: PrimitiveDateTime,
+    ) -> OutboxEvent {
+        let later_created_at = created_at + Duration::seconds(1);
+
+        OutboxEvent {
+            outbox_event_id: OutboxEventId::new(outbox_event_id),
+            aggregate_type: "career_history".to_string(),
+            aggregate_id: global_member_id.to_string(),
+            event_type: "identity.career_history.appended".to_string(),
+            payload_json: json!({
+                "global_member_id": global_member_id,
+                "display_name": display_name,
+                "lifecycle": "hired",
+                "main_role_id": main_role_id,
+                "career_summary_json": {
+                    "global_member_id": global_member_id,
+                    "entry_count": 2,
+                    "entries": [
+                        {
+                            "career_entry_id": "career-entry:career-event-156-a",
+                            "source_event_id": "career-event-156-a",
+                            "source_module": "work",
+                            "project_id": "project-156",
+                            "work_ref": {
+                                "work_id": "work-156-a",
+                                "work_kind": "task",
+                                "work_version": "v1",
+                            },
+                            "process_ref": null,
+                            "entry_kind": "assigned",
+                            "started_at": created_at,
+                            "ended_at": created_at + Duration::seconds(1),
+                            "payload_summary": {
+                                "title": "Design projection merge",
+                            },
+                            "created_at": created_at,
+                        },
+                        {
+                            "career_entry_id": "career-entry:career-event-156-b",
+                            "source_event_id": "career-event-156-b",
+                            "source_module": "process",
+                            "project_id": "project-156",
+                            "work_ref": null,
+                            "process_ref": {
+                                "process_id": "process-156-b",
+                                "process_kind": "review",
+                                "process_version": "v2",
+                            },
+                            "entry_kind": "reviewed",
+                            "started_at": later_created_at,
+                            "ended_at": later_created_at + Duration::seconds(15),
+                            "payload_summary": {
+                                "activity": "Projection QA",
+                            },
+                            "created_at": later_created_at,
+                        }
+                    ]
+                },
+                "version": 2,
+                "updated_at": later_created_at,
             }),
             idempotency_key: format!("idem-{outbox_event_id}"),
             status: OutboxStatus::Pending,

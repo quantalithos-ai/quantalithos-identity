@@ -48,6 +48,20 @@ pub struct InboundRoleCatalogEvent {
     pub envelope: InboundEventEnvelope,
 }
 
+/// Raw inbound work-fact event routed into append-only career history consumption.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InboundWorkFactEvent {
+    /// Standardized envelope metadata extracted by the transport boundary.
+    pub envelope: InboundEventEnvelope,
+}
+
+/// Raw inbound process-fact event routed into append-only career history consumption.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InboundProcessFactEvent {
+    /// Standardized envelope metadata extracted by the transport boundary.
+    pub envelope: InboundEventEnvelope,
+}
+
 /// Parses role-catalog event payloads into the minimal identity-local snapshot view.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RoleCatalogEventParser;
