@@ -5,6 +5,9 @@ use thiserror::Error;
 /// Represents service-level errors that are safe to construct before business logic exists.
 #[derive(Debug, Error)]
 pub enum IdentityError {
+    /// Raised when a request violates an explicit business or API rule.
+    #[error("{code}: {message}")]
+    RuleViolation { code: &'static str, message: String },
     /// Raised when a required or optional configuration value is malformed.
     #[error("invalid configuration for `{key}`: {reason}")]
     InvalidConfiguration { key: String, reason: String },

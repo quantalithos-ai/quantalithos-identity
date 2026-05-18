@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::PrimitiveDateTime;
 
+use crate::domain::member::GlobalMember;
+use crate::domain::shared::context::ActorContext;
+
 /// Enumerates the supported terminal results for an audit trace entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,6 +64,30 @@ pub struct AuditTraceEntry {
 }
 
 impl AuditTraceEntry {
+    /// Creates an audit trace row for a successful hire command.
+    pub fn for_hire_command(
+        audit_trace_id: impl Into<String>,
+        member: &GlobalMember,
+        actor: &ActorContext,
+        trace_id: impl Into<String>,
+        created_at: PrimitiveDateTime,
+    ) -> Self {
+        Self {
+            audit_trace_id: audit_trace_id.into(),
+            trace_id: trace_id.into(),
+            action: "HireGlobalMember".to_string(),
+            actor_json: Some(json!(actor)),
+            target_ref_json: Some(json!({
+                "kind": "global_member",
+                "id": member.global_member_id.as_str(),
+            })),
+            source_module: None,
+            result: AuditResult::Success,
+            reason: None,
+            created_at,
+        }
+    }
+
     /// Creates an audit trace row for a handled inbound event.
     pub fn for_inbound_event(
         audit_trace_id: impl Into<String>,

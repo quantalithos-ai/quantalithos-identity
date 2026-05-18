@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::PrimitiveDateTime;
 
+use crate::domain::member::GlobalMember;
 use crate::domain::role_catalog::RoleCatalogEntry;
 use crate::domain::shared::ids::OutboxEventId;
 
@@ -70,6 +71,40 @@ pub struct OutboxEvent {
 }
 
 impl OutboxEvent {
+    /// Creates the outbox record produced by a successful hire command.
+    pub fn for_member_hired(
+        outbox_event_id: OutboxEventId,
+        member: &GlobalMember,
+        idempotency_key: &str,
+        created_at: PrimitiveDateTime,
+    ) -> Self {
+        Self {
+            outbox_event_id,
+            aggregate_type: "global_member".to_string(),
+            aggregate_id: member.global_member_id.as_str().to_string(),
+            event_type: "identity.member.created".to_string(),
+            payload_json: json!({
+                "global_member_id": member.global_member_id.as_str(),
+                "display_name": member.display_name,
+                "lifecycle": member.lifecycle.as_db(),
+                "main_role_id": member.main_role_id.as_str(),
+                "secondary_role_ids": member.secondary_role_ids.iter().map(|value| value.as_str()).collect::<Vec<_>>(),
+                "capability_profile_id": member.capability_profile_id.as_ref().map(|value| value.as_str()),
+                "memory_refs_id": member.memory_refs_id.as_ref().map(|value| value.as_str()),
+                "version": member.version,
+                "created_at": member.created_at,
+                "updated_at": member.updated_at,
+            }),
+            idempotency_key: idempotency_key.to_string(),
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            next_retry_at: None,
+            created_at,
+            published_at: None,
+            failure_reason: None,
+        }
+    }
+
     /// Creates the outbox record produced by a successful role-catalog synchronization.
     pub fn for_role_catalog_sync(
         outbox_event_id: OutboxEventId,
