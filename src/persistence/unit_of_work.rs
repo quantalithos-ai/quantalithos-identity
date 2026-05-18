@@ -5,8 +5,8 @@ use sqlx::{Postgres, Transaction, postgres::PgPool};
 use crate::application::persistence::UnitOfWorkFactory;
 use crate::error::IdentityError;
 use crate::persistence::repositories::{
-    SqlxAuditTraceRepository, SqlxGlobalMemberRepository, SqlxIdempotencyStore,
-    SqlxInboundDeadLetterStore, SqlxLifecycleHistoryRepository,
+    SqlxAuditTraceRepository, SqlxCapabilityProfileRepository, SqlxGlobalMemberRepository,
+    SqlxIdempotencyStore, SqlxInboundDeadLetterStore, SqlxLifecycleHistoryRepository,
     SqlxMemberSummaryProjectionRepository, SqlxOutboxStore, SqlxProjectionCheckpointRepository,
     SqlxRoleCatalogRepository,
 };
@@ -45,6 +45,10 @@ impl<'db> crate::application::persistence::UnitOfWork for SqlxUnitOfWork<'db> {
         = SqlxRoleCatalogRepository<'a, 'db>
     where
         Self: 'a;
+    type CapabilityProfiles<'a>
+        = SqlxCapabilityProfileRepository<'a, 'db>
+    where
+        Self: 'a;
     type LifecycleHistory<'a>
         = SqlxLifecycleHistoryRepository<'a, 'db>
     where
@@ -80,6 +84,10 @@ impl<'db> crate::application::persistence::UnitOfWork for SqlxUnitOfWork<'db> {
 
     fn role_catalog(&mut self) -> Self::RoleCatalog<'_> {
         SqlxRoleCatalogRepository::new(&mut self.transaction)
+    }
+
+    fn capability_profiles(&mut self) -> Self::CapabilityProfiles<'_> {
+        SqlxCapabilityProfileRepository::new(&mut self.transaction)
     }
 
     fn lifecycle_history(&mut self) -> Self::LifecycleHistory<'_> {
@@ -150,12 +158,14 @@ mod tests {
     use time::{OffsetDateTime, PrimitiveDateTime};
 
     use crate::application::persistence::{
-        AuditTraceRepository, GlobalMemberRepository, IdempotencyStore, InboundDeadLetterStore,
-        LifecycleHistoryRepository, MemberSummaryProjectionRepository, OutboxStore,
-        ProjectionCheckpointRepository, RoleCatalogRepository, UnitOfWork, UnitOfWorkFactory,
+        AuditTraceRepository, CapabilityProfileRepository, GlobalMemberRepository,
+        IdempotencyStore, InboundDeadLetterStore, LifecycleHistoryRepository,
+        MemberSummaryProjectionRepository, OutboxStore, ProjectionCheckpointRepository,
+        RoleCatalogRepository, UnitOfWork, UnitOfWorkFactory,
     };
     use crate::config::AppConfig;
     use crate::domain::audit::{AuditResult, AuditTraceEntry};
+    use crate::domain::capability_profile::{ArtifactRef, CapabilityItem, CapabilityProfile};
     use crate::domain::dead_letter::{DeadLetterReplayStatus, InboundDeadLetter};
     use crate::domain::idempotency::{IdempotencyScope, IdempotencyStatus};
     use crate::domain::member::{GlobalMember, GlobalMemberLifecycle};
@@ -163,7 +173,9 @@ mod tests {
     use crate::domain::projection::{MemberSummaryProjection, ProjectionCheckpointStatus};
     use crate::domain::role_catalog::{RoleCatalogEntry, RoleCatalogStatus};
     use crate::domain::shared::context::{ActorContext, ActorKind};
-    use crate::domain::shared::ids::{DeadLetterId, GlobalMemberId, OutboxEventId, RoleId};
+    use crate::domain::shared::ids::{
+        CapabilityProfileId, DeadLetterId, GlobalMemberId, OutboxEventId, RoleId,
+    };
     use crate::domain::shared::metadata::CommandMetadata;
     use crate::domain::timeline::{LifecycleEventType, LifecycleHistoryEntry};
     use crate::error::IdentityError;
@@ -333,6 +345,78 @@ mod tests {
         ));
 
         uow.rollback().await.expect("rollback failed update");
+    }
+
+    #[tokio::test]
+    async fn capability_profile_store_round_trips_and_uses_optimistic_locking() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool).await;
+
+        let factory = SqlxUnitOfWorkFactory::new(pool.clone());
+        let actor = ActorContext::new("human/admin-3", ActorKind::HumanUser, None);
+        let member = sample_member(actor.clone());
+        let timestamp = now();
+
+        {
+            let mut uow = factory.begin().await.expect("begin insert transaction");
+            uow.global_members()
+                .insert(&member)
+                .await
+                .expect("insert member for capability profile");
+            uow.capability_profiles()
+                .insert(&CapabilityProfile {
+                    capability_profile_id: CapabilityProfileId::new(
+                        "capability-profile:member-001",
+                    ),
+                    global_member_id: member.global_member_id.clone(),
+                    capabilities: vec![CapabilityItem {
+                        capability_id: "capability.rust".to_string(),
+                        capability_name: "Rust".to_string(),
+                        proficiency: Some("advanced".to_string()),
+                        notes: Some("systems programming".to_string()),
+                    }],
+                    evidence_refs: vec![ArtifactRef {
+                        artifact_id: "artifact-001".to_string(),
+                        artifact_kind: "evidence".to_string(),
+                        artifact_version: Some("v1".to_string()),
+                    }],
+                    version: 1,
+                    updated_at: timestamp,
+                })
+                .await
+                .expect("insert capability profile");
+            uow.commit()
+                .await
+                .expect("commit capability profile insert");
+        }
+
+        let mut uow = factory.begin().await.expect("begin load transaction");
+        let mut profile = uow
+            .capability_profiles()
+            .get_for_update_by_member(&member.global_member_id)
+            .await
+            .expect("load capability profile")
+            .expect("capability profile should exist");
+        assert_eq!(profile.capabilities.len(), 1);
+        assert_eq!(profile.evidence_refs.len(), 1);
+
+        profile.version += 1;
+        profile.updated_at = now();
+        profile.capabilities.push(CapabilityItem {
+            capability_id: "capability.sql".to_string(),
+            capability_name: "SQL".to_string(),
+            proficiency: Some("intermediate".to_string()),
+            notes: None,
+        });
+        let save_result = uow.capability_profiles().save(&profile, 999).await;
+        assert!(matches!(
+            save_result,
+            Err(IdentityError::VersionConflict { entity }) if entity == "capability_profile"
+        ));
+        uow.rollback().await.expect("rollback optimistic-lock test");
     }
 
     #[tokio::test]
@@ -699,6 +783,7 @@ mod tests {
                 idempotency_records,
                 audit_trace_entries,
                 lifecycle_history_entries,
+                capability_profiles,
                 global_members,
                 projection_checkpoints,
                 member_summary_projection,

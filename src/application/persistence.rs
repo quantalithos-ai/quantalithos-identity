@@ -1,6 +1,7 @@
 //! Persistence-facing application ports used by command and event handlers.
 
 use crate::domain::audit::AuditTraceEntry;
+use crate::domain::capability_profile::CapabilityProfile;
 use crate::domain::dead_letter::InboundDeadLetter;
 use crate::domain::idempotency::{IdempotencyRecord, IdempotencyScope};
 use crate::domain::member::GlobalMember;
@@ -52,6 +53,34 @@ pub trait RoleCatalogRepository {
     fn upsert(
         &mut self,
         entry: &RoleCatalogEntry,
+    ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
+}
+
+/// Exposes capability-profile persistence required by capability update flows.
+pub trait CapabilityProfileRepository {
+    /// Loads the current capability profile for the provided member, if any.
+    fn get_by_member(
+        &mut self,
+        global_member_id: &GlobalMemberId,
+    ) -> impl std::future::Future<Output = Result<Option<CapabilityProfile>, IdentityError>> + Send;
+
+    /// Loads and locks the current capability profile for the provided member, if any.
+    fn get_for_update_by_member(
+        &mut self,
+        global_member_id: &GlobalMemberId,
+    ) -> impl std::future::Future<Output = Result<Option<CapabilityProfile>, IdentityError>> + Send;
+
+    /// Inserts a newly-created capability profile.
+    fn insert(
+        &mut self,
+        profile: &CapabilityProfile,
+    ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
+
+    /// Persists an updated capability profile using optimistic locking.
+    fn save(
+        &mut self,
+        profile: &CapabilityProfile,
+        expected_version: i64,
     ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
 }
 
@@ -176,6 +205,11 @@ pub trait UnitOfWork {
     where
         Self: 'a;
 
+    /// Capability-profile repository bound to the current transaction.
+    type CapabilityProfiles<'a>: CapabilityProfileRepository
+    where
+        Self: 'a;
+
     /// Lifecycle history repository bound to the current transaction.
     type LifecycleHistory<'a>: LifecycleHistoryRepository
     where
@@ -216,6 +250,9 @@ pub trait UnitOfWork {
 
     /// Returns a repository handle for local role catalog persistence.
     fn role_catalog(&mut self) -> Self::RoleCatalog<'_>;
+
+    /// Returns a repository handle for capability-profile persistence.
+    fn capability_profiles(&mut self) -> Self::CapabilityProfiles<'_>;
 
     /// Returns a repository handle for lifecycle history writes.
     fn lifecycle_history(&mut self) -> Self::LifecycleHistory<'_>;

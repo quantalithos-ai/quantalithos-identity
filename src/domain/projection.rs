@@ -44,6 +44,7 @@ impl MemberSummaryProjection {
     /// is currently unsupported by the projection rebuild flow.
     pub fn apply_outbox_event(
         event: &OutboxEvent,
+        existing_projection: Option<Self>,
         rebuilt_at: PrimitiveDateTime,
     ) -> Result<Option<Self>, IdentityError> {
         match event.event_type.as_str() {
@@ -79,6 +80,48 @@ impl MemberSummaryProjection {
                     projection_version: payload.version,
                     updated_at: rebuilt_at,
                 }))
+            }
+            "identity.capability_profile.updated" => {
+                let payload: CapabilityProfileUpdatedProjectionPayload =
+                    serde_json::from_value(event.payload_json.clone()).map_err(|error| {
+                        IdentityError::PersistenceData {
+                            message: format!(
+                                "invalid capability-profile outbox payload for `{}`: {error}",
+                                event.outbox_event_id.as_str()
+                            ),
+                        }
+                    })?;
+                let lifecycle = GlobalMemberLifecycle::from_db(payload.lifecycle.as_str()).ok_or(
+                    IdentityError::PersistenceData {
+                        message: format!(
+                            "invalid lifecycle `{}` in capability-profile outbox payload for `{}`",
+                            payload.lifecycle,
+                            event.outbox_event_id.as_str()
+                        ),
+                    },
+                )?;
+
+                let mut projection = existing_projection.unwrap_or(Self {
+                    global_member_id: GlobalMemberId::new(payload.global_member_id.clone()),
+                    display_name: payload.display_name.clone(),
+                    lifecycle,
+                    main_role_id: Some(RoleId::new(payload.main_role_id.clone())),
+                    main_role_name: None,
+                    capability_summary_json: json!({}),
+                    career_summary_json: json!({}),
+                    memory_ref_summary_json: json!({}),
+                    projection_version: payload.version,
+                    updated_at: rebuilt_at,
+                });
+                projection.global_member_id = GlobalMemberId::new(payload.global_member_id);
+                projection.display_name = payload.display_name;
+                projection.lifecycle = lifecycle;
+                projection.main_role_id = Some(RoleId::new(payload.main_role_id));
+                projection.capability_summary_json = payload.capability_summary_json;
+                projection.projection_version = payload.version;
+                projection.updated_at = rebuilt_at;
+
+                Ok(Some(projection))
             }
             "identity.role_catalog.synced" => Ok(None),
             other => Err(IdentityError::PersistenceData {
@@ -191,5 +234,15 @@ struct MemberCreatedProjectionPayload {
     display_name: String,
     lifecycle: String,
     main_role_id: String,
+    version: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CapabilityProfileUpdatedProjectionPayload {
+    global_member_id: String,
+    display_name: String,
+    lifecycle: String,
+    main_role_id: String,
+    capability_summary_json: Value,
     version: i64,
 }

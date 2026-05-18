@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::{Duration, PrimitiveDateTime};
 
+use crate::domain::capability_profile::CapabilityProfile;
 use crate::domain::member::GlobalMember;
 use crate::domain::role_catalog::RoleCatalogEntry;
 use crate::domain::shared::ids::OutboxEventId;
@@ -156,6 +157,39 @@ impl OutboxEvent {
                 "version": member.version,
                 "created_at": member.created_at,
                 "updated_at": member.updated_at,
+            }),
+            idempotency_key: idempotency_key.to_string(),
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            next_retry_at: None,
+            created_at,
+            published_at: None,
+            failure_reason: None,
+        }
+    }
+
+    /// Creates the outbox record produced by a successful capability-profile update command.
+    pub fn for_capability_profile_updated(
+        outbox_event_id: OutboxEventId,
+        member: &GlobalMember,
+        profile: &CapabilityProfile,
+        idempotency_key: &str,
+        created_at: PrimitiveDateTime,
+    ) -> Self {
+        Self {
+            outbox_event_id,
+            aggregate_type: "capability_profile".to_string(),
+            aggregate_id: profile.capability_profile_id.as_str().to_string(),
+            event_type: "identity.capability_profile.updated".to_string(),
+            payload_json: json!({
+                "capability_profile_id": profile.capability_profile_id.as_str(),
+                "global_member_id": profile.global_member_id.as_str(),
+                "display_name": member.display_name,
+                "lifecycle": member.lifecycle.as_db(),
+                "main_role_id": member.main_role_id.as_str(),
+                "capability_summary_json": profile.summary_json(),
+                "version": profile.version,
+                "updated_at": profile.updated_at,
             }),
             idempotency_key: idempotency_key.to_string(),
             status: OutboxStatus::Pending,

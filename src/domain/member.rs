@@ -273,6 +273,17 @@ impl GlobalMember {
         Ok(())
     }
 
+    /// Links the stable capability-profile id onto the member write model.
+    pub fn link_capability_profile(&mut self, capability_profile_id: CapabilityProfileId) {
+        if self.capability_profile_id.as_ref() == Some(&capability_profile_id) {
+            return;
+        }
+
+        self.capability_profile_id = Some(capability_profile_id);
+        self.version += 1;
+        self.updated_at = current_timestamp();
+    }
+
     fn apply_lifecycle_transition(&mut self, target_lifecycle: GlobalMemberLifecycle) {
         self.lifecycle = target_lifecycle;
         self.version += 1;

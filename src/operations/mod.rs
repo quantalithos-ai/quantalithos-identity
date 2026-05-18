@@ -264,11 +264,34 @@ async fn apply_member_summary_projection_event<Uow>(
 where
     Uow: UnitOfWork,
 {
-    let mut projection =
-        match MemberSummaryProjection::apply_outbox_event(event, current_timestamp())? {
-            Some(projection) => projection,
-            None => return Ok(None),
-        };
+    let existing_projection = if event.event_type == "identity.capability_profile.updated" {
+        let global_member_id = event
+            .payload_json
+            .get("global_member_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| IdentityError::PersistenceData {
+                message: format!(
+                    "capability-profile outbox payload for `{}` is missing `global_member_id`",
+                    event.outbox_event_id.as_str()
+                ),
+            })?;
+        uow.member_summary_projection()
+            .get(&crate::domain::shared::ids::GlobalMemberId::new(
+                global_member_id,
+            ))
+            .await?
+    } else {
+        None
+    };
+
+    let mut projection = match MemberSummaryProjection::apply_outbox_event(
+        event,
+        existing_projection,
+        current_timestamp(),
+    )? {
+        Some(projection) => projection,
+        None => return Ok(None),
+    };
 
     if let Some(main_role_id) = projection.main_role_id.clone() {
         projection.main_role_name = uow
@@ -696,6 +719,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebuild_member_summary_projection_merges_capability_updates_into_existing_projection()
+    {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let first_created_at = now();
+        let second_created_at = first_created_at + Duration::seconds(1);
+        seed_outbox_event(
+            &pool,
+            sample_member_created_projection_event(
+                "outbox-member-151",
+                "member-151",
+                "Member One Five One",
+                "role.member.operator",
+                first_created_at,
+            ),
+        )
+        .await;
+
+        let job = ProjectionRebuildJob::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        job.rebuild_member_summary_projection("member-summary-rebuild", 10)
+            .await
+            .expect("initial projection rebuild should succeed");
+
+        sqlx::query(
+            r#"
+            UPDATE member_summary_projection
+            SET
+                career_summary_json = $2,
+                memory_ref_summary_json = $3
+            WHERE global_member_id = $1
+            "#,
+        )
+        .bind("member-151")
+        .bind(json!({ "entries": 2 }))
+        .bind(json!({ "refs": ["memory-001"] }))
+        .execute(&pool)
+        .await
+        .expect("seed existing projection summaries");
+
+        seed_outbox_event(
+            &pool,
+            sample_capability_profile_updated_projection_event(
+                "outbox-capability-151",
+                "capability-profile:member-151",
+                "member-151",
+                "Member One Five One",
+                "role.member.operator",
+                second_created_at,
+            ),
+        )
+        .await;
+
+        let summary = job
+            .rebuild_member_summary_projection("member-summary-rebuild", 10)
+            .await
+            .expect("capability projection rebuild should succeed");
+
+        let projection_row = sqlx::query(
+            r#"
+            SELECT
+                display_name,
+                main_role_name,
+                capability_summary_json,
+                career_summary_json,
+                memory_ref_summary_json,
+                projection_version
+            FROM member_summary_projection
+            WHERE global_member_id = $1
+            "#,
+        )
+        .bind("member-151")
+        .fetch_one(&pool)
+        .await
+        .expect("load projection after capability update");
+        let checkpoint_row = sqlx::query(
+            "SELECT last_processed_event_id, status FROM projection_checkpoints WHERE checkpoint_name = $1",
+        )
+        .bind("member-summary-rebuild")
+        .fetch_one(&pool)
+        .await
+        .expect("load projection checkpoint after capability update");
+
+        assert_eq!(
+            summary,
+            RebuildMemberSummaryProjectionSummary {
+                scanned: 1,
+                rebuilt: 1,
+                skipped: 0,
+            }
+        );
+        assert_eq!(
+            projection_row.get::<String, _>("display_name"),
+            "Member One Five One"
+        );
+        assert_eq!(
+            projection_row.get::<Option<String>, _>("main_role_name"),
+            Some("Member Operator".to_string())
+        );
+        assert_eq!(
+            projection_row.get::<serde_json::Value, _>("capability_summary_json"),
+            json!({
+                "capability_profile_id": "capability-profile:member-151",
+                "items": [
+                    {
+                        "capability_id": "capability.rust",
+                        "capability_name": "Rust",
+                        "proficiency": "advanced",
+                        "notes": "systems programming",
+                    }
+                ],
+                "evidence_refs": [
+                    {
+                        "artifact_id": "artifact-151",
+                        "artifact_kind": "evidence",
+                        "artifact_version": "v1",
+                    }
+                ],
+                "version": 1,
+            })
+        );
+        assert_eq!(
+            projection_row.get::<serde_json::Value, _>("career_summary_json"),
+            json!({ "entries": 2 })
+        );
+        assert_eq!(
+            projection_row.get::<serde_json::Value, _>("memory_ref_summary_json"),
+            json!({ "refs": ["memory-001"] })
+        );
+        assert_eq!(projection_row.get::<i64, _>("projection_version"), 1);
+        assert_eq!(
+            checkpoint_row.get::<Option<String>, _>("last_processed_event_id"),
+            Some("outbox-capability-151".to_string())
+        );
+        assert_eq!(checkpoint_row.get::<String, _>("status"), "idle");
+    }
+
+    #[tokio::test]
     async fn rebuild_member_summary_projection_marks_checkpoint_failed_without_advancing_past_bad_event()
      {
         let db_mutex = Arc::clone(&DB_TEST_MUTEX);
@@ -816,6 +980,7 @@ mod tests {
                 idempotency_records,
                 audit_trace_entries,
                 lifecycle_history_entries,
+                capability_profiles,
                 global_members,
                 role_catalog_entries
             RESTART IDENTITY CASCADE
@@ -985,6 +1150,57 @@ mod tests {
                 "memory_refs_id": null,
                 "version": 0,
                 "created_at": created_at,
+                "updated_at": created_at,
+            }),
+            idempotency_key: format!("idem-{outbox_event_id}"),
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            next_retry_at: None,
+            created_at,
+            published_at: None,
+            failure_reason: None,
+        }
+    }
+
+    fn sample_capability_profile_updated_projection_event(
+        outbox_event_id: &str,
+        capability_profile_id: &str,
+        global_member_id: &str,
+        display_name: &str,
+        main_role_id: &str,
+        created_at: PrimitiveDateTime,
+    ) -> OutboxEvent {
+        OutboxEvent {
+            outbox_event_id: OutboxEventId::new(outbox_event_id),
+            aggregate_type: "capability_profile".to_string(),
+            aggregate_id: capability_profile_id.to_string(),
+            event_type: "identity.capability_profile.updated".to_string(),
+            payload_json: json!({
+                "capability_profile_id": capability_profile_id,
+                "global_member_id": global_member_id,
+                "display_name": display_name,
+                "lifecycle": "hired",
+                "main_role_id": main_role_id,
+                "capability_summary_json": {
+                    "capability_profile_id": capability_profile_id,
+                    "items": [
+                        {
+                            "capability_id": "capability.rust",
+                            "capability_name": "Rust",
+                            "proficiency": "advanced",
+                            "notes": "systems programming",
+                        }
+                    ],
+                    "evidence_refs": [
+                        {
+                            "artifact_id": "artifact-151",
+                            "artifact_kind": "evidence",
+                            "artifact_version": "v1",
+                        }
+                    ],
+                    "version": 1,
+                },
+                "version": 1,
                 "updated_at": created_at,
             }),
             idempotency_key: format!("idem-{outbox_event_id}"),

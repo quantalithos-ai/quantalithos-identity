@@ -5,11 +5,12 @@ use sqlx::{Postgres, Row, Transaction};
 use time::{OffsetDateTime, PrimitiveDateTime};
 
 use crate::application::persistence::{
-    AuditTraceRepository, GlobalMemberRepository, IdempotencyStore, InboundDeadLetterStore,
-    LifecycleHistoryRepository, MemberSummaryProjectionRepository, OutboxStore,
-    ProjectionCheckpointRepository, RoleCatalogRepository,
+    AuditTraceRepository, CapabilityProfileRepository, GlobalMemberRepository, IdempotencyStore,
+    InboundDeadLetterStore, LifecycleHistoryRepository, MemberSummaryProjectionRepository,
+    OutboxStore, ProjectionCheckpointRepository, RoleCatalogRepository,
 };
 use crate::domain::audit::{AuditResult, AuditTraceEntry};
+use crate::domain::capability_profile::{ArtifactRef, CapabilityItem, CapabilityProfile};
 use crate::domain::dead_letter::{DeadLetterReplayStatus, InboundDeadLetter};
 use crate::domain::idempotency::{IdempotencyRecord, IdempotencyScope, IdempotencyStatus};
 use crate::domain::member::{GlobalMember, GlobalMemberLifecycle};
@@ -19,7 +20,9 @@ use crate::domain::projection::{
 };
 use crate::domain::role_catalog::{RoleCatalogEntry, RoleCatalogStatus};
 use crate::domain::shared::context::ActorContext;
-use crate::domain::shared::ids::{EventId, GlobalMemberId, OutboxEventId, RoleId};
+use crate::domain::shared::ids::{
+    CapabilityProfileId, EventId, GlobalMemberId, OutboxEventId, RoleId,
+};
 use crate::domain::shared::metadata::CommandMetadata;
 use crate::domain::timeline::{LifecycleEventType, LifecycleHistoryEntry};
 use crate::error::IdentityError;
@@ -297,6 +300,155 @@ impl RoleCatalogRepository for SqlxRoleCatalogRepository<'_, '_> {
         .execute(self.transaction.as_mut())
         .await
         .map_err(IdentityError::DatabasePool)?;
+
+        Ok(())
+    }
+}
+
+/// Capability-profile repository bound to an open SQL transaction.
+pub struct SqlxCapabilityProfileRepository<'tx, 'db> {
+    transaction: &'tx mut Transaction<'db, Postgres>,
+}
+
+impl<'tx, 'db> SqlxCapabilityProfileRepository<'tx, 'db> {
+    /// Creates a repository facade over the provided SQL transaction.
+    pub fn new(transaction: &'tx mut Transaction<'db, Postgres>) -> Self {
+        Self { transaction }
+    }
+}
+
+impl CapabilityProfileRepository for SqlxCapabilityProfileRepository<'_, '_> {
+    async fn get_by_member(
+        &mut self,
+        global_member_id: &GlobalMemberId,
+    ) -> Result<Option<CapabilityProfile>, IdentityError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                capability_profile_id,
+                global_member_id,
+                capabilities_json,
+                evidence_refs_json,
+                version,
+                updated_at
+            FROM capability_profiles
+            WHERE global_member_id = $1
+            "#,
+        )
+        .bind(global_member_id.as_str())
+        .fetch_optional(self.transaction.as_mut())
+        .await
+        .map_err(IdentityError::DatabasePool)?;
+
+        row.map(map_capability_profile_row).transpose()
+    }
+
+    async fn get_for_update_by_member(
+        &mut self,
+        global_member_id: &GlobalMemberId,
+    ) -> Result<Option<CapabilityProfile>, IdentityError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                capability_profile_id,
+                global_member_id,
+                capabilities_json,
+                evidence_refs_json,
+                version,
+                updated_at
+            FROM capability_profiles
+            WHERE global_member_id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(global_member_id.as_str())
+        .fetch_optional(self.transaction.as_mut())
+        .await
+        .map_err(IdentityError::DatabasePool)?;
+
+        row.map(map_capability_profile_row).transpose()
+    }
+
+    async fn insert(&mut self, profile: &CapabilityProfile) -> Result<(), IdentityError> {
+        let capabilities_json = serde_json::to_value(&profile.capabilities).map_err(|error| {
+            IdentityError::PersistenceData {
+                message: format!("serialize capability items: {error}"),
+            }
+        })?;
+        let evidence_refs_json = serde_json::to_value(&profile.evidence_refs).map_err(|error| {
+            IdentityError::PersistenceData {
+                message: format!("serialize capability evidence refs: {error}"),
+            }
+        })?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO capability_profiles (
+                capability_profile_id,
+                global_member_id,
+                capabilities_json,
+                evidence_refs_json,
+                version,
+                updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(profile.capability_profile_id.as_str())
+        .bind(profile.global_member_id.as_str())
+        .bind(capabilities_json)
+        .bind(evidence_refs_json)
+        .bind(profile.version)
+        .bind(profile.updated_at)
+        .execute(self.transaction.as_mut())
+        .await
+        .map_err(IdentityError::DatabasePool)?;
+
+        Ok(())
+    }
+
+    async fn save(
+        &mut self,
+        profile: &CapabilityProfile,
+        expected_version: i64,
+    ) -> Result<(), IdentityError> {
+        let capabilities_json = serde_json::to_value(&profile.capabilities).map_err(|error| {
+            IdentityError::PersistenceData {
+                message: format!("serialize capability items: {error}"),
+            }
+        })?;
+        let evidence_refs_json = serde_json::to_value(&profile.evidence_refs).map_err(|error| {
+            IdentityError::PersistenceData {
+                message: format!("serialize capability evidence refs: {error}"),
+            }
+        })?;
+
+        let result = sqlx::query(
+            r#"
+            UPDATE capability_profiles
+            SET
+                capabilities_json = $2,
+                evidence_refs_json = $3,
+                version = $4,
+                updated_at = $5
+            WHERE capability_profile_id = $1
+              AND version = $6
+            "#,
+        )
+        .bind(profile.capability_profile_id.as_str())
+        .bind(capabilities_json)
+        .bind(evidence_refs_json)
+        .bind(profile.version)
+        .bind(profile.updated_at)
+        .bind(expected_version)
+        .execute(self.transaction.as_mut())
+        .await
+        .map_err(IdentityError::DatabasePool)?;
+
+        if result.rows_affected() == 0 {
+            return Err(IdentityError::VersionConflict {
+                entity: "capability_profile".to_string(),
+            });
+        }
 
         Ok(())
     }
@@ -1004,6 +1156,36 @@ fn map_role_catalog_row(row: sqlx::postgres::PgRow) -> Result<RoleCatalogEntry, 
         source_ref_json: row.get("source_ref_json"),
         fingerprint: row.get("fingerprint"),
         status,
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn map_capability_profile_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<CapabilityProfile, IdentityError> {
+    let capabilities_json: Value = row.get("capabilities_json");
+    let evidence_refs_json: Value = row.get("evidence_refs_json");
+    let capabilities: Vec<CapabilityItem> =
+        serde_json::from_value(capabilities_json).map_err(|error| {
+            IdentityError::PersistenceData {
+                message: format!("decode capability items json: {error}"),
+            }
+        })?;
+    let evidence_refs: Vec<ArtifactRef> =
+        serde_json::from_value(evidence_refs_json).map_err(|error| {
+            IdentityError::PersistenceData {
+                message: format!("decode capability evidence refs json: {error}"),
+            }
+        })?;
+
+    Ok(CapabilityProfile {
+        capability_profile_id: CapabilityProfileId::new(
+            row.get::<String, _>("capability_profile_id"),
+        ),
+        global_member_id: GlobalMemberId::new(row.get::<String, _>("global_member_id")),
+        capabilities,
+        evidence_refs,
+        version: row.get("version"),
         updated_at: row.get("updated_at"),
     })
 }

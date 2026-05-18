@@ -1019,6 +1019,7 @@ mod tests {
                 idempotency_records,
                 audit_trace_entries,
                 lifecycle_history_entries,
+                capability_profiles,
                 global_members,
                 role_catalog_entries
             RESTART IDENTITY CASCADE

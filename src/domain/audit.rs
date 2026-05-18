@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::PrimitiveDateTime;
 
+use crate::domain::capability_profile::CapabilityProfile;
 use crate::domain::member::GlobalMember;
 use crate::domain::shared::context::ActorContext;
 
@@ -101,6 +102,31 @@ impl AuditTraceEntry {
             created_at,
             reason,
         )
+    }
+
+    /// Creates an audit trace row for a successful capability-profile update command.
+    pub fn for_capability_profile_command(
+        audit_trace_id: impl Into<String>,
+        profile: &CapabilityProfile,
+        actor: &ActorContext,
+        trace_id: impl Into<String>,
+        created_at: PrimitiveDateTime,
+    ) -> Self {
+        Self {
+            audit_trace_id: audit_trace_id.into(),
+            trace_id: trace_id.into(),
+            action: "UpdateCapabilityProfile".to_string(),
+            actor_json: Some(json!(actor)),
+            target_ref_json: Some(json!({
+                "kind": "capability_profile",
+                "id": profile.capability_profile_id.as_str(),
+                "global_member_id": profile.global_member_id.as_str(),
+            })),
+            source_module: None,
+            result: AuditResult::Success,
+            reason: None,
+            created_at,
+        }
     }
 
     fn for_member_command(
