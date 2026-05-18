@@ -1,9 +1,11 @@
 //! Lightweight ID value objects used to keep repository boundaries explicit.
 
+use serde::{Deserialize, Serialize};
+
 macro_rules! define_id_type {
     ($name:ident) => {
         #[doc = "Stable identifier value object."]
-        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
         pub struct $name(String);
 
         impl $name {

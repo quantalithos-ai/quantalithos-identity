@@ -1,7 +1,7 @@
 //! SQLx database bootstrap helpers for the persistence layer.
 
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use sqlx::ConnectOptions;
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
 use crate::config::AppConfig;
 use crate::error::IdentityError;

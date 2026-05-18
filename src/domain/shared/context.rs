@@ -1,9 +1,11 @@
 //! Trusted caller context passed from the gateway into identity.
 
+use serde::{Deserialize, Serialize};
+
 use super::ids::GlobalMemberId;
 
 /// Describes the kind of trusted actor making the current call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActorKind {
     /// A human operator such as an owner or administrator.
     HumanUser,
@@ -14,7 +16,7 @@ pub enum ActorKind {
 }
 
 /// Represents trusted caller context injected by the gateway or runtime boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActorContext {
     /// Stable actor reference for audit traces and created_by snapshots.
     pub actor_ref: String,

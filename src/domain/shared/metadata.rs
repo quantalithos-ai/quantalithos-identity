@@ -1,7 +1,9 @@
 //! Request-scoped metadata value objects for commands and inbound events.
 
+use serde::{Deserialize, Serialize};
+
 /// Carries trace, idempotency, and hashing metadata for command or event handling.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandMetadata {
     /// Idempotency key used to deduplicate repeated requests or events.
     pub idempotency_key: String,
