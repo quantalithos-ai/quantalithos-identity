@@ -358,6 +358,14 @@ impl ProjectionCheckpoint {
         self.failure_reason = Some(failure_reason.into());
         self.updated_at = updated_at;
     }
+
+    /// Resets the checkpoint back to its initial idle state for a fresh rebuild pass.
+    pub fn reset(&mut self, updated_at: PrimitiveDateTime) {
+        self.last_processed_event_id = None;
+        self.status = ProjectionCheckpointStatus::Idle;
+        self.failure_reason = None;
+        self.updated_at = updated_at;
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -397,4 +405,28 @@ struct CareerHistoryAppendedProjectionPayload {
     main_role_id: String,
     career_summary_json: Value,
     version: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use time::macros::datetime;
+
+    use super::{ProjectionCheckpoint, ProjectionCheckpointStatus};
+    use crate::domain::shared::ids::OutboxEventId;
+
+    #[test]
+    fn reset_restores_checkpoint_to_initial_idle_state() {
+        let initial_time = datetime!(2026-05-18 12:00:00);
+        let reset_time = datetime!(2026-05-18 12:05:00);
+        let mut checkpoint = ProjectionCheckpoint::initial("member-summary-rebuild", initial_time);
+
+        checkpoint.advance_to(OutboxEventId::new("outbox-001"), initial_time);
+        checkpoint.mark_failed("apply failed", initial_time);
+        checkpoint.reset(reset_time);
+
+        assert_eq!(checkpoint.last_processed_event_id, None);
+        assert_eq!(checkpoint.status, ProjectionCheckpointStatus::Idle);
+        assert_eq!(checkpoint.failure_reason, None);
+        assert_eq!(checkpoint.updated_at, reset_time);
+    }
 }

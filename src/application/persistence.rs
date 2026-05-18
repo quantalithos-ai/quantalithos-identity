@@ -192,6 +192,13 @@ pub trait IdempotencyStore {
         scope: IdempotencyScope,
     ) -> impl std::future::Future<Output = Result<Option<IdempotencyRecord>, IdentityError>> + Send;
 
+    /// Deletes one persisted idempotency record so a later retry can re-enter normal flow.
+    fn delete(
+        &mut self,
+        idempotency_key: &str,
+        scope: IdempotencyScope,
+    ) -> impl std::future::Future<Output = Result<bool, IdentityError>> + Send;
+
     /// Persists a succeeded idempotency record inside the same local transaction as business writes.
     fn record_success(
         &mut self,
@@ -209,7 +216,7 @@ pub trait OutboxStore {
         event: &OutboxEvent,
     ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
 
-    /// Lists pending outbox rows ordered for publisher processing.
+    /// Lists outbox rows that are ready for publisher processing.
     fn list_pending(
         &mut self,
         batch_size: usize,
@@ -221,6 +228,18 @@ pub trait OutboxStore {
         last_processed_event_id: Option<&OutboxEventId>,
         batch_size: usize,
     ) -> impl std::future::Future<Output = Result<Vec<OutboxEvent>, IdentityError>> + Send;
+
+    /// Lists all outbox rows that can rebuild one member summary projection in event order.
+    fn list_for_member_projection(
+        &mut self,
+        global_member_id: &GlobalMemberId,
+    ) -> impl std::future::Future<Output = Result<Vec<OutboxEvent>, IdentityError>> + Send;
+
+    /// Loads one persisted outbox row by its stable identifier.
+    fn get(
+        &mut self,
+        outbox_event_id: &OutboxEventId,
+    ) -> impl std::future::Future<Output = Result<Option<OutboxEvent>, IdentityError>> + Send;
 
     /// Persists an updated outbox row after publisher-side status changes.
     fn save(
@@ -242,6 +261,12 @@ pub trait MemberSummaryProjectionRepository {
         &mut self,
         projection: &MemberSummaryProjection,
     ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
+
+    /// Deletes one member summary projection row before a point rebuild rewrites it from facts.
+    fn delete(
+        &mut self,
+        global_member_id: &GlobalMemberId,
+    ) -> impl std::future::Future<Output = Result<bool, IdentityError>> + Send;
 }
 
 /// Maintains durable rebuild progress for projection and replay workflows.
@@ -266,6 +291,18 @@ pub trait InboundDeadLetterStore {
         &mut self,
         dead_letter: &InboundDeadLetter,
     ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
+
+    /// Lists dead-letter rows that are still waiting for replay or review.
+    fn list_pending(
+        &mut self,
+        batch_size: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<InboundDeadLetter>, IdentityError>> + Send;
+
+    /// Loads one dead-letter row by its stable identifier.
+    fn get(
+        &mut self,
+        dead_letter_id: &crate::domain::shared::ids::DeadLetterId,
+    ) -> impl std::future::Future<Output = Result<Option<InboundDeadLetter>, IdentityError>> + Send;
 
     /// Persists replay-status changes for an existing dead-letter row.
     fn save(

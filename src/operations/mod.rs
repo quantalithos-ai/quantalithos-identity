@@ -2,13 +2,23 @@
 
 use time::{OffsetDateTime, PrimitiveDateTime};
 
+use crate::application::career_event::CareerEventOutcome;
 use crate::application::persistence::{
-    MemberSummaryProjectionRepository, OutboxStore, ProjectionCheckpointRepository,
-    RoleCatalogRepository, UnitOfWork, UnitOfWorkFactory,
+    IdempotencyStore, InboundDeadLetterStore, MemberSummaryProjectionRepository, OutboxStore,
+    ProjectionCheckpointRepository, RoleCatalogRepository, UnitOfWork, UnitOfWorkFactory,
 };
+use crate::application::role_catalog_sync::RoleCatalogSyncOutcome;
+use crate::application::tombstone_flow::GateDecisionOutcome;
+use crate::domain::dead_letter::InboundDeadLetter;
+use crate::domain::idempotency::{IdempotencyScope, IdempotencyStatus};
 use crate::domain::outbox::OutboxEvent;
 use crate::domain::projection::{MemberSummaryProjection, ProjectionCheckpoint};
+use crate::domain::shared::ids::{DeadLetterId, OutboxEventId};
 use crate::error::IdentityError;
+use crate::inbound::events::{
+    InboundEventEnvelope, InboundGateDecisionEvent, InboundProcessFactEvent,
+    InboundRoleCatalogEvent, InboundWorkFactEvent,
+};
 use crate::outbound::BusPublisherPort;
 
 /// Summary returned after one publisher pass over the pending outbox batch.
@@ -31,6 +41,681 @@ pub struct RebuildMemberSummaryProjectionSummary {
     pub rebuilt: usize,
     /// Number of rows that were known but irrelevant to the member summary projection.
     pub skipped: usize,
+}
+
+/// Result returned after resetting one projection checkpoint for a fresh rebuild pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetProjectionCheckpointResult {
+    /// Name of the checkpoint that was reset.
+    pub checkpoint_name: String,
+}
+
+/// Result returned after clearing one abnormal idempotency record for later retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClearIdempotencyRecordResult {
+    /// Stable idempotency key that was cleared.
+    pub idempotency_key: String,
+    /// Scope associated with the cleared idempotency key.
+    pub scope: IdempotencyScope,
+}
+
+/// Result returned after rebuilding one member summary projection row from persisted facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebuildMemberProjectionResult {
+    /// Member whose projection row was rebuilt.
+    pub global_member_id: String,
+    /// Number of outbox facts replayed for the rebuilt member projection.
+    pub replayed_events: usize,
+}
+
+/// Result returned after replaying one dead outbox row manually.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayDeadOutboxEventResult {
+    /// Stable outbox event identifier that was replayed.
+    pub outbox_event_id: String,
+}
+
+/// Summary returned after one replay pass over pending inbound dead letters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayInboundDeadLettersSummary {
+    /// Number of dead-letter rows that were selected for the current pass.
+    pub scanned: usize,
+    /// Number of rows successfully replayed and marked replayed.
+    pub replayed: usize,
+    /// Number of rows that still require later replay or manual review.
+    pub still_pending: usize,
+}
+
+/// Result returned after one manual dead-letter ignore operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoreInboundDeadLetterResult {
+    /// Identifier of the dead-letter row that was ignored.
+    pub dead_letter_id: String,
+}
+
+/// Result returned after replaying one inbound dead-letter row manually.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayInboundDeadLetterResult {
+    /// Identifier of the dead-letter row that was replayed successfully.
+    pub dead_letter_id: String,
+}
+
+/// Replays one dead-lettered role-catalog event through the application-service boundary.
+pub trait RoleCatalogDeadLetterReplayPort {
+    /// Replays one stored role-catalog dead letter.
+    fn replay_dead_letter(
+        &self,
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+        event: InboundRoleCatalogEvent,
+    ) -> impl std::future::Future<Output = Result<RoleCatalogSyncOutcome, IdentityError>>;
+}
+
+/// Replays one dead-lettered career event through the application-service boundary.
+pub trait CareerDeadLetterReplayPort {
+    /// Replays one stored work dead letter.
+    fn replay_work_dead_letter(
+        &self,
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+        event: InboundWorkFactEvent,
+    ) -> impl std::future::Future<Output = Result<CareerEventOutcome, IdentityError>>;
+
+    /// Replays one stored process dead letter.
+    fn replay_process_dead_letter(
+        &self,
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+        event: InboundProcessFactEvent,
+    ) -> impl std::future::Future<Output = Result<CareerEventOutcome, IdentityError>>;
+}
+
+/// Replays one dead-lettered gate-decision event through the application-service boundary.
+pub trait GateDecisionDeadLetterReplayPort {
+    /// Replays one stored gate-decision dead letter.
+    fn replay_dead_letter(
+        &self,
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+        event: InboundGateDecisionEvent,
+    ) -> impl std::future::Future<Output = Result<GateDecisionOutcome, IdentityError>>;
+}
+
+/// Replays pending inbound dead letters through the same application services used in normal flow.
+#[derive(Debug, Clone)]
+pub struct InboundDeadLetterReplayJob<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
+{
+    unit_of_work_factory: UowFactory,
+    role_catalog_replayer: RoleCatalogReplayer,
+    career_replayer: CareerReplayer,
+    gate_replayer: GateReplayer,
+}
+
+impl<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
+    InboundDeadLetterReplayJob<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
+{
+    /// Creates a new inbound dead-letter replay job bound to the provided handlers.
+    pub fn new(
+        unit_of_work_factory: UowFactory,
+        role_catalog_replayer: RoleCatalogReplayer,
+        career_replayer: CareerReplayer,
+        gate_replayer: GateReplayer,
+    ) -> Self {
+        Self {
+            unit_of_work_factory,
+            role_catalog_replayer,
+            career_replayer,
+            gate_replayer,
+        }
+    }
+
+    /// Returns a stable operations name for diagnostics and tests.
+    pub fn operation_name(&self) -> &'static str {
+        "ReplayInboundDeadLetters"
+    }
+}
+
+/// Marks one inbound dead-letter row as intentionally ignored after manual review.
+#[derive(Debug, Clone)]
+pub struct IgnoreInboundDeadLetterJob<UowFactory> {
+    unit_of_work_factory: UowFactory,
+}
+
+impl<UowFactory> IgnoreInboundDeadLetterJob<UowFactory> {
+    /// Creates a new manual dead-letter ignore job.
+    pub fn new(unit_of_work_factory: UowFactory) -> Self {
+        Self {
+            unit_of_work_factory,
+        }
+    }
+
+    /// Returns a stable operations name for diagnostics and tests.
+    pub fn operation_name(&self) -> &'static str {
+        "IgnoreInboundDeadLetter"
+    }
+}
+
+impl<UowFactory> IgnoreInboundDeadLetterJob<UowFactory>
+where
+    UowFactory: UnitOfWorkFactory,
+{
+    /// Marks one pending inbound dead-letter row as ignored with an explicit operator reason.
+    pub async fn ignore_inbound_dead_letter(
+        &self,
+        dead_letter_id: &DeadLetterId,
+        reason: &str,
+    ) -> Result<IgnoreInboundDeadLetterResult, IdentityError> {
+        if reason.trim().is_empty() {
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_INVALID_ARGUMENT",
+                message: "ignore reason must not be blank".to_string(),
+            });
+        }
+
+        let mut uow = self.unit_of_work_factory.begin().await?;
+        let mut dead_letter = uow
+            .inbound_dead_letters()
+            .get(dead_letter_id)
+            .await?
+            .ok_or_else(|| IdentityError::RuleViolation {
+                code: "IDENTITY_DEAD_LETTER_NOT_FOUND",
+                message: format!(
+                    "inbound dead letter `{}` was not found",
+                    dead_letter_id.as_str()
+                ),
+            })?;
+
+        if dead_letter.replay_status != crate::domain::dead_letter::DeadLetterReplayStatus::Pending
+        {
+            uow.rollback().await?;
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_DEAD_LETTER_NOT_PENDING",
+                message: format!(
+                    "inbound dead letter `{}` is not pending replay or review",
+                    dead_letter_id.as_str()
+                ),
+            });
+        }
+
+        dead_letter.mark_ignored(reason.trim());
+        uow.inbound_dead_letters().save(&dead_letter).await?;
+        uow.commit().await?;
+
+        Ok(IgnoreInboundDeadLetterResult {
+            dead_letter_id: dead_letter_id.as_str().to_string(),
+        })
+    }
+}
+
+/// Replays one pending inbound dead-letter row manually through the normal application boundary.
+#[derive(Debug, Clone)]
+pub struct ReplayInboundDeadLetterJob<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
+{
+    unit_of_work_factory: UowFactory,
+    role_catalog_replayer: RoleCatalogReplayer,
+    career_replayer: CareerReplayer,
+    gate_replayer: GateReplayer,
+}
+
+impl<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
+    ReplayInboundDeadLetterJob<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
+{
+    /// Creates a new single dead-letter replay job bound to the provided handlers.
+    pub fn new(
+        unit_of_work_factory: UowFactory,
+        role_catalog_replayer: RoleCatalogReplayer,
+        career_replayer: CareerReplayer,
+        gate_replayer: GateReplayer,
+    ) -> Self {
+        Self {
+            unit_of_work_factory,
+            role_catalog_replayer,
+            career_replayer,
+            gate_replayer,
+        }
+    }
+
+    /// Returns a stable operations name for diagnostics and tests.
+    pub fn operation_name(&self) -> &'static str {
+        "ReplayInboundDeadLetter"
+    }
+}
+
+impl<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
+    ReplayInboundDeadLetterJob<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
+where
+    UowFactory: UnitOfWorkFactory + Clone,
+    RoleCatalogReplayer: RoleCatalogDeadLetterReplayPort,
+    CareerReplayer: CareerDeadLetterReplayPort,
+    GateReplayer: GateDecisionDeadLetterReplayPort,
+{
+    /// Replays one pending inbound dead-letter row manually.
+    pub async fn replay_inbound_dead_letter(
+        &self,
+        dead_letter_id: &DeadLetterId,
+    ) -> Result<ReplayInboundDeadLetterResult, IdentityError> {
+        let mut uow = self.unit_of_work_factory.begin().await?;
+        let dead_letter = uow
+            .inbound_dead_letters()
+            .get(dead_letter_id)
+            .await?
+            .ok_or_else(|| IdentityError::RuleViolation {
+                code: "IDENTITY_DEAD_LETTER_NOT_FOUND",
+                message: format!(
+                    "inbound dead letter `{}` was not found",
+                    dead_letter_id.as_str()
+                ),
+            })?;
+        uow.rollback().await?;
+
+        if dead_letter.replay_status != crate::domain::dead_letter::DeadLetterReplayStatus::Pending
+        {
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_DEAD_LETTER_NOT_PENDING",
+                message: format!(
+                    "inbound dead letter `{}` is not pending replay or review",
+                    dead_letter_id.as_str()
+                ),
+            });
+        }
+
+        let replayed = self.replay_dead_letter(dead_letter).await?;
+        if !replayed {
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_DEAD_LETTER_REPLAY_FAILED",
+                message: format!(
+                    "inbound dead letter `{}` replay did not complete successfully",
+                    dead_letter_id.as_str()
+                ),
+            });
+        }
+
+        Ok(ReplayInboundDeadLetterResult {
+            dead_letter_id: dead_letter_id.as_str().to_string(),
+        })
+    }
+
+    async fn replay_dead_letter(
+        &self,
+        mut dead_letter: InboundDeadLetter,
+    ) -> Result<bool, IdentityError> {
+        let disposition = self.dispatch_dead_letter(&dead_letter).await;
+        match disposition {
+            Ok(DeadLetterReplayDisposition::Replayed) => dead_letter.mark_replayed(),
+            Ok(DeadLetterReplayDisposition::StillPending(reason)) => {
+                dead_letter.refresh_failure_reason(reason);
+            }
+            Err(error) => dead_letter.refresh_failure_reason(error.to_string()),
+        }
+
+        let replayed = dead_letter.replay_status
+            == crate::domain::dead_letter::DeadLetterReplayStatus::Replayed;
+        let mut uow = self.unit_of_work_factory.begin().await?;
+        uow.inbound_dead_letters().save(&dead_letter).await?;
+        uow.commit().await?;
+
+        Ok(replayed)
+    }
+
+    async fn dispatch_dead_letter(
+        &self,
+        dead_letter: &InboundDeadLetter,
+    ) -> Result<DeadLetterReplayDisposition, IdentityError> {
+        let source_event_id = match dead_letter.source_event_id.clone() {
+            Some(source_event_id) => source_event_id,
+            None => {
+                return Ok(DeadLetterReplayDisposition::StillPending(
+                    "automatic replay requires source_event_id".to_string(),
+                ));
+            }
+        };
+
+        let envelope = InboundEventEnvelope {
+            source_event_id,
+            source_module: dead_letter.source_module.clone(),
+            event_type: dead_letter.event_type.clone(),
+            occurred_at: dead_letter.created_at,
+            payload_hash: replay_payload_hash(&dead_letter.payload_json),
+            payload: dead_letter.payload_json.clone(),
+        };
+
+        match dead_letter.source_module.as_str() {
+            "method-library" => {
+                let outcome = self
+                    .role_catalog_replayer
+                    .replay_dead_letter(
+                        dead_letter.dead_letter_id.clone(),
+                        dead_letter.created_at,
+                        InboundRoleCatalogEvent { envelope },
+                    )
+                    .await?;
+                Ok(match outcome {
+                    RoleCatalogSyncOutcome::Synced { .. }
+                    | RoleCatalogSyncOutcome::SkippedDuplicate { .. } => {
+                        DeadLetterReplayDisposition::Replayed
+                    }
+                    RoleCatalogSyncOutcome::DeadLettered => {
+                        DeadLetterReplayDisposition::StillPending(
+                            "replay still failed and remained dead-lettered".to_string(),
+                        )
+                    }
+                })
+            }
+            "work" => {
+                let outcome = self
+                    .career_replayer
+                    .replay_work_dead_letter(
+                        dead_letter.dead_letter_id.clone(),
+                        dead_letter.created_at,
+                        InboundWorkFactEvent { envelope },
+                    )
+                    .await?;
+                Ok(match outcome {
+                    CareerEventOutcome::Appended { .. }
+                    | CareerEventOutcome::SkippedDuplicate { .. } => {
+                        DeadLetterReplayDisposition::Replayed
+                    }
+                    CareerEventOutcome::DeadLettered => DeadLetterReplayDisposition::StillPending(
+                        "replay still failed and remained dead-lettered".to_string(),
+                    ),
+                })
+            }
+            "process" => {
+                let outcome = self
+                    .career_replayer
+                    .replay_process_dead_letter(
+                        dead_letter.dead_letter_id.clone(),
+                        dead_letter.created_at,
+                        InboundProcessFactEvent { envelope },
+                    )
+                    .await?;
+                Ok(match outcome {
+                    CareerEventOutcome::Appended { .. }
+                    | CareerEventOutcome::SkippedDuplicate { .. } => {
+                        DeadLetterReplayDisposition::Replayed
+                    }
+                    CareerEventOutcome::DeadLettered => DeadLetterReplayDisposition::StillPending(
+                        "replay still failed and remained dead-lettered".to_string(),
+                    ),
+                })
+            }
+            "governance" => {
+                let outcome = self
+                    .gate_replayer
+                    .replay_dead_letter(
+                        dead_letter.dead_letter_id.clone(),
+                        dead_letter.created_at,
+                        InboundGateDecisionEvent { envelope },
+                    )
+                    .await?;
+                Ok(match outcome {
+                    GateDecisionOutcome::Recorded { .. }
+                    | GateDecisionOutcome::SkippedDuplicate { .. }
+                    | GateDecisionOutcome::SkippedNoPendingFlow { .. } => {
+                        DeadLetterReplayDisposition::Replayed
+                    }
+                    GateDecisionOutcome::DeadLettered => DeadLetterReplayDisposition::StillPending(
+                        "replay still failed and remained dead-lettered".to_string(),
+                    ),
+                })
+            }
+            other => Ok(DeadLetterReplayDisposition::StillPending(format!(
+                "automatic replay is not supported for source_module `{other}`"
+            ))),
+        }
+    }
+}
+
+impl<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
+    InboundDeadLetterReplayJob<UowFactory, RoleCatalogReplayer, CareerReplayer, GateReplayer>
+where
+    UowFactory: UnitOfWorkFactory,
+    RoleCatalogReplayer: RoleCatalogDeadLetterReplayPort,
+    CareerReplayer: CareerDeadLetterReplayPort,
+    GateReplayer: GateDecisionDeadLetterReplayPort,
+{
+    /// Replays one batch of pending inbound dead letters.
+    pub async fn replay_inbound_dead_letters(
+        &self,
+        batch_size: usize,
+    ) -> Result<ReplayInboundDeadLettersSummary, IdentityError> {
+        let mut uow = self.unit_of_work_factory.begin().await?;
+        let dead_letters = uow.inbound_dead_letters().list_pending(batch_size).await?;
+        uow.rollback().await?;
+
+        let mut summary = ReplayInboundDeadLettersSummary {
+            scanned: dead_letters.len(),
+            replayed: 0,
+            still_pending: 0,
+        };
+
+        for dead_letter in dead_letters {
+            match self.replay_dead_letter(dead_letter).await? {
+                true => summary.replayed += 1,
+                false => summary.still_pending += 1,
+            }
+        }
+
+        Ok(summary)
+    }
+
+    async fn replay_dead_letter(
+        &self,
+        mut dead_letter: InboundDeadLetter,
+    ) -> Result<bool, IdentityError> {
+        let disposition = self.dispatch_dead_letter(&dead_letter).await;
+        match disposition {
+            Ok(DeadLetterReplayDisposition::Replayed) => dead_letter.mark_replayed(),
+            Ok(DeadLetterReplayDisposition::StillPending(reason)) => {
+                dead_letter.refresh_failure_reason(reason);
+            }
+            Err(error) => dead_letter.refresh_failure_reason(error.to_string()),
+        }
+
+        let replayed = dead_letter.replay_status
+            == crate::domain::dead_letter::DeadLetterReplayStatus::Replayed;
+        let mut uow = self.unit_of_work_factory.begin().await?;
+        uow.inbound_dead_letters().save(&dead_letter).await?;
+        uow.commit().await?;
+
+        Ok(replayed)
+    }
+
+    async fn dispatch_dead_letter(
+        &self,
+        dead_letter: &InboundDeadLetter,
+    ) -> Result<DeadLetterReplayDisposition, IdentityError> {
+        let source_event_id = match dead_letter.source_event_id.clone() {
+            Some(source_event_id) => source_event_id,
+            None => {
+                return Ok(DeadLetterReplayDisposition::StillPending(
+                    "automatic replay requires source_event_id".to_string(),
+                ));
+            }
+        };
+
+        let envelope = InboundEventEnvelope {
+            source_event_id,
+            source_module: dead_letter.source_module.clone(),
+            event_type: dead_letter.event_type.clone(),
+            occurred_at: dead_letter.created_at,
+            payload_hash: replay_payload_hash(&dead_letter.payload_json),
+            payload: dead_letter.payload_json.clone(),
+        };
+
+        match dead_letter.source_module.as_str() {
+            "method-library" => {
+                let outcome = self
+                    .role_catalog_replayer
+                    .replay_dead_letter(
+                        dead_letter.dead_letter_id.clone(),
+                        dead_letter.created_at,
+                        InboundRoleCatalogEvent { envelope },
+                    )
+                    .await?;
+                Ok(match outcome {
+                    RoleCatalogSyncOutcome::Synced { .. }
+                    | RoleCatalogSyncOutcome::SkippedDuplicate { .. } => {
+                        DeadLetterReplayDisposition::Replayed
+                    }
+                    RoleCatalogSyncOutcome::DeadLettered => {
+                        DeadLetterReplayDisposition::StillPending(
+                            "replay still failed and remained dead-lettered".to_string(),
+                        )
+                    }
+                })
+            }
+            "work" => {
+                let outcome = self
+                    .career_replayer
+                    .replay_work_dead_letter(
+                        dead_letter.dead_letter_id.clone(),
+                        dead_letter.created_at,
+                        InboundWorkFactEvent { envelope },
+                    )
+                    .await?;
+                Ok(match outcome {
+                    CareerEventOutcome::Appended { .. }
+                    | CareerEventOutcome::SkippedDuplicate { .. } => {
+                        DeadLetterReplayDisposition::Replayed
+                    }
+                    CareerEventOutcome::DeadLettered => DeadLetterReplayDisposition::StillPending(
+                        "replay still failed and remained dead-lettered".to_string(),
+                    ),
+                })
+            }
+            "process" => {
+                let outcome = self
+                    .career_replayer
+                    .replay_process_dead_letter(
+                        dead_letter.dead_letter_id.clone(),
+                        dead_letter.created_at,
+                        InboundProcessFactEvent { envelope },
+                    )
+                    .await?;
+                Ok(match outcome {
+                    CareerEventOutcome::Appended { .. }
+                    | CareerEventOutcome::SkippedDuplicate { .. } => {
+                        DeadLetterReplayDisposition::Replayed
+                    }
+                    CareerEventOutcome::DeadLettered => DeadLetterReplayDisposition::StillPending(
+                        "replay still failed and remained dead-lettered".to_string(),
+                    ),
+                })
+            }
+            "governance" => {
+                let outcome = self
+                    .gate_replayer
+                    .replay_dead_letter(
+                        dead_letter.dead_letter_id.clone(),
+                        dead_letter.created_at,
+                        InboundGateDecisionEvent { envelope },
+                    )
+                    .await?;
+                Ok(match outcome {
+                    GateDecisionOutcome::Recorded { .. }
+                    | GateDecisionOutcome::SkippedDuplicate { .. }
+                    | GateDecisionOutcome::SkippedNoPendingFlow { .. } => {
+                        DeadLetterReplayDisposition::Replayed
+                    }
+                    GateDecisionOutcome::DeadLettered => DeadLetterReplayDisposition::StillPending(
+                        "replay still failed and remained dead-lettered".to_string(),
+                    ),
+                })
+            }
+            other => Ok(DeadLetterReplayDisposition::StillPending(format!(
+                "automatic replay is not supported for source_module `{other}`"
+            ))),
+        }
+    }
+}
+
+enum DeadLetterReplayDisposition {
+    Replayed,
+    StillPending(String),
+}
+
+impl<UowFactory> RoleCatalogDeadLetterReplayPort
+    for crate::application::role_catalog_sync::RoleCatalogSyncService<UowFactory>
+where
+    UowFactory: UnitOfWorkFactory,
+{
+    async fn replay_dead_letter(
+        &self,
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+        event: InboundRoleCatalogEvent,
+    ) -> Result<RoleCatalogSyncOutcome, IdentityError> {
+        crate::application::role_catalog_sync::RoleCatalogSyncService::<UowFactory>::replay_dead_letter(
+            self,
+            dead_letter_id,
+            created_at,
+            event,
+        )
+        .await
+    }
+}
+
+impl<UowFactory> CareerDeadLetterReplayPort
+    for crate::application::career_event::CareerEventConsumerService<UowFactory>
+where
+    UowFactory: UnitOfWorkFactory,
+{
+    async fn replay_work_dead_letter(
+        &self,
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+        event: InboundWorkFactEvent,
+    ) -> Result<CareerEventOutcome, IdentityError> {
+        crate::application::career_event::CareerEventConsumerService::<UowFactory>::replay_work_dead_letter(
+            self,
+            dead_letter_id,
+            created_at,
+            event,
+        )
+        .await
+    }
+
+    async fn replay_process_dead_letter(
+        &self,
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+        event: InboundProcessFactEvent,
+    ) -> Result<CareerEventOutcome, IdentityError> {
+        crate::application::career_event::CareerEventConsumerService::<UowFactory>::replay_process_dead_letter(
+            self,
+            dead_letter_id,
+            created_at,
+            event,
+        )
+        .await
+    }
+}
+
+impl<UowFactory, Governance, ArchiveRequester> GateDecisionDeadLetterReplayPort
+    for crate::application::tombstone_flow::TombstoneFlowService<
+        UowFactory,
+        Governance,
+        ArchiveRequester,
+    >
+where
+    UowFactory: UnitOfWorkFactory,
+    Governance: crate::outbound::GovernancePort,
+    ArchiveRequester: crate::outbound::ArchiveRequestPort,
+{
+    async fn replay_dead_letter(
+        &self,
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+        event: InboundGateDecisionEvent,
+    ) -> Result<GateDecisionOutcome, IdentityError> {
+        crate::application::tombstone_flow::TombstoneFlowService::<
+            UowFactory,
+            Governance,
+            ArchiveRequester,
+        >::replay_dead_letter(self, dead_letter_id, created_at, event)
+        .await
+    }
 }
 
 /// Publishes already-persisted outbox rows to the external L0-bus.
@@ -105,6 +790,82 @@ where
     }
 }
 
+/// Replays one dead outbox row manually after operator review.
+#[derive(Debug, Clone)]
+pub struct ReplayDeadOutboxEventJob<UowFactory, BusPublisher> {
+    unit_of_work_factory: UowFactory,
+    bus_publisher: BusPublisher,
+}
+
+impl<UowFactory, BusPublisher> ReplayDeadOutboxEventJob<UowFactory, BusPublisher> {
+    /// Creates a new manual dead-outbox replay job.
+    pub fn new(unit_of_work_factory: UowFactory, bus_publisher: BusPublisher) -> Self {
+        Self {
+            unit_of_work_factory,
+            bus_publisher,
+        }
+    }
+
+    /// Returns a stable operations name for diagnostics and tests.
+    pub fn operation_name(&self) -> &'static str {
+        "ReplayDeadOutboxEvent"
+    }
+}
+
+impl<UowFactory, BusPublisher> ReplayDeadOutboxEventJob<UowFactory, BusPublisher>
+where
+    UowFactory: UnitOfWorkFactory,
+    BusPublisher: BusPublisherPort,
+{
+    /// Replays one outbox row that has already reached `dead`.
+    pub async fn replay_dead_outbox_event(
+        &self,
+        outbox_event_id: &OutboxEventId,
+    ) -> Result<ReplayDeadOutboxEventResult, IdentityError> {
+        let mut uow = self.unit_of_work_factory.begin().await?;
+        let event = uow.outbox().get(outbox_event_id).await?.ok_or_else(|| {
+            IdentityError::RuleViolation {
+                code: "IDENTITY_OUTBOX_EVENT_NOT_FOUND",
+                message: format!("outbox event `{}` was not found", outbox_event_id.as_str()),
+            }
+        })?;
+        uow.rollback().await?;
+
+        if event.status != crate::domain::outbox::OutboxStatus::Dead {
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_OUTBOX_EVENT_NOT_DEAD",
+                message: format!(
+                    "outbox event `{}` is not in dead status",
+                    outbox_event_id.as_str()
+                ),
+            });
+        }
+
+        let publish_result = self.bus_publisher.publish(&event).await;
+        let mut event_to_save = event.clone();
+        let now = current_timestamp();
+
+        match &publish_result {
+            Ok(()) => event_to_save.mark_published(now),
+            Err(error) => {
+                event_to_save.status = crate::domain::outbox::OutboxStatus::Dead;
+                event_to_save.failure_reason = Some(error.to_string());
+                event_to_save.next_retry_at = None;
+                event_to_save.published_at = None;
+            }
+        }
+
+        let mut uow = self.unit_of_work_factory.begin().await?;
+        uow.outbox().save(&event_to_save).await?;
+        uow.commit().await?;
+
+        publish_result?;
+        Ok(ReplayDeadOutboxEventResult {
+            outbox_event_id: outbox_event_id.as_str().to_string(),
+        })
+    }
+}
+
 /// Rebuilds member summary projections from already-persisted outbox events.
 #[derive(Debug, Clone)]
 pub struct ProjectionRebuildJob<UowFactory> {
@@ -122,6 +883,226 @@ impl<UowFactory> ProjectionRebuildJob<UowFactory> {
     /// Returns a stable operations name for diagnostics and tests.
     pub fn operation_name(&self) -> &'static str {
         "RebuildMemberSummaryProjection"
+    }
+}
+
+/// Resets one projection checkpoint back to the initial idle state for recovery workflows.
+#[derive(Debug, Clone)]
+pub struct ResetProjectionCheckpointJob<UowFactory> {
+    unit_of_work_factory: UowFactory,
+}
+
+impl<UowFactory> ResetProjectionCheckpointJob<UowFactory> {
+    /// Creates a new checkpoint reset job bound to the provided persistence factory.
+    pub fn new(unit_of_work_factory: UowFactory) -> Self {
+        Self {
+            unit_of_work_factory,
+        }
+    }
+
+    /// Returns a stable operations name for diagnostics and tests.
+    pub fn operation_name(&self) -> &'static str {
+        "ResetProjectionCheckpoint"
+    }
+}
+
+impl<UowFactory> ResetProjectionCheckpointJob<UowFactory>
+where
+    UowFactory: UnitOfWorkFactory,
+{
+    /// Resets one persisted projection checkpoint so a later rebuild can restart from scratch.
+    pub async fn reset_projection_checkpoint(
+        &self,
+        checkpoint_name: &str,
+    ) -> Result<ResetProjectionCheckpointResult, IdentityError> {
+        if checkpoint_name.trim().is_empty() {
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_INVALID_ARGUMENT",
+                message: "checkpoint_name must not be blank".to_string(),
+            });
+        }
+
+        let mut uow = self.unit_of_work_factory.begin().await?;
+        let mut checkpoint = uow
+            .projection_checkpoints()
+            .get_or_create(checkpoint_name)
+            .await?;
+        checkpoint.reset(current_timestamp());
+        uow.projection_checkpoints().save(&checkpoint).await?;
+        uow.commit().await?;
+
+        Ok(ResetProjectionCheckpointResult {
+            checkpoint_name: checkpoint_name.to_string(),
+        })
+    }
+}
+
+/// Clears one stuck or failed idempotency record so operators can safely retry the original flow.
+#[derive(Debug, Clone)]
+pub struct ClearIdempotencyRecordJob<UowFactory> {
+    unit_of_work_factory: UowFactory,
+}
+
+impl<UowFactory> ClearIdempotencyRecordJob<UowFactory> {
+    /// Creates a new idempotency recovery job.
+    pub fn new(unit_of_work_factory: UowFactory) -> Self {
+        Self {
+            unit_of_work_factory,
+        }
+    }
+
+    /// Returns a stable operations name for diagnostics and tests.
+    pub fn operation_name(&self) -> &'static str {
+        "ClearIdempotencyRecord"
+    }
+}
+
+impl<UowFactory> ClearIdempotencyRecordJob<UowFactory>
+where
+    UowFactory: UnitOfWorkFactory,
+{
+    /// Deletes one `processing` or `failed` idempotency record to allow a clean retry.
+    pub async fn clear_idempotency_record(
+        &self,
+        idempotency_key: &str,
+        scope: IdempotencyScope,
+    ) -> Result<ClearIdempotencyRecordResult, IdentityError> {
+        if idempotency_key.trim().is_empty() {
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_INVALID_ARGUMENT",
+                message: "idempotency_key must not be blank".to_string(),
+            });
+        }
+
+        let mut uow = self.unit_of_work_factory.begin().await?;
+        let record = uow
+            .idempotency()
+            .get(idempotency_key, scope)
+            .await?
+            .ok_or_else(|| IdentityError::RuleViolation {
+                code: "IDENTITY_IDEMPOTENCY_RECORD_NOT_FOUND",
+                message: format!(
+                    "idempotency record `{idempotency_key}` in scope `{}` was not found",
+                    scope.as_db()
+                ),
+            })?;
+
+        if record.status == IdempotencyStatus::Succeeded {
+            uow.rollback().await?;
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_IDEMPOTENCY_RECORD_NOT_CLEARABLE",
+                message: format!(
+                    "idempotency record `{idempotency_key}` in scope `{}` has already succeeded and cannot be cleared",
+                    scope.as_db()
+                ),
+            });
+        }
+
+        let deleted = uow.idempotency().delete(idempotency_key, scope).await?;
+        if !deleted {
+            uow.rollback().await?;
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_IDEMPOTENCY_RECORD_NOT_FOUND",
+                message: format!(
+                    "idempotency record `{idempotency_key}` in scope `{}` was not found",
+                    scope.as_db()
+                ),
+            });
+        }
+
+        uow.commit().await?;
+
+        Ok(ClearIdempotencyRecordResult {
+            idempotency_key: idempotency_key.to_string(),
+            scope,
+        })
+    }
+}
+
+/// Rebuilds one member summary projection row from that member's persisted outbox facts.
+#[derive(Debug, Clone)]
+pub struct RebuildMemberProjectionJob<UowFactory> {
+    unit_of_work_factory: UowFactory,
+}
+
+impl<UowFactory> RebuildMemberProjectionJob<UowFactory> {
+    /// Creates a new point-rebuild job for member summary projection recovery.
+    pub fn new(unit_of_work_factory: UowFactory) -> Self {
+        Self {
+            unit_of_work_factory,
+        }
+    }
+
+    /// Returns a stable operations name for diagnostics and tests.
+    pub fn operation_name(&self) -> &'static str {
+        "RebuildMemberProjection"
+    }
+}
+
+impl<UowFactory> RebuildMemberProjectionJob<UowFactory>
+where
+    UowFactory: UnitOfWorkFactory,
+{
+    /// Rebuilds one member summary projection row entirely from persisted outbox facts.
+    pub async fn rebuild_member_projection(
+        &self,
+        global_member_id: &str,
+    ) -> Result<RebuildMemberProjectionResult, IdentityError> {
+        if global_member_id.trim().is_empty() {
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_INVALID_ARGUMENT",
+                message: "global_member_id must not be blank".to_string(),
+            });
+        }
+
+        let global_member_id = crate::domain::shared::ids::GlobalMemberId::new(global_member_id);
+        let mut uow = self.unit_of_work_factory.begin().await?;
+        let events = uow
+            .outbox()
+            .list_for_member_projection(&global_member_id)
+            .await?;
+
+        if events.is_empty() {
+            uow.rollback().await?;
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_PROJECTION_REBUILD_SOURCE_NOT_FOUND",
+                message: format!(
+                    "no persisted member projection facts were found for global member `{}`",
+                    global_member_id.as_str()
+                ),
+            });
+        }
+
+        uow.member_summary_projection()
+            .delete(&global_member_id)
+            .await?;
+
+        let mut rebuilt_any_projection = false;
+        for event in &events {
+            let projection = apply_member_summary_projection_event(&mut uow, event).await?;
+            if let Some(projection) = projection.as_ref() {
+                uow.member_summary_projection().upsert(projection).await?;
+                rebuilt_any_projection = true;
+            }
+        }
+
+        if !rebuilt_any_projection {
+            uow.rollback().await?;
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_PROJECTION_REBUILD_SOURCE_NOT_FOUND",
+                message: format!(
+                    "no persisted member projection facts were found for global member `{}`",
+                    global_member_id.as_str()
+                ),
+            });
+        }
+
+        uow.commit().await?;
+
+        Ok(RebuildMemberProjectionResult {
+            global_member_id: global_member_id.as_str().to_string(),
+            replayed_events: events.len(),
+        })
     }
 }
 
@@ -257,6 +1238,10 @@ fn current_timestamp() -> PrimitiveDateTime {
     PrimitiveDateTime::new(now.date(), now.time())
 }
 
+fn replay_payload_hash(payload_json: &serde_json::Value) -> String {
+    payload_json.to_string()
+}
+
 async fn apply_member_summary_projection_event<Uow>(
     uow: &mut Uow,
     event: &OutboxEvent,
@@ -319,18 +1304,36 @@ mod tests {
     use sqlx::{Executor, Row, postgres::PgPoolOptions};
     use time::{Duration, OffsetDateTime, PrimitiveDateTime};
 
+    use crate::application::career_event::CareerEventConsumerService;
+    use crate::application::role_catalog_sync::{RoleCatalogSyncOutcome, RoleCatalogSyncService};
+    use crate::application::tombstone_flow::TombstoneFlowService;
     use crate::config::AppConfig;
+    use crate::domain::dead_letter::InboundDeadLetter;
+    use crate::domain::idempotency::{IdempotencyScope, IdempotencyStatus};
+    use crate::domain::memory_refs::ArchiveRef;
     use crate::domain::outbox::{OutboxEvent, OutboxStatus};
-    use crate::domain::shared::ids::OutboxEventId;
+    use crate::domain::shared::context::{ActorContext, ActorKind};
+    use crate::domain::shared::ids::{
+        DeadLetterId, EventId, GlobalMemberId, OutboxEventId, ProjectId,
+    };
+    use crate::domain::tombstone::GateDecisionRef;
     use crate::error::IdentityError;
-    use crate::outbound::BusPublisherPort;
+    use crate::inbound::events::{
+        InboundEventEnvelope, InboundProcessFactEvent, InboundRoleCatalogEvent,
+    };
+    use crate::outbound::{ArchiveRequestPort, BusPublisherPort, GovernancePort};
     use crate::persistence::database::run_migrations;
     use crate::persistence::test_support::DB_TEST_MUTEX;
     use crate::persistence::unit_of_work::SqlxUnitOfWorkFactory;
 
     use super::{
-        OutboxPublisherJob, ProjectionRebuildJob, PublishOutboxEventsSummary,
-        RebuildMemberSummaryProjectionSummary,
+        ClearIdempotencyRecordJob, ClearIdempotencyRecordResult, IgnoreInboundDeadLetterJob,
+        IgnoreInboundDeadLetterResult, InboundDeadLetterReplayJob, OutboxPublisherJob,
+        ProjectionRebuildJob, PublishOutboxEventsSummary, RebuildMemberProjectionJob,
+        RebuildMemberProjectionResult, RebuildMemberSummaryProjectionSummary,
+        ReplayDeadOutboxEventJob, ReplayDeadOutboxEventResult, ReplayInboundDeadLetterJob,
+        ReplayInboundDeadLetterResult, ReplayInboundDeadLettersSummary,
+        ResetProjectionCheckpointJob, ResetProjectionCheckpointResult,
     };
 
     #[derive(Debug, Clone)]
@@ -384,6 +1387,39 @@ mod tests {
                 .published_event_ids
                 .push(event.outbox_event_id.as_str().to_string());
             Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct NoopGovernancePort;
+
+    impl GovernancePort for NoopGovernancePort {
+        async fn require_gate_decision(
+            &self,
+            _action_name: &str,
+            _member: &crate::domain::member::GlobalMember,
+            _actor: &ActorContext,
+            _reason: &str,
+            _supplied_gate_ref: Option<&GateDecisionRef>,
+        ) -> Result<GateDecisionRef, IdentityError> {
+            Err(IdentityError::PersistenceData {
+                message: "noop governance port should not be called in this test".to_string(),
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct NoopArchiveRequester;
+
+    impl ArchiveRequestPort for NoopArchiveRequester {
+        async fn request_archive(
+            &self,
+            _global_member_id: &GlobalMemberId,
+            _reason: &str,
+        ) -> Result<ArchiveRef, IdentityError> {
+            Err(IdentityError::PersistenceData {
+                message: "noop archive requester should not be called in this test".to_string(),
+            })
         }
     }
 
@@ -519,6 +1555,789 @@ mod tests {
             publisher.published_event_ids(),
             vec!["outbox-003".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn publish_outbox_events_retries_failed_rows_after_backoff_window() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+
+        let mut retryable = sample_pending_outbox_event("outbox-005");
+        retryable.status = OutboxStatus::Failed;
+        retryable.retry_count = 1;
+        retryable.next_retry_at = Some(now() - Duration::seconds(1));
+        retryable.failure_reason = Some("previous publish failure".to_string());
+        seed_outbox_event(&pool, retryable).await;
+
+        let publisher = RecordingBusPublisher::with_failures(&[]);
+        let job =
+            OutboxPublisherJob::new(SqlxUnitOfWorkFactory::new(pool.clone()), publisher.clone());
+
+        let summary = job
+            .publish_outbox_events(10)
+            .await
+            .expect("publisher pass should retry failed rows");
+
+        let row = sqlx::query(
+            "SELECT status, retry_count, next_retry_at, published_at FROM outbox_events WHERE outbox_event_id = $1",
+        )
+        .bind("outbox-005")
+        .fetch_one(&pool)
+        .await
+        .expect("load retried outbox row");
+
+        assert_eq!(
+            summary,
+            PublishOutboxEventsSummary {
+                scanned: 1,
+                published: 1,
+                failed: 0,
+            }
+        );
+        assert_eq!(row.get::<String, _>("status"), "published");
+        assert_eq!(row.get::<i32, _>("retry_count"), 1);
+        assert_eq!(
+            publisher.published_event_ids(),
+            vec!["outbox-005".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_outbox_events_skips_failed_rows_until_retry_time() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+
+        let mut retry_later = sample_pending_outbox_event("outbox-006");
+        retry_later.status = OutboxStatus::Failed;
+        retry_later.retry_count = 1;
+        retry_later.next_retry_at = Some(now() + Duration::seconds(120));
+        retry_later.failure_reason = Some("backoff in progress".to_string());
+        seed_outbox_event(&pool, retry_later).await;
+
+        let publisher = RecordingBusPublisher::with_failures(&[]);
+        let job =
+            OutboxPublisherJob::new(SqlxUnitOfWorkFactory::new(pool.clone()), publisher.clone());
+
+        let summary = job
+            .publish_outbox_events(10)
+            .await
+            .expect("publisher pass should skip rows that are still backing off");
+
+        let row =
+            sqlx::query("SELECT status, retry_count FROM outbox_events WHERE outbox_event_id = $1")
+                .bind("outbox-006")
+                .fetch_one(&pool)
+                .await
+                .expect("load deferred outbox row");
+
+        assert_eq!(
+            summary,
+            PublishOutboxEventsSummary {
+                scanned: 0,
+                published: 0,
+                failed: 0,
+            }
+        );
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert_eq!(row.get::<i32, _>("retry_count"), 1);
+        assert!(publisher.published_event_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn publish_outbox_events_marks_rows_dead_after_max_retries() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+
+        let mut exhausted = sample_pending_outbox_event("outbox-007");
+        exhausted.status = OutboxStatus::Failed;
+        exhausted.retry_count = 4;
+        exhausted.next_retry_at = Some(now() - Duration::seconds(1));
+        exhausted.failure_reason = Some("already retried".to_string());
+        seed_outbox_event(&pool, exhausted).await;
+
+        let publisher = RecordingBusPublisher::with_failures(&["outbox-007"]);
+        let job = OutboxPublisherJob::new(SqlxUnitOfWorkFactory::new(pool.clone()), publisher);
+
+        let summary = job
+            .publish_outbox_events(10)
+            .await
+            .expect("publisher pass should dead-letter exhausted outbox rows");
+
+        let row = sqlx::query(
+            "SELECT status, retry_count, next_retry_at, failure_reason FROM outbox_events WHERE outbox_event_id = $1",
+        )
+        .bind("outbox-007")
+        .fetch_one(&pool)
+        .await
+        .expect("load exhausted outbox row");
+
+        assert_eq!(
+            summary,
+            PublishOutboxEventsSummary {
+                scanned: 1,
+                published: 0,
+                failed: 1,
+            }
+        );
+        assert_eq!(row.get::<String, _>("status"), "dead");
+        assert_eq!(row.get::<i32, _>("retry_count"), 5);
+        assert_eq!(
+            row.get::<Option<PrimitiveDateTime>, _>("next_retry_at"),
+            None
+        );
+        assert!(
+            row.get::<Option<String>, _>("failure_reason")
+                .expect("failure reason should exist")
+                .contains("IDENTITY_OUTBOX_PUBLISH_FAILED")
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_dead_outbox_event_marks_dead_rows_published_after_manual_success() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+
+        let mut dead_event = sample_pending_outbox_event("outbox-dead-001");
+        dead_event.status = OutboxStatus::Dead;
+        dead_event.retry_count = 5;
+        dead_event.failure_reason = Some("manual replay needed".to_string());
+        seed_outbox_event(&pool, dead_event).await;
+
+        let publisher = RecordingBusPublisher::with_failures(&[]);
+        let job = ReplayDeadOutboxEventJob::new(
+            SqlxUnitOfWorkFactory::new(pool.clone()),
+            publisher.clone(),
+        );
+        let result = job
+            .replay_dead_outbox_event(&OutboxEventId::new("outbox-dead-001"))
+            .await
+            .expect("manual replay should publish dead outbox rows");
+
+        let row = sqlx::query(
+            "SELECT status, retry_count, next_retry_at, published_at, failure_reason FROM outbox_events WHERE outbox_event_id = $1",
+        )
+        .bind("outbox-dead-001")
+        .fetch_one(&pool)
+        .await
+        .expect("load replayed dead outbox row");
+
+        assert_eq!(
+            result,
+            ReplayDeadOutboxEventResult {
+                outbox_event_id: "outbox-dead-001".to_string(),
+            }
+        );
+        assert_eq!(
+            publisher.published_event_ids(),
+            vec!["outbox-dead-001".to_string()]
+        );
+        assert_eq!(row.get::<String, _>("status"), "published");
+        assert_eq!(row.get::<i32, _>("retry_count"), 5);
+        assert_eq!(
+            row.get::<Option<PrimitiveDateTime>, _>("next_retry_at"),
+            None
+        );
+        assert!(
+            row.get::<Option<PrimitiveDateTime>, _>("published_at")
+                .is_some()
+        );
+        assert_eq!(row.get::<Option<String>, _>("failure_reason"), None);
+    }
+
+    #[tokio::test]
+    async fn replay_dead_outbox_event_rejects_non_dead_rows() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_outbox_event(&pool, sample_pending_outbox_event("outbox-not-dead-001")).await;
+
+        let publisher = RecordingBusPublisher::with_failures(&[]);
+        let job =
+            ReplayDeadOutboxEventJob::new(SqlxUnitOfWorkFactory::new(pool.clone()), publisher);
+        let error = job
+            .replay_dead_outbox_event(&OutboxEventId::new("outbox-not-dead-001"))
+            .await
+            .expect_err("non-dead rows should be rejected");
+
+        match error {
+            IdentityError::RuleViolation { code, message } => {
+                assert_eq!(code, "IDENTITY_OUTBOX_EVENT_NOT_DEAD");
+                assert_eq!(
+                    message,
+                    "outbox event `outbox-not-dead-001` is not in dead status"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_dead_outbox_event_keeps_rows_dead_when_manual_replay_fails() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+
+        let mut dead_event = sample_pending_outbox_event("outbox-dead-002");
+        dead_event.status = OutboxStatus::Dead;
+        dead_event.retry_count = 5;
+        dead_event.failure_reason = Some("previous terminal failure".to_string());
+        seed_outbox_event(&pool, dead_event).await;
+
+        let publisher = RecordingBusPublisher::with_failures(&["outbox-dead-002"]);
+        let job =
+            ReplayDeadOutboxEventJob::new(SqlxUnitOfWorkFactory::new(pool.clone()), publisher);
+        let error = job
+            .replay_dead_outbox_event(&OutboxEventId::new("outbox-dead-002"))
+            .await
+            .expect_err("manual replay failure should surface to operators");
+
+        let row = sqlx::query(
+            "SELECT status, retry_count, next_retry_at, published_at, failure_reason FROM outbox_events WHERE outbox_event_id = $1",
+        )
+        .bind("outbox-dead-002")
+        .fetch_one(&pool)
+        .await
+        .expect("load failed manual replay row");
+
+        match error {
+            IdentityError::RuleViolation { code, .. } => {
+                assert_eq!(code, "IDENTITY_OUTBOX_PUBLISH_FAILED");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(row.get::<String, _>("status"), "dead");
+        assert_eq!(row.get::<i32, _>("retry_count"), 5);
+        assert_eq!(
+            row.get::<Option<PrimitiveDateTime>, _>("next_retry_at"),
+            None
+        );
+        assert_eq!(
+            row.get::<Option<PrimitiveDateTime>, _>("published_at"),
+            None
+        );
+        assert!(
+            row.get::<Option<String>, _>("failure_reason")
+                .expect("failure reason should exist")
+                .contains("IDENTITY_OUTBOX_PUBLISH_FAILED")
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_inbound_dead_letters_replays_career_event_after_member_exists() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let factory = SqlxUnitOfWorkFactory::new(pool.clone());
+        let career_service = CareerEventConsumerService::new(factory.clone());
+        let role_service = RoleCatalogSyncService::new(factory.clone());
+        let tombstone_service =
+            TombstoneFlowService::new(factory.clone(), NoopGovernancePort, NoopArchiveRequester);
+
+        let dead_letter_outcome = career_service
+            .consume_process_event(sample_process_event(
+                "career-replay-001",
+                "career-replay-hash-001",
+                "member-replay-001",
+            ))
+            .await
+            .expect("missing member should dead-letter");
+        assert!(matches!(
+            dead_letter_outcome,
+            crate::application::career_event::CareerEventOutcome::DeadLettered
+        ));
+        let original_created_at: PrimitiveDateTime =
+            sqlx::query("SELECT created_at FROM inbound_dead_letters WHERE source_event_id = $1")
+                .bind("career-replay-001")
+                .fetch_one(&pool)
+                .await
+                .expect("load original dead-letter timestamp")
+                .get("created_at");
+
+        insert_member(&pool, "member-replay-001", "Replay Member").await;
+
+        let replay_job = InboundDeadLetterReplayJob::new(
+            factory.clone(),
+            role_service,
+            career_service,
+            tombstone_service,
+        );
+        let summary = replay_job
+            .replay_inbound_dead_letters(10)
+            .await
+            .expect("replay should succeed after member exists");
+
+        let replay_row = sqlx::query(
+            "SELECT replay_status, created_at FROM inbound_dead_letters WHERE source_event_id = $1",
+        )
+        .bind("career-replay-001")
+        .fetch_one(&pool)
+        .await
+        .expect("load replay row");
+        let career_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM career_history_entries WHERE source_event_id = $1",
+        )
+        .bind("career-replay-001")
+        .fetch_one(&pool)
+        .await
+        .expect("count replayed career rows");
+
+        assert_eq!(
+            summary,
+            ReplayInboundDeadLettersSummary {
+                scanned: 1,
+                replayed: 1,
+                still_pending: 0,
+            }
+        );
+        assert_eq!(replay_row.get::<String, _>("replay_status"), "replayed");
+        assert_eq!(
+            replay_row.get::<PrimitiveDateTime, _>("created_at"),
+            original_created_at
+        );
+        assert_eq!(career_count, 1);
+    }
+
+    #[tokio::test]
+    async fn replay_inbound_dead_letters_does_not_duplicate_dead_letters_when_failure_persists() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+
+        let factory = SqlxUnitOfWorkFactory::new(pool.clone());
+        let role_service = RoleCatalogSyncService::new(factory.clone());
+        let career_service = CareerEventConsumerService::new(factory.clone());
+        let tombstone_service =
+            TombstoneFlowService::new(factory.clone(), NoopGovernancePort, NoopArchiveRequester);
+
+        let dead_letter_outcome = role_service
+            .sync_role_catalog(InboundRoleCatalogEvent {
+                envelope: InboundEventEnvelope {
+                    source_event_id: "role-replay-001".into(),
+                    source_module: "method-library".to_string(),
+                    event_type: "role.definition.updated".to_string(),
+                    occurred_at: now(),
+                    payload_hash: "role-replay-hash-001".to_string(),
+                    payload: json!({
+                        "unexpected_field": true
+                    }),
+                },
+            })
+            .await
+            .expect("invalid payload should dead-letter");
+        assert!(matches!(
+            dead_letter_outcome,
+            RoleCatalogSyncOutcome::DeadLettered
+        ));
+        let original_created_at: PrimitiveDateTime =
+            sqlx::query("SELECT created_at FROM inbound_dead_letters WHERE source_event_id = $1")
+                .bind("role-replay-001")
+                .fetch_one(&pool)
+                .await
+                .expect("load original dead-letter timestamp")
+                .get("created_at");
+
+        let replay_job = InboundDeadLetterReplayJob::new(
+            factory.clone(),
+            role_service,
+            career_service,
+            tombstone_service,
+        );
+        let summary = replay_job
+            .replay_inbound_dead_letters(10)
+            .await
+            .expect("replay should leave persistent failures pending");
+
+        let dead_letter_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM inbound_dead_letters")
+                .fetch_one(&pool)
+                .await
+                .expect("count dead letters");
+        let replay_row = sqlx::query(
+            "SELECT replay_status, created_at FROM inbound_dead_letters WHERE source_event_id = $1",
+        )
+        .bind("role-replay-001")
+        .fetch_one(&pool)
+        .await
+        .expect("load replay row");
+
+        assert_eq!(
+            summary,
+            ReplayInboundDeadLettersSummary {
+                scanned: 1,
+                replayed: 0,
+                still_pending: 1,
+            }
+        );
+        assert_eq!(dead_letter_count, 1);
+        assert_eq!(replay_row.get::<String, _>("replay_status"), "pending");
+        assert_eq!(
+            replay_row.get::<PrimitiveDateTime, _>("created_at"),
+            original_created_at
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_inbound_dead_letter_replays_one_pending_row_after_dependency_is_restored() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let factory = SqlxUnitOfWorkFactory::new(pool.clone());
+        let career_service = CareerEventConsumerService::new(factory.clone());
+        let role_service = RoleCatalogSyncService::new(factory.clone());
+        let tombstone_service =
+            TombstoneFlowService::new(factory.clone(), NoopGovernancePort, NoopArchiveRequester);
+
+        let outcome = career_service
+            .consume_process_event(sample_process_event(
+                "career-single-replay-001",
+                "career-single-replay-hash-001",
+                "member-single-replay-001",
+            ))
+            .await
+            .expect("missing member should dead-letter");
+        assert!(matches!(
+            outcome,
+            crate::application::career_event::CareerEventOutcome::DeadLettered
+        ));
+        let dead_letter_id: String = sqlx::query(
+            "SELECT dead_letter_id FROM inbound_dead_letters WHERE source_event_id = $1",
+        )
+        .bind("career-single-replay-001")
+        .fetch_one(&pool)
+        .await
+        .expect("load single-replay dead-letter id")
+        .get("dead_letter_id");
+
+        insert_member(&pool, "member-single-replay-001", "Replay One Member").await;
+
+        let replay_job = ReplayInboundDeadLetterJob::new(
+            factory.clone(),
+            role_service,
+            career_service,
+            tombstone_service,
+        );
+        let result = replay_job
+            .replay_inbound_dead_letter(&DeadLetterId::new(dead_letter_id.clone()))
+            .await
+            .expect("single dead-letter replay should succeed");
+
+        let replay_row =
+            sqlx::query("SELECT replay_status FROM inbound_dead_letters WHERE dead_letter_id = $1")
+                .bind(dead_letter_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load replayed dead-letter row");
+        let career_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM career_history_entries WHERE source_event_id = $1",
+        )
+        .bind("career-single-replay-001")
+        .fetch_one(&pool)
+        .await
+        .expect("count replayed career rows");
+
+        assert_eq!(result, ReplayInboundDeadLetterResult { dead_letter_id });
+        assert_eq!(replay_row.get::<String, _>("replay_status"), "replayed");
+        assert_eq!(career_count, 1);
+    }
+
+    #[tokio::test]
+    async fn replay_inbound_dead_letter_rejects_non_pending_rows() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_dead_letter(
+            &pool,
+            InboundDeadLetter {
+                dead_letter_id: DeadLetterId::new("dead-letter-replayed-001"),
+                source_event_id: Some(EventId::new("dead-letter-source-replayed-001")),
+                source_module: "work".to_string(),
+                event_type: "work.fact.recorded".to_string(),
+                payload_json: json!({ "global_member_id": "member-001" }),
+                failure_reason: "already replayed".to_string(),
+                replay_status: crate::domain::dead_letter::DeadLetterReplayStatus::Replayed,
+                created_at: now(),
+            },
+        )
+        .await;
+
+        let factory = SqlxUnitOfWorkFactory::new(pool.clone());
+        let replay_job = ReplayInboundDeadLetterJob::new(
+            factory.clone(),
+            RoleCatalogSyncService::new(factory.clone()),
+            CareerEventConsumerService::new(factory.clone()),
+            TombstoneFlowService::new(factory.clone(), NoopGovernancePort, NoopArchiveRequester),
+        );
+        let error = replay_job
+            .replay_inbound_dead_letter(&DeadLetterId::new("dead-letter-replayed-001"))
+            .await
+            .expect_err("non-pending dead letters should be rejected");
+
+        match error {
+            IdentityError::RuleViolation { code, message } => {
+                assert_eq!(code, "IDENTITY_DEAD_LETTER_NOT_PENDING");
+                assert_eq!(
+                    message,
+                    "inbound dead letter `dead-letter-replayed-001` is not pending replay or review"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_inbound_dead_letter_surfaces_persistent_replay_failures() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+
+        let factory = SqlxUnitOfWorkFactory::new(pool.clone());
+        let role_service = RoleCatalogSyncService::new(factory.clone());
+        let career_service = CareerEventConsumerService::new(factory.clone());
+        let tombstone_service =
+            TombstoneFlowService::new(factory.clone(), NoopGovernancePort, NoopArchiveRequester);
+
+        let dead_letter_outcome = role_service
+            .sync_role_catalog(InboundRoleCatalogEvent {
+                envelope: InboundEventEnvelope {
+                    source_event_id: "role-single-replay-001".into(),
+                    source_module: "method-library".to_string(),
+                    event_type: "role.definition.updated".to_string(),
+                    occurred_at: now(),
+                    payload_hash: "role-single-replay-hash-001".to_string(),
+                    payload: json!({
+                        "unexpected_field": true
+                    }),
+                },
+            })
+            .await
+            .expect("invalid payload should dead-letter");
+        assert!(matches!(
+            dead_letter_outcome,
+            RoleCatalogSyncOutcome::DeadLettered
+        ));
+        let dead_letter_id: String = sqlx::query(
+            "SELECT dead_letter_id FROM inbound_dead_letters WHERE source_event_id = $1",
+        )
+        .bind("role-single-replay-001")
+        .fetch_one(&pool)
+        .await
+        .expect("load persistent-failure dead-letter id")
+        .get("dead_letter_id");
+
+        let replay_job = ReplayInboundDeadLetterJob::new(
+            factory.clone(),
+            role_service,
+            career_service,
+            tombstone_service,
+        );
+        let error = replay_job
+            .replay_inbound_dead_letter(&DeadLetterId::new(dead_letter_id.clone()))
+            .await
+            .expect_err("persistent replay failures should surface");
+
+        let replay_row =
+            sqlx::query("SELECT replay_status FROM inbound_dead_letters WHERE dead_letter_id = $1")
+                .bind(dead_letter_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load pending replay row");
+
+        match error {
+            IdentityError::RuleViolation { code, message } => {
+                assert_eq!(code, "IDENTITY_DEAD_LETTER_REPLAY_FAILED");
+                assert_eq!(
+                    message,
+                    format!(
+                        "inbound dead letter `{}` replay did not complete successfully",
+                        dead_letter_id
+                    )
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(replay_row.get::<String, _>("replay_status"), "pending");
+    }
+
+    #[tokio::test]
+    async fn ignore_inbound_dead_letter_marks_pending_row_ignored() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        let created_at = now();
+        seed_dead_letter(
+            &pool,
+            InboundDeadLetter {
+                dead_letter_id: DeadLetterId::new("dead-letter-ignore-001"),
+                source_event_id: Some(EventId::new("dead-letter-source-001")),
+                source_module: "work".to_string(),
+                event_type: "work.fact.recorded".to_string(),
+                payload_json: json!({ "global_member_id": "member-001" }),
+                failure_reason: "member missing".to_string(),
+                replay_status: crate::domain::dead_letter::DeadLetterReplayStatus::Pending,
+                created_at,
+            },
+        )
+        .await;
+        let stored_created_at: PrimitiveDateTime =
+            sqlx::query("SELECT created_at FROM inbound_dead_letters WHERE dead_letter_id = $1")
+                .bind("dead-letter-ignore-001")
+                .fetch_one(&pool)
+                .await
+                .expect("load stored dead-letter timestamp")
+                .get("created_at");
+
+        let job = IgnoreInboundDeadLetterJob::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        let result = job
+            .ignore_inbound_dead_letter(
+                &DeadLetterId::new("dead-letter-ignore-001"),
+                "ignored after manual review",
+            )
+            .await
+            .expect("ignore should succeed for pending dead letters");
+
+        let row = sqlx::query(
+            "SELECT replay_status, failure_reason, created_at FROM inbound_dead_letters WHERE dead_letter_id = $1",
+        )
+        .bind("dead-letter-ignore-001")
+        .fetch_one(&pool)
+        .await
+        .expect("load ignored dead-letter row");
+
+        assert_eq!(
+            result,
+            IgnoreInboundDeadLetterResult {
+                dead_letter_id: "dead-letter-ignore-001".to_string(),
+            }
+        );
+        assert_eq!(row.get::<String, _>("replay_status"), "ignored");
+        assert_eq!(
+            row.get::<String, _>("failure_reason"),
+            "ignored after manual review"
+        );
+        assert_eq!(
+            row.get::<PrimitiveDateTime, _>("created_at"),
+            stored_created_at
+        );
+    }
+
+    #[tokio::test]
+    async fn ignore_inbound_dead_letter_rejects_missing_rows() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+
+        let job = IgnoreInboundDeadLetterJob::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        let error = job
+            .ignore_inbound_dead_letter(
+                &DeadLetterId::new("dead-letter-missing-001"),
+                "ignored after manual review",
+            )
+            .await
+            .expect_err("missing dead letters should be rejected");
+
+        match error {
+            IdentityError::RuleViolation { code, message } => {
+                assert_eq!(code, "IDENTITY_DEAD_LETTER_NOT_FOUND");
+                assert!(message.contains("dead-letter-missing-001"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ignore_inbound_dead_letter_rejects_non_pending_rows() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_dead_letter(
+            &pool,
+            InboundDeadLetter {
+                dead_letter_id: DeadLetterId::new("dead-letter-ignore-002"),
+                source_event_id: Some(EventId::new("dead-letter-source-002")),
+                source_module: "work".to_string(),
+                event_type: "work.fact.recorded".to_string(),
+                payload_json: json!({ "global_member_id": "member-002" }),
+                failure_reason: "already handled".to_string(),
+                replay_status: crate::domain::dead_letter::DeadLetterReplayStatus::Replayed,
+                created_at: now(),
+            },
+        )
+        .await;
+
+        let job = IgnoreInboundDeadLetterJob::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        let error = job
+            .ignore_inbound_dead_letter(
+                &DeadLetterId::new("dead-letter-ignore-002"),
+                "ignored after manual review",
+            )
+            .await
+            .expect_err("non-pending dead letters should be rejected");
+
+        match error {
+            IdentityError::RuleViolation { code, message } => {
+                assert_eq!(code, "IDENTITY_DEAD_LETTER_NOT_PENDING");
+                assert!(message.contains("dead-letter-ignore-002"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ignore_inbound_dead_letter_rejects_blank_reason() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_dead_letter(
+            &pool,
+            InboundDeadLetter {
+                dead_letter_id: DeadLetterId::new("dead-letter-ignore-003"),
+                source_event_id: Some(EventId::new("dead-letter-source-003")),
+                source_module: "work".to_string(),
+                event_type: "work.fact.recorded".to_string(),
+                payload_json: json!({ "global_member_id": "member-003" }),
+                failure_reason: "member missing".to_string(),
+                replay_status: crate::domain::dead_letter::DeadLetterReplayStatus::Pending,
+                created_at: now(),
+            },
+        )
+        .await;
+
+        let job = IgnoreInboundDeadLetterJob::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        let error = job
+            .ignore_inbound_dead_letter(&DeadLetterId::new("dead-letter-ignore-003"), "   ")
+            .await
+            .expect_err("blank ignore reason should be rejected");
+
+        match error {
+            IdentityError::RuleViolation { code, message } => {
+                assert_eq!(code, "IDENTITY_INVALID_ARGUMENT");
+                assert_eq!(message, "ignore reason must not be blank");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[tokio::test]
@@ -1257,6 +3076,513 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reset_projection_checkpoint_clears_cursor_and_failure_state() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_outbox_event(&pool, sample_pending_outbox_event("outbox-member-999")).await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO projection_checkpoints (
+                checkpoint_name,
+                last_processed_event_id,
+                status,
+                failure_reason,
+                updated_at
+            ) VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind("member-summary-rebuild")
+        .bind(Some("outbox-member-999"))
+        .bind("failed")
+        .bind(Some("projection payload was invalid"))
+        .bind(now())
+        .execute(&pool)
+        .await
+        .expect("seed failed checkpoint");
+
+        let job = ResetProjectionCheckpointJob::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        let result = job
+            .reset_projection_checkpoint("member-summary-rebuild")
+            .await
+            .expect("checkpoint reset should succeed");
+
+        let row = sqlx::query(
+            "SELECT last_processed_event_id, status, failure_reason FROM projection_checkpoints WHERE checkpoint_name = $1",
+        )
+        .bind("member-summary-rebuild")
+        .fetch_one(&pool)
+        .await
+        .expect("load reset checkpoint");
+
+        assert_eq!(
+            result,
+            ResetProjectionCheckpointResult {
+                checkpoint_name: "member-summary-rebuild".to_string(),
+            }
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("last_processed_event_id"),
+            None
+        );
+        assert_eq!(row.get::<String, _>("status"), "idle");
+        assert_eq!(row.get::<Option<String>, _>("failure_reason"), None);
+    }
+
+    #[tokio::test]
+    async fn reset_projection_checkpoint_rejects_blank_names() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+
+        let job = ResetProjectionCheckpointJob::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        let error = job
+            .reset_projection_checkpoint("   ")
+            .await
+            .expect_err("blank checkpoint names should be rejected");
+
+        match error {
+            IdentityError::RuleViolation { code, message } => {
+                assert_eq!(code, "IDENTITY_INVALID_ARGUMENT");
+                assert_eq!(message, "checkpoint_name must not be blank");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_idempotency_record_deletes_failed_record() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_idempotency_record(
+            &pool,
+            "idem-failed-001",
+            IdempotencyScope::Command,
+            IdempotencyStatus::Failed,
+        )
+        .await;
+
+        let job = ClearIdempotencyRecordJob::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        let result = job
+            .clear_idempotency_record("idem-failed-001", IdempotencyScope::Command)
+            .await
+            .expect("failed records should be clearable");
+
+        let remaining_count: i64 = sqlx::query(
+            "SELECT COUNT(*) AS count FROM idempotency_records WHERE idempotency_key = $1 AND scope = $2",
+        )
+        .bind("idem-failed-001")
+        .bind(IdempotencyScope::Command.as_db())
+        .fetch_one(&pool)
+        .await
+        .expect("count cleared idempotency record")
+        .get("count");
+
+        assert_eq!(
+            result,
+            ClearIdempotencyRecordResult {
+                idempotency_key: "idem-failed-001".to_string(),
+                scope: IdempotencyScope::Command,
+            }
+        );
+        assert_eq!(remaining_count, 0);
+    }
+
+    #[tokio::test]
+    async fn clear_idempotency_record_deletes_processing_record() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_idempotency_record(
+            &pool,
+            "idem-processing-001",
+            IdempotencyScope::InboundEvent,
+            IdempotencyStatus::Processing,
+        )
+        .await;
+
+        let job = ClearIdempotencyRecordJob::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        let result = job
+            .clear_idempotency_record("idem-processing-001", IdempotencyScope::InboundEvent)
+            .await
+            .expect("processing records should be clearable");
+
+        let remaining_count: i64 = sqlx::query(
+            "SELECT COUNT(*) AS count FROM idempotency_records WHERE idempotency_key = $1 AND scope = $2",
+        )
+        .bind("idem-processing-001")
+        .bind(IdempotencyScope::InboundEvent.as_db())
+        .fetch_one(&pool)
+        .await
+        .expect("count cleared idempotency record")
+        .get("count");
+
+        assert_eq!(
+            result,
+            ClearIdempotencyRecordResult {
+                idempotency_key: "idem-processing-001".to_string(),
+                scope: IdempotencyScope::InboundEvent,
+            }
+        );
+        assert_eq!(remaining_count, 0);
+    }
+
+    #[tokio::test]
+    async fn clear_idempotency_record_rejects_succeeded_record() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_idempotency_record(
+            &pool,
+            "idem-succeeded-001",
+            IdempotencyScope::Command,
+            IdempotencyStatus::Succeeded,
+        )
+        .await;
+
+        let job = ClearIdempotencyRecordJob::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        let error = job
+            .clear_idempotency_record("idem-succeeded-001", IdempotencyScope::Command)
+            .await
+            .expect_err("succeeded records must remain intact");
+
+        let remaining_status: String = sqlx::query(
+            "SELECT status FROM idempotency_records WHERE idempotency_key = $1 AND scope = $2",
+        )
+        .bind("idem-succeeded-001")
+        .bind(IdempotencyScope::Command.as_db())
+        .fetch_one(&pool)
+        .await
+        .expect("load succeeded idempotency record")
+        .get("status");
+
+        match error {
+            IdentityError::RuleViolation { code, message } => {
+                assert_eq!(code, "IDENTITY_IDEMPOTENCY_RECORD_NOT_CLEARABLE");
+                assert_eq!(
+                    message,
+                    "idempotency record `idem-succeeded-001` in scope `command` has already succeeded and cannot be cleared"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(remaining_status, IdempotencyStatus::Succeeded.as_db());
+    }
+
+    #[tokio::test]
+    async fn clear_idempotency_record_rejects_missing_record() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+
+        let job = ClearIdempotencyRecordJob::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        let error = job
+            .clear_idempotency_record("idem-missing-001", IdempotencyScope::OutboxPublish)
+            .await
+            .expect_err("missing records should be rejected");
+
+        match error {
+            IdentityError::RuleViolation { code, message } => {
+                assert_eq!(code, "IDENTITY_IDEMPOTENCY_RECORD_NOT_FOUND");
+                assert_eq!(
+                    message,
+                    "idempotency record `idem-missing-001` in scope `outbox_publish` was not found"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_idempotency_record_rejects_blank_keys() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+
+        let job = ClearIdempotencyRecordJob::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        let error = job
+            .clear_idempotency_record("   ", IdempotencyScope::Command)
+            .await
+            .expect_err("blank keys should be rejected");
+
+        match error {
+            IdentityError::RuleViolation { code, message } => {
+                assert_eq!(code, "IDENTITY_INVALID_ARGUMENT");
+                assert_eq!(message, "idempotency_key must not be blank");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_member_projection_rebuilds_one_member_from_persisted_outbox_facts() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let first_created_at = now();
+        let second_created_at = first_created_at + Duration::seconds(1);
+        let third_created_at = second_created_at + Duration::seconds(1);
+        seed_outbox_event(
+            &pool,
+            sample_member_created_projection_event(
+                "outbox-member-201",
+                "member-201",
+                "Member Two Zero One",
+                "role.member.operator",
+                first_created_at,
+            ),
+        )
+        .await;
+        seed_outbox_event(
+            &pool,
+            sample_capability_profile_updated_projection_event(
+                "outbox-capability-201",
+                "capability-profile:member-201",
+                "member-201",
+                "Member Two Zero One",
+                "role.member.operator",
+                second_created_at,
+            ),
+        )
+        .await;
+        seed_outbox_event(
+            &pool,
+            sample_career_history_appended_projection_event(
+                "outbox-career-201",
+                "member-201",
+                "Member Two Zero One",
+                "role.member.operator",
+                third_created_at,
+            ),
+        )
+        .await;
+        seed_outbox_event(
+            &pool,
+            sample_member_created_projection_event(
+                "outbox-member-999",
+                "member-999",
+                "Unrelated Member",
+                "role.member.operator",
+                third_created_at + Duration::seconds(1),
+            ),
+        )
+        .await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO member_summary_projection (
+                global_member_id,
+                display_name,
+                lifecycle,
+                main_role_id,
+                main_role_name,
+                capability_summary_json,
+                career_summary_json,
+                memory_ref_summary_json,
+                projection_version,
+                updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            "#,
+        )
+        .bind("member-201")
+        .bind("Corrupted Projection")
+        .bind("paused")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(json!({ "corrupted": true }))
+        .bind(json!({ "entries": ["bad"] }))
+        .bind(json!({ "refs": ["bad"] }))
+        .bind(99_i64)
+        .bind(third_created_at)
+        .execute(&pool)
+        .await
+        .expect("seed corrupted member projection");
+
+        let job = RebuildMemberProjectionJob::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        let result = job
+            .rebuild_member_projection("member-201")
+            .await
+            .expect("point rebuild should succeed");
+
+        let rebuilt_row = sqlx::query(
+            r#"
+            SELECT
+                display_name,
+                lifecycle,
+                main_role_id,
+                main_role_name,
+                capability_summary_json,
+                career_summary_json,
+                memory_ref_summary_json,
+                projection_version
+            FROM member_summary_projection
+            WHERE global_member_id = $1
+            "#,
+        )
+        .bind("member-201")
+        .fetch_one(&pool)
+        .await
+        .expect("load rebuilt member projection");
+        let unrelated_row = sqlx::query(
+            r#"
+            SELECT display_name
+            FROM member_summary_projection
+            WHERE global_member_id = $1
+            "#,
+        )
+        .bind("member-999")
+        .fetch_optional(&pool)
+        .await
+        .expect("load unrelated projection row");
+
+        assert_eq!(
+            result,
+            RebuildMemberProjectionResult {
+                global_member_id: "member-201".to_string(),
+                replayed_events: 3,
+            }
+        );
+        assert_eq!(
+            rebuilt_row.get::<String, _>("display_name"),
+            "Member Two Zero One"
+        );
+        assert_eq!(rebuilt_row.get::<String, _>("lifecycle"), "hired");
+        assert_eq!(
+            rebuilt_row.get::<Option<String>, _>("main_role_name"),
+            Some("Member Operator".to_string())
+        );
+        assert_eq!(rebuilt_row.get::<i64, _>("projection_version"), 2);
+        assert_eq!(
+            rebuilt_row.get::<serde_json::Value, _>("career_summary_json"),
+            json!({
+                "global_member_id": "member-201",
+                "entry_count": 2,
+                "entries": [
+                    {
+                        "career_entry_id": "career-entry:career-event-156-a",
+                        "source_event_id": "career-event-156-a",
+                        "source_module": "work",
+                        "project_id": "project-156",
+                        "work_ref": {
+                            "work_id": "work-156-a",
+                            "work_kind": "task",
+                            "work_version": "v1",
+                        },
+                        "process_ref": null,
+                        "entry_kind": "assigned",
+                        "started_at": first_created_at + Duration::seconds(2),
+                        "ended_at": first_created_at + Duration::seconds(3),
+                        "payload_summary": {
+                            "title": "Design projection merge",
+                        },
+                        "created_at": first_created_at + Duration::seconds(2),
+                    },
+                    {
+                        "career_entry_id": "career-entry:career-event-156-b",
+                        "source_event_id": "career-event-156-b",
+                        "source_module": "process",
+                        "project_id": "project-156",
+                        "work_ref": null,
+                        "process_ref": {
+                            "process_id": "process-156-b",
+                            "process_kind": "review",
+                            "process_version": "v2",
+                        },
+                        "entry_kind": "reviewed",
+                        "started_at": first_created_at + Duration::seconds(3),
+                        "ended_at": first_created_at + Duration::seconds(18),
+                        "payload_summary": {
+                            "activity": "Projection QA",
+                        },
+                        "created_at": first_created_at + Duration::seconds(3),
+                    }
+                ]
+            })
+        );
+        assert_eq!(
+            rebuilt_row.get::<serde_json::Value, _>("memory_ref_summary_json"),
+            json!({})
+        );
+        assert!(
+            rebuilt_row
+                .get::<serde_json::Value, _>("capability_summary_json")
+                .get("items")
+                .is_some()
+        );
+        assert!(unrelated_row.is_none());
+    }
+
+    #[tokio::test]
+    async fn rebuild_member_projection_rejects_blank_member_ids() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+
+        let job = RebuildMemberProjectionJob::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        let error = job
+            .rebuild_member_projection("   ")
+            .await
+            .expect_err("blank member ids should be rejected");
+
+        match error {
+            IdentityError::RuleViolation { code, message } => {
+                assert_eq!(code, "IDENTITY_INVALID_ARGUMENT");
+                assert_eq!(message, "global_member_id must not be blank");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_member_projection_rejects_members_without_projection_facts() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_outbox(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+        seed_outbox_event(
+            &pool,
+            sample_role_catalog_synced_outbox_event(
+                "outbox-role-only-301",
+                "role.member.operator",
+                "Member Operator",
+                now(),
+            ),
+        )
+        .await;
+
+        let job = RebuildMemberProjectionJob::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        let error = job
+            .rebuild_member_projection("member-301")
+            .await
+            .expect_err("missing projection facts should be rejected");
+
+        match error {
+            IdentityError::RuleViolation { code, message } => {
+                assert_eq!(code, "IDENTITY_PROJECTION_REBUILD_SOURCE_NOT_FOUND");
+                assert_eq!(
+                    message,
+                    "no persisted member projection facts were found for global member `member-301`"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
     async fn test_pool() -> sqlx::postgres::PgPool {
         let config = AppConfig {
             listen_addr: "127.0.0.1:8080".to_string(),
@@ -1339,6 +3665,73 @@ mod tests {
         .expect("seed outbox event");
     }
 
+    async fn seed_dead_letter(pool: &sqlx::postgres::PgPool, dead_letter: InboundDeadLetter) {
+        sqlx::query(
+            r#"
+            INSERT INTO inbound_dead_letters (
+                dead_letter_id,
+                source_event_id,
+                source_module,
+                event_type,
+                payload_json,
+                failure_reason,
+                replay_status,
+                created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            "#,
+        )
+        .bind(dead_letter.dead_letter_id.as_str())
+        .bind(
+            dead_letter
+                .source_event_id
+                .as_ref()
+                .map(|value| value.as_str()),
+        )
+        .bind(dead_letter.source_module)
+        .bind(dead_letter.event_type)
+        .bind(dead_letter.payload_json)
+        .bind(dead_letter.failure_reason)
+        .bind(dead_letter.replay_status.as_db())
+        .bind(dead_letter.created_at)
+        .execute(pool)
+        .await
+        .expect("seed inbound dead-letter");
+    }
+
+    async fn seed_idempotency_record(
+        pool: &sqlx::postgres::PgPool,
+        idempotency_key: &str,
+        scope: IdempotencyScope,
+        status: IdempotencyStatus,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO idempotency_records (
+                idempotency_key,
+                scope,
+                request_hash,
+                result_ref_json,
+                status,
+                created_at,
+                updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "#,
+        )
+        .bind(idempotency_key)
+        .bind(scope.as_db())
+        .bind(format!("request-hash-{idempotency_key}"))
+        .bind(Some(json!({
+            "kind": "test-record",
+            "id": idempotency_key,
+        })))
+        .bind(status.as_db())
+        .bind(now())
+        .bind(now())
+        .execute(pool)
+        .await
+        .expect("seed idempotency record");
+    }
+
     async fn seed_role(pool: &sqlx::postgres::PgPool, role_id: &str, role_name: &str) {
         sqlx::query(
             r#"
@@ -1391,6 +3784,52 @@ mod tests {
         .expect("insert projection checkpoint");
     }
 
+    async fn insert_member(
+        pool: &sqlx::postgres::PgPool,
+        global_member_id: &str,
+        display_name: &str,
+    ) {
+        let created_at = now();
+        let created_by_json = serde_json::to_value(ActorContext::new(
+            "system:operations-test",
+            ActorKind::System,
+            None,
+        ))
+        .expect("serialize created_by actor");
+
+        sqlx::query(
+            r#"
+            INSERT INTO global_members (
+                global_member_id,
+                display_name,
+                lifecycle,
+                main_role_id,
+                secondary_role_ids_json,
+                capability_profile_id,
+                memory_refs_id,
+                version,
+                created_by_json,
+                created_at,
+                updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            "#,
+        )
+        .bind(global_member_id)
+        .bind(display_name)
+        .bind("hired")
+        .bind("role.member.operator")
+        .bind(json!([]))
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .bind(created_by_json)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .expect("insert member");
+    }
+
     fn sample_pending_outbox_event(outbox_event_id: &str) -> OutboxEvent {
         OutboxEvent {
             outbox_event_id: OutboxEventId::new(outbox_event_id),
@@ -1408,6 +3847,37 @@ mod tests {
             created_at: now(),
             published_at: None,
             failure_reason: None,
+        }
+    }
+
+    fn sample_process_event(
+        source_event_id: &str,
+        payload_hash: &str,
+        global_member_id: &str,
+    ) -> InboundProcessFactEvent {
+        InboundProcessFactEvent {
+            envelope: InboundEventEnvelope {
+                source_event_id: EventId::new(source_event_id),
+                source_module: "process".to_string(),
+                event_type: "process.activity.completed".to_string(),
+                occurred_at: now() + Duration::seconds(1),
+                payload_hash: payload_hash.to_string(),
+                payload: json!({
+                    "global_member_id": GlobalMemberId::new(global_member_id),
+                    "project_id": ProjectId::new("project-002"),
+                    "process_ref": {
+                        "process_id": "process-001",
+                        "process_kind": "activity",
+                        "process_version": "v2",
+                    },
+                    "entry_kind": "completed",
+                    "started_at": now(),
+                    "ended_at": now() + Duration::seconds(45),
+                    "payload_summary": {
+                        "activity_name": "Career review",
+                    }
+                }),
+            },
         }
     }
 

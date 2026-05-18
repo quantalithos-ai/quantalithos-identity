@@ -52,7 +52,12 @@ where
         &self,
         event: InboundWorkFactEvent,
     ) -> Result<CareerEventOutcome, IdentityError> {
-        self.consume_event(event.envelope, build_work_entry).await
+        self.consume_event(
+            event.envelope,
+            build_work_entry,
+            DeadLetterRetention::CreateNew,
+        )
+        .await
     }
 
     /// Consumes a process-domain fact event and appends one career-history entry when valid.
@@ -60,14 +65,55 @@ where
         &self,
         event: InboundProcessFactEvent,
     ) -> Result<CareerEventOutcome, IdentityError> {
-        self.consume_event(event.envelope, build_process_entry)
-            .await
+        self.consume_event(
+            event.envelope,
+            build_process_entry,
+            DeadLetterRetention::CreateNew,
+        )
+        .await
+    }
+
+    /// Replays one existing dead-letter row through the normal work-event consumer logic.
+    pub async fn replay_work_dead_letter(
+        &self,
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+        event: InboundWorkFactEvent,
+    ) -> Result<CareerEventOutcome, IdentityError> {
+        self.consume_event(
+            event.envelope,
+            build_work_entry,
+            DeadLetterRetention::UpdateExisting {
+                dead_letter_id,
+                created_at,
+            },
+        )
+        .await
+    }
+
+    /// Replays one existing dead-letter row through the normal process-event consumer logic.
+    pub async fn replay_process_dead_letter(
+        &self,
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+        event: InboundProcessFactEvent,
+    ) -> Result<CareerEventOutcome, IdentityError> {
+        self.consume_event(
+            event.envelope,
+            build_process_entry,
+            DeadLetterRetention::UpdateExisting {
+                dead_letter_id,
+                created_at,
+            },
+        )
+        .await
     }
 
     async fn consume_event<EntryBuilder>(
         &self,
         envelope: InboundEventEnvelope,
         entry_builder: EntryBuilder,
+        dead_letter_retention: DeadLetterRetention,
     ) -> Result<CareerEventOutcome, IdentityError>
     where
         EntryBuilder:
@@ -86,7 +132,12 @@ where
 
         if let Some(existing_record) = existing_record {
             return self
-                .handle_existing_idempotency_record(existing_record, &envelope, uow)
+                .handle_existing_idempotency_record(
+                    existing_record,
+                    &envelope,
+                    dead_letter_retention,
+                    uow,
+                )
                 .await;
         }
 
@@ -94,8 +145,13 @@ where
         let entry = match entry_builder(&envelope, now) {
             Ok(entry) => entry,
             Err(error) => {
-                let dead_letter = build_dead_letter(&envelope, error.to_string());
-                uow.inbound_dead_letters().append(&dead_letter).await?;
+                retain_dead_letter(
+                    &mut uow,
+                    &dead_letter_retention,
+                    &envelope,
+                    error.to_string(),
+                )
+                .await?;
                 uow.commit().await?;
                 return Ok(CareerEventOutcome::DeadLettered);
             }
@@ -107,14 +163,16 @@ where
         } {
             Some(member) => member,
             None => {
-                let dead_letter = build_dead_letter(
+                retain_dead_letter(
+                    &mut uow,
+                    &dead_letter_retention,
                     &envelope,
                     format!(
                         "IDENTITY_MEMBER_NOT_FOUND: global member `{}` was not found",
                         entry.global_member_id.as_str()
                     ),
-                );
-                uow.inbound_dead_letters().append(&dead_letter).await?;
+                )
+                .await?;
                 uow.commit().await?;
                 return Ok(CareerEventOutcome::DeadLettered);
             }
@@ -200,6 +258,7 @@ where
         &self,
         existing_record: IdempotencyRecord,
         envelope: &InboundEventEnvelope,
+        dead_letter_retention: DeadLetterRetention,
         mut uow: Uow,
     ) -> Result<CareerEventOutcome, IdentityError>
     where
@@ -212,8 +271,13 @@ where
                     envelope.source_event_id.as_str()
                 ),
             };
-            let dead_letter = build_dead_letter(envelope, error.to_string());
-            uow.inbound_dead_letters().append(&dead_letter).await?;
+            retain_dead_letter(
+                &mut uow,
+                &dead_letter_retention,
+                envelope,
+                error.to_string(),
+            )
+            .await?;
             uow.commit().await?;
             return Err(error);
         }
@@ -241,6 +305,15 @@ where
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+enum DeadLetterRetention {
+    CreateNew,
+    UpdateExisting {
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+    },
 }
 
 fn build_work_entry(
@@ -312,6 +385,41 @@ fn build_dead_letter(
         failure_reason: failure_reason.into(),
         replay_status: DeadLetterReplayStatus::Pending,
         created_at: PrimitiveDateTime::new(now.date(), now.time()),
+    }
+}
+
+async fn retain_dead_letter<Uow>(
+    uow: &mut Uow,
+    dead_letter_retention: &DeadLetterRetention,
+    envelope: &InboundEventEnvelope,
+    failure_reason: impl Into<String>,
+) -> Result<(), IdentityError>
+where
+    Uow: UnitOfWork,
+{
+    let failure_reason = failure_reason.into();
+    match dead_letter_retention {
+        DeadLetterRetention::CreateNew => {
+            let dead_letter = build_dead_letter(envelope, failure_reason);
+            uow.inbound_dead_letters().append(&dead_letter).await
+        }
+        DeadLetterRetention::UpdateExisting {
+            dead_letter_id,
+            created_at,
+        } => {
+            uow.inbound_dead_letters()
+                .save(&InboundDeadLetter {
+                    dead_letter_id: dead_letter_id.clone(),
+                    source_event_id: Some(envelope.source_event_id.clone()),
+                    source_module: envelope.source_module.clone(),
+                    event_type: envelope.event_type.clone(),
+                    payload_json: envelope.payload.clone(),
+                    failure_reason,
+                    replay_status: DeadLetterReplayStatus::Pending,
+                    created_at: *created_at,
+                })
+                .await
+        }
     }
 }
 

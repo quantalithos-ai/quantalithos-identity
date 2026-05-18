@@ -59,3 +59,22 @@ pub struct InboundDeadLetter {
     /// Timestamp when the row was captured.
     pub created_at: PrimitiveDateTime,
 }
+
+impl InboundDeadLetter {
+    /// Marks the dead-letter row as successfully replayed.
+    pub fn mark_replayed(&mut self) {
+        self.replay_status = DeadLetterReplayStatus::Replayed;
+    }
+
+    /// Keeps the row pending and refreshes the retained failure reason.
+    pub fn refresh_failure_reason(&mut self, failure_reason: impl Into<String>) {
+        self.replay_status = DeadLetterReplayStatus::Pending;
+        self.failure_reason = failure_reason.into();
+    }
+
+    /// Marks the dead-letter row as intentionally ignored after review.
+    pub fn mark_ignored(&mut self, failure_reason: impl Into<String>) {
+        self.replay_status = DeadLetterReplayStatus::Ignored;
+        self.failure_reason = failure_reason.into();
+    }
+}

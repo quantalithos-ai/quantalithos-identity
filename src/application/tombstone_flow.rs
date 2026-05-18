@@ -235,7 +235,32 @@ where
         &self,
         event: InboundGateDecisionEvent,
     ) -> Result<GateDecisionOutcome, IdentityError> {
-        let envelope = event.envelope;
+        self.handle_gate_decision_event_internal(event.envelope, DeadLetterRetention::CreateNew)
+            .await
+    }
+
+    /// Replays one existing dead-letter row through the normal gate-decision consumer logic.
+    pub async fn replay_dead_letter(
+        &self,
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+        event: InboundGateDecisionEvent,
+    ) -> Result<GateDecisionOutcome, IdentityError> {
+        self.handle_gate_decision_event_internal(
+            event.envelope,
+            DeadLetterRetention::UpdateExisting {
+                dead_letter_id,
+                created_at,
+            },
+        )
+        .await
+    }
+
+    async fn handle_gate_decision_event_internal(
+        &self,
+        envelope: InboundEventEnvelope,
+        dead_letter_retention: DeadLetterRetention,
+    ) -> Result<GateDecisionOutcome, IdentityError> {
         let mut uow = self.unit_of_work_factory.begin().await?;
         let existing_record = {
             let mut idempotency = uow.idempotency();
@@ -249,7 +274,12 @@ where
 
         if let Some(existing_record) = existing_record {
             return self
-                .handle_existing_gate_event_record(existing_record, &envelope, uow)
+                .handle_existing_gate_event_record(
+                    existing_record,
+                    &envelope,
+                    dead_letter_retention,
+                    uow,
+                )
                 .await;
         }
 
@@ -257,8 +287,13 @@ where
         let gate_decision_ref = match self.gate_decision_parser.parse(envelope.payload.clone()) {
             Ok(gate_decision_ref) => gate_decision_ref,
             Err(error) => {
-                let dead_letter = build_dead_letter(&envelope, error.to_string());
-                uow.inbound_dead_letters().append(&dead_letter).await?;
+                retain_dead_letter(
+                    &mut uow,
+                    &dead_letter_retention,
+                    &envelope,
+                    error.to_string(),
+                )
+                .await?;
                 uow.commit().await?;
                 return Ok(GateDecisionOutcome::DeadLettered);
             }
@@ -307,8 +342,13 @@ where
         };
 
         if let Err(error) = pending_flow.attach_gate_decision(gate_decision_ref.clone(), now) {
-            let dead_letter = build_dead_letter(&envelope, error.to_string());
-            uow.inbound_dead_letters().append(&dead_letter).await?;
+            retain_dead_letter(
+                &mut uow,
+                &dead_letter_retention,
+                &envelope,
+                error.to_string(),
+            )
+            .await?;
             uow.commit().await?;
             return Ok(GateDecisionOutcome::DeadLettered);
         }
@@ -401,6 +441,7 @@ where
         &self,
         existing_record: IdempotencyRecord,
         envelope: &InboundEventEnvelope,
+        dead_letter_retention: DeadLetterRetention,
         mut uow: Uow,
     ) -> Result<GateDecisionOutcome, IdentityError>
     where
@@ -413,8 +454,13 @@ where
                     envelope.source_event_id.as_str()
                 ),
             };
-            let dead_letter = build_dead_letter(envelope, error.to_string());
-            uow.inbound_dead_letters().append(&dead_letter).await?;
+            retain_dead_letter(
+                &mut uow,
+                &dead_letter_retention,
+                envelope,
+                error.to_string(),
+            )
+            .await?;
             uow.commit().await?;
             return Err(error);
         }
@@ -442,6 +488,15 @@ where
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+enum DeadLetterRetention {
+    CreateNew,
+    UpdateExisting {
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+    },
 }
 
 fn summary_from_result_ref(
@@ -510,6 +565,41 @@ fn build_dead_letter(
         failure_reason: failure_reason.into(),
         replay_status: DeadLetterReplayStatus::Pending,
         created_at: PrimitiveDateTime::new(now.date(), now.time()),
+    }
+}
+
+async fn retain_dead_letter<Uow>(
+    uow: &mut Uow,
+    dead_letter_retention: &DeadLetterRetention,
+    envelope: &InboundEventEnvelope,
+    failure_reason: impl Into<String>,
+) -> Result<(), IdentityError>
+where
+    Uow: UnitOfWork,
+{
+    let failure_reason = failure_reason.into();
+    match dead_letter_retention {
+        DeadLetterRetention::CreateNew => {
+            let dead_letter = build_dead_letter(envelope, failure_reason);
+            uow.inbound_dead_letters().append(&dead_letter).await
+        }
+        DeadLetterRetention::UpdateExisting {
+            dead_letter_id,
+            created_at,
+        } => {
+            uow.inbound_dead_letters()
+                .save(&InboundDeadLetter {
+                    dead_letter_id: dead_letter_id.clone(),
+                    source_event_id: Some(envelope.source_event_id.clone()),
+                    source_module: envelope.source_module.clone(),
+                    event_type: envelope.event_type.clone(),
+                    payload_json: envelope.payload.clone(),
+                    failure_reason,
+                    replay_status: DeadLetterReplayStatus::Pending,
+                    created_at: *created_at,
+                })
+                .await
+        }
     }
 }
 

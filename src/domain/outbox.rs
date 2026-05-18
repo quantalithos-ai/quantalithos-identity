@@ -22,6 +22,8 @@ pub enum OutboxStatus {
     Published,
     /// Event publication failed and may be retried later.
     Failed,
+    /// Event exhausted automatic retries and now requires manual intervention.
+    Dead,
 }
 
 impl OutboxStatus {
@@ -31,6 +33,7 @@ impl OutboxStatus {
             "pending" => Some(Self::Pending),
             "published" => Some(Self::Published),
             "failed" => Some(Self::Failed),
+            "dead" => Some(Self::Dead),
             _ => None,
         }
     }
@@ -41,9 +44,12 @@ impl OutboxStatus {
             Self::Pending => "pending",
             Self::Published => "published",
             Self::Failed => "failed",
+            Self::Dead => "dead",
         }
     }
 }
+
+const MAX_AUTOMATIC_RETRY_COUNT: i32 = 5;
 
 /// Represents a durable outbox record stored in `outbox_events`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -89,7 +95,12 @@ impl OutboxEvent {
         self.retry_count += 1;
         self.failure_reason = Some(failure_reason.into());
         self.published_at = None;
-        self.next_retry_at = Some(self.next_retry_at(failed_at));
+        if self.retry_count >= MAX_AUTOMATIC_RETRY_COUNT {
+            self.status = OutboxStatus::Dead;
+            self.next_retry_at = None;
+        } else {
+            self.next_retry_at = Some(self.next_retry_at(failed_at));
+        }
     }
 
     /// Computes the next retry timestamp using a simple bounded linear backoff.

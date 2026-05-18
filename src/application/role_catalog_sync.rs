@@ -59,7 +59,32 @@ where
         &self,
         event: InboundRoleCatalogEvent,
     ) -> Result<RoleCatalogSyncOutcome, IdentityError> {
-        let envelope = event.envelope;
+        self.sync_role_catalog_internal(event.envelope, DeadLetterRetention::CreateNew)
+            .await
+    }
+
+    /// Replays one existing dead-letter row through the normal role-catalog sync logic.
+    pub async fn replay_dead_letter(
+        &self,
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+        event: InboundRoleCatalogEvent,
+    ) -> Result<RoleCatalogSyncOutcome, IdentityError> {
+        self.sync_role_catalog_internal(
+            event.envelope,
+            DeadLetterRetention::UpdateExisting {
+                dead_letter_id,
+                created_at,
+            },
+        )
+        .await
+    }
+
+    async fn sync_role_catalog_internal(
+        &self,
+        envelope: InboundEventEnvelope,
+        dead_letter_retention: DeadLetterRetention,
+    ) -> Result<RoleCatalogSyncOutcome, IdentityError> {
         let mut uow = self.unit_of_work_factory.begin().await?;
 
         let existing_record = {
@@ -74,15 +99,25 @@ where
 
         if let Some(existing_record) = existing_record {
             return self
-                .handle_existing_idempotency_record(existing_record, &envelope, uow)
+                .handle_existing_idempotency_record(
+                    existing_record,
+                    &envelope,
+                    dead_letter_retention,
+                    uow,
+                )
                 .await;
         }
 
         let snapshot = match self.parser.parse(envelope.payload.clone()) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                let dead_letter = build_dead_letter(&envelope, error.to_string());
-                uow.inbound_dead_letters().append(&dead_letter).await?;
+                retain_dead_letter(
+                    &mut uow,
+                    &dead_letter_retention,
+                    &envelope,
+                    error.to_string(),
+                )
+                .await?;
                 uow.commit().await?;
                 return Ok(RoleCatalogSyncOutcome::DeadLettered);
             }
@@ -92,8 +127,13 @@ where
         let entry = match RoleCatalogEntry::from_role_definition_snapshot(snapshot, now) {
             Ok(entry) => entry,
             Err(error) => {
-                let dead_letter = build_dead_letter(&envelope, error.to_string());
-                uow.inbound_dead_letters().append(&dead_letter).await?;
+                retain_dead_letter(
+                    &mut uow,
+                    &dead_letter_retention,
+                    &envelope,
+                    error.to_string(),
+                )
+                .await?;
                 uow.commit().await?;
                 return Ok(RoleCatalogSyncOutcome::DeadLettered);
             }
@@ -146,6 +186,7 @@ where
         &self,
         existing_record: IdempotencyRecord,
         envelope: &InboundEventEnvelope,
+        dead_letter_retention: DeadLetterRetention,
         mut uow: Uow,
     ) -> Result<RoleCatalogSyncOutcome, IdentityError>
     where
@@ -158,8 +199,13 @@ where
                     envelope.source_event_id.as_str()
                 ),
             };
-            let dead_letter = build_dead_letter(envelope, error.to_string());
-            uow.inbound_dead_letters().append(&dead_letter).await?;
+            retain_dead_letter(
+                &mut uow,
+                &dead_letter_retention,
+                envelope,
+                error.to_string(),
+            )
+            .await?;
             uow.commit().await?;
             return Err(error);
         }
@@ -189,9 +235,53 @@ where
     }
 }
 
+#[derive(Debug, Clone)]
+enum DeadLetterRetention {
+    CreateNew,
+    UpdateExisting {
+        dead_letter_id: DeadLetterId,
+        created_at: PrimitiveDateTime,
+    },
+}
+
 fn current_timestamp() -> PrimitiveDateTime {
     let now = OffsetDateTime::now_utc();
     PrimitiveDateTime::new(now.date(), now.time())
+}
+
+async fn retain_dead_letter<Uow>(
+    uow: &mut Uow,
+    dead_letter_retention: &DeadLetterRetention,
+    envelope: &InboundEventEnvelope,
+    failure_reason: impl Into<String>,
+) -> Result<(), IdentityError>
+where
+    Uow: UnitOfWork,
+{
+    let failure_reason = failure_reason.into();
+    match dead_letter_retention {
+        DeadLetterRetention::CreateNew => {
+            let dead_letter = build_dead_letter(envelope, failure_reason);
+            uow.inbound_dead_letters().append(&dead_letter).await
+        }
+        DeadLetterRetention::UpdateExisting {
+            dead_letter_id,
+            created_at,
+        } => {
+            uow.inbound_dead_letters()
+                .save(&InboundDeadLetter {
+                    dead_letter_id: dead_letter_id.clone(),
+                    source_event_id: Some(envelope.source_event_id.clone()),
+                    source_module: envelope.source_module.clone(),
+                    event_type: envelope.event_type.clone(),
+                    payload_json: envelope.payload.clone(),
+                    failure_reason,
+                    replay_status: DeadLetterReplayStatus::Pending,
+                    created_at: *created_at,
+                })
+                .await
+        }
+    }
 }
 
 fn build_dead_letter(

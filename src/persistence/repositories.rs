@@ -990,6 +990,27 @@ impl IdempotencyStore for SqlxIdempotencyStore<'_, '_> {
         row.map(map_idempotency_row).transpose()
     }
 
+    async fn delete(
+        &mut self,
+        idempotency_key: &str,
+        scope: IdempotencyScope,
+    ) -> Result<bool, IdentityError> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM idempotency_records
+            WHERE idempotency_key = $1
+              AND scope = $2
+            "#,
+        )
+        .bind(idempotency_key)
+        .bind(scope.as_db())
+        .execute(self.transaction.as_mut())
+        .await
+        .map_err(IdentityError::DatabasePool)?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn record_success(
         &mut self,
         metadata: &CommandMetadata,
@@ -1086,6 +1107,7 @@ impl OutboxStore for SqlxOutboxStore<'_, '_> {
     }
 
     async fn list_pending(&mut self, batch_size: usize) -> Result<Vec<OutboxEvent>, IdentityError> {
+        let now = current_timestamp();
         let rows = sqlx::query(
             r#"
             SELECT
@@ -1103,11 +1125,17 @@ impl OutboxStore for SqlxOutboxStore<'_, '_> {
                 failure_reason
             FROM outbox_events
             WHERE status = 'pending'
-            ORDER BY created_at ASC, outbox_event_id ASC
+               OR (
+                    status = 'failed'
+                AND next_retry_at IS NOT NULL
+                AND next_retry_at <= $2
+               )
+            ORDER BY COALESCE(next_retry_at, created_at) ASC, created_at ASC, outbox_event_id ASC
             LIMIT $1
             "#,
         )
         .bind(batch_size as i64)
+        .bind(now)
         .fetch_all(self.transaction.as_mut())
         .await
         .map_err(IdentityError::DatabasePool)?;
@@ -1193,6 +1221,77 @@ impl OutboxStore for SqlxOutboxStore<'_, '_> {
         };
 
         rows.into_iter().map(map_outbox_row).collect()
+    }
+
+    async fn list_for_member_projection(
+        &mut self,
+        global_member_id: &GlobalMemberId,
+    ) -> Result<Vec<OutboxEvent>, IdentityError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                outbox_event_id,
+                aggregate_type,
+                aggregate_id,
+                event_type,
+                payload_json,
+                idempotency_key,
+                status,
+                retry_count,
+                next_retry_at,
+                created_at,
+                published_at,
+                failure_reason
+            FROM outbox_events
+            WHERE payload_json->>'global_member_id' = $1
+              AND event_type IN (
+                    'identity.member.created',
+                    'identity.member.lifecycle_changed',
+                    'identity.member.tombstoned',
+                    'identity.capability_profile.updated',
+                    'identity.memory_refs.updated',
+                    'identity.career_history.appended'
+              )
+            ORDER BY created_at ASC, outbox_event_id ASC
+            "#,
+        )
+        .bind(global_member_id.as_str())
+        .fetch_all(self.transaction.as_mut())
+        .await
+        .map_err(IdentityError::DatabasePool)?;
+
+        rows.into_iter().map(map_outbox_row).collect()
+    }
+
+    async fn get(
+        &mut self,
+        outbox_event_id: &OutboxEventId,
+    ) -> Result<Option<OutboxEvent>, IdentityError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                outbox_event_id,
+                aggregate_type,
+                aggregate_id,
+                event_type,
+                payload_json,
+                idempotency_key,
+                status,
+                retry_count,
+                next_retry_at,
+                created_at,
+                published_at,
+                failure_reason
+            FROM outbox_events
+            WHERE outbox_event_id = $1
+            "#,
+        )
+        .bind(outbox_event_id.as_str())
+        .fetch_optional(self.transaction.as_mut())
+        .await
+        .map_err(IdentityError::DatabasePool)?;
+
+        row.map(map_outbox_row).transpose()
     }
 
     async fn save(&mut self, event: &OutboxEvent) -> Result<(), IdentityError> {
@@ -1319,6 +1418,21 @@ impl MemberSummaryProjectionRepository for SqlxMemberSummaryProjectionRepository
         .map_err(IdentityError::DatabasePool)?;
 
         Ok(())
+    }
+
+    async fn delete(&mut self, global_member_id: &GlobalMemberId) -> Result<bool, IdentityError> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM member_summary_projection
+            WHERE global_member_id = $1
+            "#,
+        )
+        .bind(global_member_id.as_str())
+        .execute(self.transaction.as_mut())
+        .await
+        .map_err(IdentityError::DatabasePool)?;
+
+        Ok(result.rows_affected() == 1)
     }
 }
 
@@ -1456,6 +1570,62 @@ impl InboundDeadLetterStore for SqlxInboundDeadLetterStore<'_, '_> {
         .map_err(IdentityError::DatabasePool)?;
 
         Ok(())
+    }
+
+    async fn list_pending(
+        &mut self,
+        batch_size: usize,
+    ) -> Result<Vec<InboundDeadLetter>, IdentityError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                dead_letter_id,
+                source_event_id,
+                source_module,
+                event_type,
+                payload_json,
+                failure_reason,
+                replay_status,
+                created_at
+            FROM inbound_dead_letters
+            WHERE replay_status = 'pending'
+            ORDER BY created_at ASC, dead_letter_id ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(batch_size as i64)
+        .fetch_all(self.transaction.as_mut())
+        .await
+        .map_err(IdentityError::DatabasePool)?;
+
+        rows.into_iter().map(map_inbound_dead_letter_row).collect()
+    }
+
+    async fn get(
+        &mut self,
+        dead_letter_id: &crate::domain::shared::ids::DeadLetterId,
+    ) -> Result<Option<InboundDeadLetter>, IdentityError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                dead_letter_id,
+                source_event_id,
+                source_module,
+                event_type,
+                payload_json,
+                failure_reason,
+                replay_status,
+                created_at
+            FROM inbound_dead_letters
+            WHERE dead_letter_id = $1
+            "#,
+        )
+        .bind(dead_letter_id.as_str())
+        .fetch_optional(self.transaction.as_mut())
+        .await
+        .map_err(IdentityError::DatabasePool)?;
+
+        row.map(map_inbound_dead_letter_row).transpose()
     }
 
     async fn save(&mut self, dead_letter: &InboundDeadLetter) -> Result<(), IdentityError> {
@@ -1757,7 +1927,6 @@ fn map_projection_checkpoint_row(
     })
 }
 
-#[allow(dead_code)]
 fn map_inbound_dead_letter_row(
     row: sqlx::postgres::PgRow,
 ) -> Result<InboundDeadLetter, IdentityError> {
