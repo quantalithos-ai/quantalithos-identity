@@ -1,10 +1,13 @@
 //! Persistence-facing application ports used by command and event handlers.
 
 use crate::domain::audit::AuditTraceEntry;
+use crate::domain::dead_letter::InboundDeadLetter;
 use crate::domain::idempotency::{IdempotencyRecord, IdempotencyScope};
 use crate::domain::member::GlobalMember;
+use crate::domain::outbox::OutboxEvent;
+use crate::domain::projection::{MemberSummaryProjection, ProjectionCheckpoint};
 use crate::domain::role_catalog::RoleCatalogEntry;
-use crate::domain::shared::ids::{GlobalMemberId, RoleId};
+use crate::domain::shared::ids::{GlobalMemberId, OutboxEventId, RoleId};
 use crate::domain::shared::metadata::CommandMetadata;
 use crate::domain::timeline::LifecycleHistoryEntry;
 use crate::error::IdentityError;
@@ -88,6 +91,79 @@ pub trait IdempotencyStore {
     ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
 }
 
+/// Persists and scans durable outbox rows outside of direct business rule evaluation.
+pub trait OutboxStore {
+    /// Appends a newly-created outbox row inside the current local transaction.
+    fn append(
+        &mut self,
+        event: &OutboxEvent,
+    ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
+
+    /// Lists pending outbox rows ordered for publisher processing.
+    fn list_pending(
+        &mut self,
+        batch_size: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<OutboxEvent>, IdentityError>> + Send;
+
+    /// Lists outbox rows strictly after the optional replay cursor.
+    fn list_after(
+        &mut self,
+        last_processed_event_id: Option<&OutboxEventId>,
+        batch_size: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<OutboxEvent>, IdentityError>> + Send;
+
+    /// Persists an updated outbox row after publisher-side status changes.
+    fn save(
+        &mut self,
+        event: &OutboxEvent,
+    ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
+}
+
+/// Reads and writes the read-optimized member summary projection.
+pub trait MemberSummaryProjectionRepository {
+    /// Loads the current projection row for a member, if it already exists.
+    fn get(
+        &mut self,
+        global_member_id: &GlobalMemberId,
+    ) -> impl std::future::Future<Output = Result<Option<MemberSummaryProjection>, IdentityError>> + Send;
+
+    /// Inserts or updates a member summary projection row.
+    fn upsert(
+        &mut self,
+        projection: &MemberSummaryProjection,
+    ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
+}
+
+/// Maintains durable rebuild progress for projection and replay workflows.
+pub trait ProjectionCheckpointRepository {
+    /// Loads the checkpoint row by name or creates the initial idle row when absent.
+    fn get_or_create(
+        &mut self,
+        checkpoint_name: &str,
+    ) -> impl std::future::Future<Output = Result<ProjectionCheckpoint, IdentityError>> + Send;
+
+    /// Saves checkpoint progress or failure state after a rebuild step.
+    fn save(
+        &mut self,
+        checkpoint: &ProjectionCheckpoint,
+    ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
+}
+
+/// Captures and updates failed inbound events retained for replay and diagnosis.
+pub trait InboundDeadLetterStore {
+    /// Appends a new dead-letter row for a failed inbound event.
+    fn append(
+        &mut self,
+        dead_letter: &InboundDeadLetter,
+    ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
+
+    /// Persists replay-status changes for an existing dead-letter row.
+    fn save(
+        &mut self,
+        dead_letter: &InboundDeadLetter,
+    ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;
+}
+
 /// Wraps the local transaction that must atomically commit write model, history, audit, and idempotency data.
 pub trait UnitOfWork {
     /// Global member repository bound to the current transaction.
@@ -115,6 +191,26 @@ pub trait UnitOfWork {
     where
         Self: 'a;
 
+    /// Outbox store bound to the current transaction.
+    type Outbox<'a>: OutboxStore
+    where
+        Self: 'a;
+
+    /// Member summary projection repository bound to the current transaction.
+    type MemberSummaryProjection<'a>: MemberSummaryProjectionRepository
+    where
+        Self: 'a;
+
+    /// Projection checkpoint repository bound to the current transaction.
+    type ProjectionCheckpoints<'a>: ProjectionCheckpointRepository
+    where
+        Self: 'a;
+
+    /// Inbound dead-letter store bound to the current transaction.
+    type InboundDeadLetters<'a>: InboundDeadLetterStore
+    where
+        Self: 'a;
+
     /// Returns a repository handle for global member persistence.
     fn global_members(&mut self) -> Self::GlobalMembers<'_>;
 
@@ -129,6 +225,18 @@ pub trait UnitOfWork {
 
     /// Returns a repository handle for idempotency reads and writes.
     fn idempotency(&mut self) -> Self::Idempotency<'_>;
+
+    /// Returns a store handle for outbox persistence and scanning.
+    fn outbox(&mut self) -> Self::Outbox<'_>;
+
+    /// Returns a repository handle for member summary projections.
+    fn member_summary_projection(&mut self) -> Self::MemberSummaryProjection<'_>;
+
+    /// Returns a repository handle for projection checkpoints.
+    fn projection_checkpoints(&mut self) -> Self::ProjectionCheckpoints<'_>;
+
+    /// Returns a store handle for inbound dead-letter persistence.
+    fn inbound_dead_letters(&mut self) -> Self::InboundDeadLetters<'_>;
 
     /// Commits the current local transaction.
     fn commit(self) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send;

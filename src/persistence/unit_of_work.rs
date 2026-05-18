@@ -6,7 +6,9 @@ use crate::application::persistence::UnitOfWorkFactory;
 use crate::error::IdentityError;
 use crate::persistence::repositories::{
     SqlxAuditTraceRepository, SqlxGlobalMemberRepository, SqlxIdempotencyStore,
-    SqlxLifecycleHistoryRepository, SqlxRoleCatalogRepository,
+    SqlxInboundDeadLetterStore, SqlxLifecycleHistoryRepository,
+    SqlxMemberSummaryProjectionRepository, SqlxOutboxStore, SqlxProjectionCheckpointRepository,
+    SqlxRoleCatalogRepository,
 };
 
 /// Creates PostgreSQL transaction-scoped units of work for write-model operations.
@@ -55,6 +57,22 @@ impl<'db> crate::application::persistence::UnitOfWork for SqlxUnitOfWork<'db> {
         = SqlxIdempotencyStore<'a, 'db>
     where
         Self: 'a;
+    type Outbox<'a>
+        = SqlxOutboxStore<'a, 'db>
+    where
+        Self: 'a;
+    type MemberSummaryProjection<'a>
+        = SqlxMemberSummaryProjectionRepository<'a, 'db>
+    where
+        Self: 'a;
+    type ProjectionCheckpoints<'a>
+        = SqlxProjectionCheckpointRepository<'a, 'db>
+    where
+        Self: 'a;
+    type InboundDeadLetters<'a>
+        = SqlxInboundDeadLetterStore<'a, 'db>
+    where
+        Self: 'a;
 
     fn global_members(&mut self) -> Self::GlobalMembers<'_> {
         SqlxGlobalMemberRepository::new(&mut self.transaction)
@@ -74,6 +92,22 @@ impl<'db> crate::application::persistence::UnitOfWork for SqlxUnitOfWork<'db> {
 
     fn idempotency(&mut self) -> Self::Idempotency<'_> {
         SqlxIdempotencyStore::new(&mut self.transaction)
+    }
+
+    fn outbox(&mut self) -> Self::Outbox<'_> {
+        SqlxOutboxStore::new(&mut self.transaction)
+    }
+
+    fn member_summary_projection(&mut self) -> Self::MemberSummaryProjection<'_> {
+        SqlxMemberSummaryProjectionRepository::new(&mut self.transaction)
+    }
+
+    fn projection_checkpoints(&mut self) -> Self::ProjectionCheckpoints<'_> {
+        SqlxProjectionCheckpointRepository::new(&mut self.transaction)
+    }
+
+    fn inbound_dead_letters(&mut self) -> Self::InboundDeadLetters<'_> {
+        SqlxInboundDeadLetterStore::new(&mut self.transaction)
     }
 
     async fn commit(self) -> Result<(), IdentityError> {
@@ -117,16 +151,20 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::application::persistence::{
-        AuditTraceRepository, GlobalMemberRepository, IdempotencyStore, LifecycleHistoryRepository,
-        RoleCatalogRepository, UnitOfWork, UnitOfWorkFactory,
+        AuditTraceRepository, GlobalMemberRepository, IdempotencyStore, InboundDeadLetterStore,
+        LifecycleHistoryRepository, MemberSummaryProjectionRepository, OutboxStore,
+        ProjectionCheckpointRepository, RoleCatalogRepository, UnitOfWork, UnitOfWorkFactory,
     };
     use crate::config::AppConfig;
     use crate::domain::audit::{AuditResult, AuditTraceEntry};
+    use crate::domain::dead_letter::{DeadLetterReplayStatus, InboundDeadLetter};
     use crate::domain::idempotency::{IdempotencyScope, IdempotencyStatus};
     use crate::domain::member::{GlobalMember, GlobalMemberLifecycle};
+    use crate::domain::outbox::{OutboxEvent, OutboxStatus};
+    use crate::domain::projection::{MemberSummaryProjection, ProjectionCheckpointStatus};
     use crate::domain::role_catalog::{RoleCatalogEntry, RoleCatalogStatus};
     use crate::domain::shared::context::{ActorContext, ActorKind};
-    use crate::domain::shared::ids::{GlobalMemberId, RoleId};
+    use crate::domain::shared::ids::{DeadLetterId, GlobalMemberId, OutboxEventId, RoleId};
     use crate::domain::shared::metadata::CommandMetadata;
     use crate::domain::timeline::{LifecycleEventType, LifecycleHistoryEntry};
     use crate::error::IdentityError;
@@ -354,6 +392,277 @@ mod tests {
         assert_eq!(role.status, RoleCatalogStatus::Active);
         assert_eq!(idempotency_record.status, IdempotencyStatus::Succeeded);
         uow.rollback().await.expect("rollback read transaction");
+    }
+
+    #[tokio::test]
+    async fn outbox_store_lists_pending_and_saves_publish_status() {
+        let _guard = DB_TEST_MUTEX.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+
+        let factory = SqlxUnitOfWorkFactory::new(pool.clone());
+        let created_at = now();
+
+        {
+            let mut uow = factory.begin().await.expect("begin seed transaction");
+            uow.outbox()
+                .append(&OutboxEvent {
+                    outbox_event_id: OutboxEventId::new("outbox-001"),
+                    aggregate_type: "global_member".to_string(),
+                    aggregate_id: "member-001".to_string(),
+                    event_type: "identity.member.created".to_string(),
+                    payload_json: json!({ "global_member_id": "member-001" }),
+                    idempotency_key: "idem-outbox-001".to_string(),
+                    status: OutboxStatus::Pending,
+                    retry_count: 0,
+                    next_retry_at: None,
+                    created_at,
+                    published_at: None,
+                    failure_reason: None,
+                })
+                .await
+                .expect("append pending outbox event");
+            uow.outbox()
+                .append(&OutboxEvent {
+                    outbox_event_id: OutboxEventId::new("outbox-002"),
+                    aggregate_type: "global_member".to_string(),
+                    aggregate_id: "member-002".to_string(),
+                    event_type: "identity.member.updated".to_string(),
+                    payload_json: json!({ "global_member_id": "member-002" }),
+                    idempotency_key: "idem-outbox-002".to_string(),
+                    status: OutboxStatus::Published,
+                    retry_count: 0,
+                    next_retry_at: None,
+                    created_at,
+                    published_at: Some(created_at),
+                    failure_reason: None,
+                })
+                .await
+                .expect("append published outbox event");
+            uow.commit().await.expect("commit seed outbox rows");
+        }
+
+        {
+            let mut uow = factory.begin().await.expect("begin pending scan");
+            let pending_events = uow
+                .outbox()
+                .list_pending(10)
+                .await
+                .expect("list pending outbox events");
+
+            assert_eq!(pending_events.len(), 1);
+            assert_eq!(pending_events[0].outbox_event_id.as_str(), "outbox-001");
+            uow.rollback().await.expect("rollback pending scan");
+        }
+
+        {
+            let mut uow = factory.begin().await.expect("begin save update");
+            let mut pending_event = uow
+                .outbox()
+                .list_pending(10)
+                .await
+                .expect("list pending before update")
+                .into_iter()
+                .next()
+                .expect("pending event should exist");
+            pending_event.status = OutboxStatus::Published;
+            pending_event.published_at = Some(created_at);
+
+            uow.outbox()
+                .save(&pending_event)
+                .await
+                .expect("save outbox publish status");
+            uow.commit().await.expect("commit outbox update");
+        }
+
+        let published_status: String =
+            sqlx::query("SELECT status FROM outbox_events WHERE outbox_event_id = $1")
+                .bind("outbox-001")
+                .fetch_one(&pool)
+                .await
+                .expect("fetch outbox status")
+                .get("status");
+        assert_eq!(published_status, "published");
+    }
+
+    #[tokio::test]
+    async fn outbox_store_lists_rows_after_checkpoint_cursor() {
+        let _guard = DB_TEST_MUTEX.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+
+        let factory = SqlxUnitOfWorkFactory::new(pool.clone());
+        let base_time = now();
+
+        {
+            let mut uow = factory.begin().await.expect("begin seed transaction");
+            for (event_id, aggregate_id, seconds) in [
+                ("outbox-a", "member-a", 0),
+                ("outbox-b", "member-b", 1),
+                ("outbox-c", "member-c", 2),
+            ] {
+                let created_at = base_time + time::Duration::seconds(seconds);
+                uow.outbox()
+                    .append(&OutboxEvent {
+                        outbox_event_id: OutboxEventId::new(event_id),
+                        aggregate_type: "global_member".to_string(),
+                        aggregate_id: aggregate_id.to_string(),
+                        event_type: "identity.member.changed".to_string(),
+                        payload_json: json!({ "global_member_id": aggregate_id }),
+                        idempotency_key: format!("idem-{event_id}"),
+                        status: OutboxStatus::Pending,
+                        retry_count: 0,
+                        next_retry_at: None,
+                        created_at,
+                        published_at: None,
+                        failure_reason: None,
+                    })
+                    .await
+                    .expect("append outbox event");
+            }
+            uow.commit().await.expect("commit seed outbox events");
+        }
+
+        let mut uow = factory.begin().await.expect("begin cursor scan");
+        let events_after_cursor = uow
+            .outbox()
+            .list_after(Some(&OutboxEventId::new("outbox-a")), 10)
+            .await
+            .expect("list outbox rows after cursor");
+
+        assert_eq!(
+            events_after_cursor
+                .into_iter()
+                .map(|event| event.outbox_event_id.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["outbox-b".to_string(), "outbox-c".to_string()]
+        );
+        uow.rollback().await.expect("rollback cursor scan");
+    }
+
+    #[tokio::test]
+    async fn projection_and_dead_letter_stores_round_trip() {
+        let _guard = DB_TEST_MUTEX.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+
+        let factory = SqlxUnitOfWorkFactory::new(pool.clone());
+        let timestamp = now();
+
+        {
+            let mut uow = factory.begin().await.expect("begin seed transaction");
+            uow.outbox()
+                .append(&OutboxEvent {
+                    outbox_event_id: OutboxEventId::new("outbox-proj-001"),
+                    aggregate_type: "global_member".to_string(),
+                    aggregate_id: "member-proj-001".to_string(),
+                    event_type: "identity.member.created".to_string(),
+                    payload_json: json!({ "global_member_id": "member-proj-001" }),
+                    idempotency_key: "idem-proj-001".to_string(),
+                    status: OutboxStatus::Pending,
+                    retry_count: 0,
+                    next_retry_at: None,
+                    created_at: timestamp,
+                    published_at: None,
+                    failure_reason: None,
+                })
+                .await
+                .expect("append outbox event for checkpoint ref");
+
+            uow.member_summary_projection()
+                .upsert(&MemberSummaryProjection {
+                    global_member_id: GlobalMemberId::new("member-proj-001"),
+                    display_name: "Projection Member".to_string(),
+                    lifecycle: GlobalMemberLifecycle::Active,
+                    main_role_id: Some(RoleId::new("role.member.operator")),
+                    main_role_name: Some("Member Operator".to_string()),
+                    capability_summary_json: json!({ "count": 1 }),
+                    career_summary_json: json!({ "count": 0 }),
+                    memory_ref_summary_json: json!({ "semantic": null }),
+                    projection_version: 3,
+                    updated_at: timestamp,
+                })
+                .await
+                .expect("upsert member summary projection");
+
+            let mut checkpoint = uow
+                .projection_checkpoints()
+                .get_or_create("member-summary-rebuild")
+                .await
+                .expect("get or create checkpoint");
+            checkpoint.last_processed_event_id = Some(OutboxEventId::new("outbox-proj-001"));
+            checkpoint.status = ProjectionCheckpointStatus::Running;
+            checkpoint.updated_at = timestamp;
+            uow.projection_checkpoints()
+                .save(&checkpoint)
+                .await
+                .expect("save checkpoint");
+
+            uow.inbound_dead_letters()
+                .append(&InboundDeadLetter {
+                    dead_letter_id: DeadLetterId::new("dead-letter-001"),
+                    source_event_id: Some(crate::domain::shared::ids::EventId::new(
+                        "source-event-001",
+                    )),
+                    source_module: "method-library".to_string(),
+                    event_type: "role.definition.updated".to_string(),
+                    payload_json: json!({ "role_id": "role.member.operator" }),
+                    failure_reason: "payload parse failed".to_string(),
+                    replay_status: DeadLetterReplayStatus::Pending,
+                    created_at: timestamp,
+                })
+                .await
+                .expect("append dead letter");
+            uow.commit().await.expect("commit projection seed");
+        }
+
+        let mut uow = factory.begin().await.expect("begin read transaction");
+        let projection = uow
+            .member_summary_projection()
+            .get(&GlobalMemberId::new("member-proj-001"))
+            .await
+            .expect("load member summary projection")
+            .expect("projection should exist");
+        let checkpoint = uow
+            .projection_checkpoints()
+            .get_or_create("member-summary-rebuild")
+            .await
+            .expect("load existing checkpoint");
+
+        assert_eq!(projection.display_name, "Projection Member");
+        assert_eq!(projection.projection_version, 3);
+        assert_eq!(
+            checkpoint
+                .last_processed_event_id
+                .as_ref()
+                .map(|value| value.as_str()),
+            Some("outbox-proj-001")
+        );
+        assert_eq!(checkpoint.status, ProjectionCheckpointStatus::Running);
+
+        uow.inbound_dead_letters()
+            .save(&InboundDeadLetter {
+                dead_letter_id: DeadLetterId::new("dead-letter-001"),
+                source_event_id: Some(crate::domain::shared::ids::EventId::new("source-event-001")),
+                source_module: "method-library".to_string(),
+                event_type: "role.definition.updated".to_string(),
+                payload_json: json!({ "role_id": "role.member.operator" }),
+                failure_reason: "ignored after manual review".to_string(),
+                replay_status: DeadLetterReplayStatus::Ignored,
+                created_at: timestamp,
+            })
+            .await
+            .expect("update dead letter status");
+        uow.commit().await.expect("commit dead-letter update");
+
+        let replay_status: String =
+            sqlx::query("SELECT replay_status FROM inbound_dead_letters WHERE dead_letter_id = $1")
+                .bind("dead-letter-001")
+                .fetch_one(&pool)
+                .await
+                .expect("fetch dead-letter replay status")
+                .get("replay_status");
+        assert_eq!(replay_status, "ignored");
     }
 
     async fn test_pool() -> sqlx::postgres::PgPool {
