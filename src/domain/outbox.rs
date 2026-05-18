@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use time::PrimitiveDateTime;
+use time::{Duration, PrimitiveDateTime};
 
 use crate::domain::member::GlobalMember;
 use crate::domain::role_catalog::RoleCatalogEntry;
@@ -71,6 +71,30 @@ pub struct OutboxEvent {
 }
 
 impl OutboxEvent {
+    /// Marks the outbox event as published after a successful bus handoff.
+    pub fn mark_published(&mut self, published_at: PrimitiveDateTime) {
+        self.status = OutboxStatus::Published;
+        self.published_at = Some(published_at);
+        self.next_retry_at = None;
+        self.failure_reason = None;
+    }
+
+    /// Marks the outbox event as failed and schedules the next retry attempt.
+    pub fn mark_failed(&mut self, failure_reason: impl Into<String>, failed_at: PrimitiveDateTime) {
+        self.status = OutboxStatus::Failed;
+        self.retry_count += 1;
+        self.failure_reason = Some(failure_reason.into());
+        self.published_at = None;
+        self.next_retry_at = Some(self.next_retry_at(failed_at));
+    }
+
+    /// Computes the next retry timestamp using a simple bounded linear backoff.
+    pub fn next_retry_at(&self, failed_at: PrimitiveDateTime) -> PrimitiveDateTime {
+        let retry_count = i64::from(self.retry_count.max(1));
+        let retry_delay_seconds = (retry_count * 30).min(300);
+        failed_at + Duration::seconds(retry_delay_seconds)
+    }
+
     /// Creates the outbox record produced by a successful hire command.
     pub fn for_member_hired(
         outbox_event_id: OutboxEventId,
