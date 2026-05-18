@@ -1,11 +1,13 @@
 //! Query projection records and checkpoint rows used by rebuild operations.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use time::PrimitiveDateTime;
 
 use crate::domain::member::GlobalMemberLifecycle;
+use crate::domain::outbox::OutboxEvent;
 use crate::domain::shared::ids::{GlobalMemberId, OutboxEventId, RoleId};
+use crate::error::IdentityError;
 
 /// Represents the read-optimized member summary projection row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,6 +32,63 @@ pub struct MemberSummaryProjection {
     pub projection_version: i64,
     /// Timestamp when the projection row was last refreshed.
     pub updated_at: PrimitiveDateTime,
+}
+
+impl MemberSummaryProjection {
+    /// Applies a supported outbox event and returns the resulting projection snapshot when
+    /// the event affects member summary reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a member-summary event payload is malformed or when the event type
+    /// is currently unsupported by the projection rebuild flow.
+    pub fn apply_outbox_event(
+        event: &OutboxEvent,
+        rebuilt_at: PrimitiveDateTime,
+    ) -> Result<Option<Self>, IdentityError> {
+        match event.event_type.as_str() {
+            "identity.member.created" => {
+                let payload: MemberCreatedProjectionPayload =
+                    serde_json::from_value(event.payload_json.clone()).map_err(|error| {
+                        IdentityError::PersistenceData {
+                            message: format!(
+                                "invalid member-created outbox payload for `{}`: {error}",
+                                event.outbox_event_id.as_str()
+                            ),
+                        }
+                    })?;
+                let lifecycle = GlobalMemberLifecycle::from_db(payload.lifecycle.as_str()).ok_or(
+                    IdentityError::PersistenceData {
+                        message: format!(
+                            "invalid lifecycle `{}` in member-created outbox payload for `{}`",
+                            payload.lifecycle,
+                            event.outbox_event_id.as_str()
+                        ),
+                    },
+                )?;
+
+                Ok(Some(Self {
+                    global_member_id: GlobalMemberId::new(payload.global_member_id),
+                    display_name: payload.display_name,
+                    lifecycle,
+                    main_role_id: Some(RoleId::new(payload.main_role_id)),
+                    main_role_name: None,
+                    capability_summary_json: json!({}),
+                    career_summary_json: json!({}),
+                    memory_ref_summary_json: json!({}),
+                    projection_version: payload.version,
+                    updated_at: rebuilt_at,
+                }))
+            }
+            "identity.role_catalog.synced" => Ok(None),
+            other => Err(IdentityError::PersistenceData {
+                message: format!(
+                    "unsupported member summary projection event type `{other}` for `{}`",
+                    event.outbox_event_id.as_str()
+                ),
+            }),
+        }
+    }
 }
 
 /// Enumerates the states allowed for projection checkpoint rows.
@@ -78,4 +137,59 @@ pub struct ProjectionCheckpoint {
     pub failure_reason: Option<String>,
     /// Timestamp when the checkpoint row was last updated.
     pub updated_at: PrimitiveDateTime,
+}
+
+impl ProjectionCheckpoint {
+    /// Creates a brand-new idle checkpoint for the provided operations name.
+    pub fn initial(checkpoint_name: impl Into<String>, updated_at: PrimitiveDateTime) -> Self {
+        Self {
+            checkpoint_name: checkpoint_name.into(),
+            last_processed_event_id: None,
+            status: ProjectionCheckpointStatus::Idle,
+            failure_reason: None,
+            updated_at,
+        }
+    }
+
+    /// Marks the checkpoint as actively running and clears any previous failure evidence.
+    pub fn mark_running(&mut self, updated_at: PrimitiveDateTime) {
+        self.status = ProjectionCheckpointStatus::Running;
+        self.failure_reason = None;
+        self.updated_at = updated_at;
+    }
+
+    /// Marks the checkpoint as idle after a rebuild pass finishes.
+    pub fn mark_idle(&mut self, updated_at: PrimitiveDateTime) {
+        self.status = ProjectionCheckpointStatus::Idle;
+        self.failure_reason = None;
+        self.updated_at = updated_at;
+    }
+
+    /// Advances the checkpoint after one outbox event has been applied successfully.
+    pub fn advance_to(&mut self, outbox_event_id: OutboxEventId, updated_at: PrimitiveDateTime) {
+        self.last_processed_event_id = Some(outbox_event_id);
+        self.status = ProjectionCheckpointStatus::Running;
+        self.failure_reason = None;
+        self.updated_at = updated_at;
+    }
+
+    /// Records a rebuild failure without moving the last successful event cursor.
+    pub fn mark_failed(
+        &mut self,
+        failure_reason: impl Into<String>,
+        updated_at: PrimitiveDateTime,
+    ) {
+        self.status = ProjectionCheckpointStatus::Failed;
+        self.failure_reason = Some(failure_reason.into());
+        self.updated_at = updated_at;
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MemberCreatedProjectionPayload {
+    global_member_id: String,
+    display_name: String,
+    lifecycle: String,
+    main_role_id: String,
+    version: i64,
 }
