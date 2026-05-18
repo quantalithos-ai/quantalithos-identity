@@ -9,7 +9,10 @@ use crate::application::persistence::{
 };
 use crate::domain::audit::AuditTraceEntry;
 use crate::domain::idempotency::{IdempotencyRecord, IdempotencyScope, IdempotencyStatus};
-use crate::domain::member::{GlobalMember, GlobalMemberSummary, HireGlobalMemberCommand};
+use crate::domain::member::{
+    GlobalMember, GlobalMemberLifecycle, GlobalMemberSummary, HireGlobalMemberCommand,
+    UpdateLifecycleCommand,
+};
 use crate::domain::outbox::OutboxEvent;
 use crate::domain::shared::context::ActorContext;
 use crate::domain::shared::ids::{GlobalMemberId, OutboxEventId};
@@ -132,6 +135,147 @@ where
         Ok(member.summary())
     }
 
+    /// Updates a member across the ordinary lifecycle state machine without handling tombstone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the member is missing, when the target lifecycle is illegal, when
+    /// the request tries to use the tombstone target through the ordinary lifecycle API, when the
+    /// idempotency key conflicts, or when persistence fails.
+    pub async fn update_lifecycle(
+        &self,
+        command: UpdateLifecycleCommand,
+        actor: ActorContext,
+        metadata: CommandMetadata,
+    ) -> Result<GlobalMemberSummary, IdentityError> {
+        if metadata.idempotency_key().trim().is_empty() {
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_INVALID_ARGUMENT",
+                message: "idempotency_key must not be blank".to_string(),
+            });
+        }
+        if command.reason.trim().is_empty() {
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_INVALID_ARGUMENT",
+                message: "reason must not be blank".to_string(),
+            });
+        }
+
+        let mut uow = self.unit_of_work_factory.begin().await?;
+        let existing_record = uow
+            .idempotency()
+            .get(metadata.idempotency_key(), IdempotencyScope::Command)
+            .await?;
+
+        if let Some(existing_record) = existing_record {
+            return self
+                .handle_existing_command_record(existing_record, metadata.request_hash(), uow)
+                .await;
+        }
+
+        let mut member = uow
+            .global_members()
+            .get_for_update(&command.global_member_id)
+            .await?
+            .ok_or_else(|| IdentityError::RuleViolation {
+                code: "IDENTITY_MEMBER_NOT_FOUND",
+                message: format!(
+                    "global member `{}` was not found",
+                    command.global_member_id.as_str()
+                ),
+            })?;
+
+        if command.target_lifecycle == GlobalMemberLifecycle::Tombstoned {
+            uow.rollback().await?;
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_USE_TOMBSTONE_COMMAND",
+                message: format!(
+                    "member `{}` must use TombstoneMember for tombstone transitions",
+                    command.global_member_id.as_str()
+                ),
+            });
+        }
+        if !member.can_transition_to(command.target_lifecycle) {
+            uow.rollback().await?;
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_LIFECYCLE_TRANSITION_INVALID",
+                message: format!(
+                    "member `{}` cannot transition from `{}` to `{}`",
+                    command.global_member_id.as_str(),
+                    member.lifecycle.as_db(),
+                    command.target_lifecycle.as_db()
+                ),
+            });
+        }
+
+        let expected_version = command.expected_version.unwrap_or(member.version);
+        let from_lifecycle = member.lifecycle;
+        match command.target_lifecycle {
+            GlobalMemberLifecycle::Active => member.activate(&actor)?,
+            GlobalMemberLifecycle::Paused => member.pause(&actor, &command.reason)?,
+            GlobalMemberLifecycle::Retired => member.retire(&actor, &command.reason)?,
+            GlobalMemberLifecycle::Hired | GlobalMemberLifecycle::Tombstoned => {
+                uow.rollback().await?;
+                return Err(IdentityError::RuleViolation {
+                    code: "IDENTITY_LIFECYCLE_TRANSITION_INVALID",
+                    message: format!(
+                        "member `{}` cannot transition to `{}` through UpdateLifecycle",
+                        command.global_member_id.as_str(),
+                        command.target_lifecycle.as_db()
+                    ),
+                });
+            }
+        }
+
+        let history_entry = LifecycleHistoryEntry::for_lifecycle_change(
+            format!("history:{}", metadata.idempotency_key()),
+            &member,
+            from_lifecycle,
+            actor.clone(),
+            metadata.clone(),
+        );
+        let audit_entry = AuditTraceEntry::for_lifecycle_command(
+            format!("audit:{}", metadata.idempotency_key()),
+            &member,
+            &actor,
+            metadata.trace_id(),
+            member.updated_at,
+            Some(command.reason.clone()),
+        );
+        let outbox_event = OutboxEvent::for_member_lifecycle_changed(
+            OutboxEventId::new(format!("outbox:{}", metadata.idempotency_key())),
+            &member,
+            from_lifecycle.as_db(),
+            &command.reason,
+            metadata.idempotency_key(),
+            member.updated_at,
+        );
+
+        uow.global_members().save(&member, expected_version).await?;
+        uow.lifecycle_history().append(&history_entry).await?;
+        uow.audit_traces().append(&audit_entry).await?;
+        uow.outbox().append(&outbox_event).await?;
+        uow.idempotency()
+            .record_success(
+                &metadata,
+                IdempotencyScope::Command,
+                json!({
+                    "kind": "global_member",
+                    "id": member.global_member_id.as_str(),
+                    "display_name": member.display_name,
+                    "lifecycle": member.lifecycle.as_db(),
+                    "main_role_id": member.main_role_id.as_str(),
+                    "secondary_role_ids": member.secondary_role_ids.iter().map(|value| value.as_str()).collect::<Vec<_>>(),
+                    "capability_profile_id": member.capability_profile_id.as_ref().map(|value| value.as_str()),
+                    "memory_refs_id": member.memory_refs_id.as_ref().map(|value| value.as_str()),
+                }),
+            )
+            .await?;
+        uow.commit().await?;
+
+        Ok(member.summary())
+    }
+
     async fn handle_existing_command_record<Uow>(
         &self,
         existing_record: IdempotencyRecord,
@@ -226,12 +370,16 @@ mod tests {
     use sqlx::{Executor, Row, postgres::PgPoolOptions};
     use time::{OffsetDateTime, PrimitiveDateTime};
 
+    use crate::application::query_projection::{GetMemberSummaryQuery, QueryProjectionService};
     use crate::config::AppConfig;
-    use crate::domain::member::{GlobalMemberLifecycle, HireGlobalMemberCommand};
+    use crate::domain::member::{
+        GlobalMemberLifecycle, HireGlobalMemberCommand, UpdateLifecycleCommand,
+    };
     use crate::domain::shared::context::{ActorContext, ActorKind};
     use crate::domain::shared::ids::RoleId;
     use crate::domain::shared::metadata::CommandMetadata;
     use crate::error::IdentityError;
+    use crate::operations::ProjectionRebuildJob;
     use crate::persistence::database::run_migrations;
     use crate::persistence::test_support::DB_TEST_MUTEX;
     use crate::persistence::unit_of_work::SqlxUnitOfWorkFactory;
@@ -366,7 +514,10 @@ mod tests {
             first_summary.global_member_id,
             second_summary.global_member_id
         );
-        assert_eq!(first_summary.secondary_role_ids, second_summary.secondary_role_ids);
+        assert_eq!(
+            first_summary.secondary_role_ids,
+            second_summary.secondary_role_ids
+        );
         assert_eq!(member_count, 1);
     }
 
@@ -453,6 +604,385 @@ mod tests {
             }
         ));
         assert_eq!(member_count, 0);
+    }
+
+    #[tokio::test]
+    async fn update_lifecycle_persists_member_history_audit_outbox_and_idempotency() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator").await;
+
+        let service = MemberLifecycleCommandService::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        let actor = ActorContext::new("human/admin-5", ActorKind::HumanUser, None);
+
+        let hired_member = service
+            .hire_global_member(
+                HireGlobalMemberCommand {
+                    display_name: "Member Lifecycle One".to_string(),
+                    main_role_id: RoleId::new("role.member.operator"),
+                    secondary_role_ids: Vec::new(),
+                },
+                actor.clone(),
+                CommandMetadata::new("hire-005", "trace-hire-005", "request-hash-005"),
+            )
+            .await
+            .expect("hire member for lifecycle update");
+
+        let summary = service
+            .update_lifecycle(
+                UpdateLifecycleCommand {
+                    global_member_id: hired_member.global_member_id.clone(),
+                    target_lifecycle: GlobalMemberLifecycle::Active,
+                    reason: "member approved for active staffing".to_string(),
+                    expected_version: None,
+                },
+                actor,
+                CommandMetadata::new(
+                    "lifecycle-001",
+                    "trace-lifecycle-001",
+                    "request-hash-lifecycle-001",
+                ),
+            )
+            .await
+            .expect("lifecycle update should succeed");
+
+        let member_row = sqlx::query(
+            "SELECT lifecycle, version FROM global_members WHERE global_member_id = $1",
+        )
+        .bind(summary.global_member_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load updated member row");
+        let history_row = sqlx::query(
+            r#"
+            SELECT event_type, from_lifecycle, to_lifecycle
+            FROM lifecycle_history_entries
+            WHERE history_entry_id = $1
+            "#,
+        )
+        .bind("history:lifecycle-001")
+        .fetch_one(&pool)
+        .await
+        .expect("load lifecycle history row");
+        let audit_row =
+            sqlx::query("SELECT action, reason FROM audit_trace_entries WHERE trace_id = $1")
+                .bind("trace-lifecycle-001")
+                .fetch_one(&pool)
+                .await
+                .expect("load lifecycle audit row");
+        let outbox_row = sqlx::query(
+            "SELECT event_type, payload_json FROM outbox_events WHERE outbox_event_id = $1",
+        )
+        .bind("outbox:lifecycle-001")
+        .fetch_one(&pool)
+        .await
+        .expect("load lifecycle outbox row");
+        let idempotency_status: String =
+            sqlx::query("SELECT status FROM idempotency_records WHERE idempotency_key = $1")
+                .bind("lifecycle-001")
+                .fetch_one(&pool)
+                .await
+                .expect("load lifecycle idempotency row")
+                .get("status");
+
+        assert_eq!(summary.lifecycle, GlobalMemberLifecycle::Active);
+        assert_eq!(member_row.get::<String, _>("lifecycle"), "active");
+        assert_eq!(member_row.get::<i64, _>("version"), 1);
+        assert_eq!(
+            history_row.get::<String, _>("event_type"),
+            "lifecycle_changed"
+        );
+        assert_eq!(
+            history_row.get::<Option<String>, _>("from_lifecycle"),
+            Some("hired".to_string())
+        );
+        assert_eq!(history_row.get::<String, _>("to_lifecycle"), "active");
+        assert_eq!(audit_row.get::<String, _>("action"), "UpdateLifecycle");
+        assert_eq!(
+            audit_row.get::<Option<String>, _>("reason"),
+            Some("member approved for active staffing".to_string())
+        );
+        assert_eq!(
+            outbox_row.get::<String, _>("event_type"),
+            "identity.member.lifecycle_changed"
+        );
+        assert_eq!(
+            outbox_row.get::<serde_json::Value, _>("payload_json")["from_lifecycle"],
+            json!("hired")
+        );
+        assert_eq!(
+            outbox_row.get::<serde_json::Value, _>("payload_json")["reason"],
+            json!("member approved for active staffing")
+        );
+        assert_eq!(idempotency_status, "succeeded");
+    }
+
+    #[tokio::test]
+    async fn update_lifecycle_rejects_illegal_transition_without_persisting_changes() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator").await;
+
+        let service = MemberLifecycleCommandService::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        let actor = ActorContext::new("human/admin-6", ActorKind::HumanUser, None);
+
+        let hired_member = service
+            .hire_global_member(
+                HireGlobalMemberCommand {
+                    display_name: "Member Lifecycle Two".to_string(),
+                    main_role_id: RoleId::new("role.member.operator"),
+                    secondary_role_ids: Vec::new(),
+                },
+                actor.clone(),
+                CommandMetadata::new("hire-006", "trace-hire-006", "request-hash-006"),
+            )
+            .await
+            .expect("hire member for illegal transition");
+
+        let error = service
+            .update_lifecycle(
+                UpdateLifecycleCommand {
+                    global_member_id: hired_member.global_member_id.clone(),
+                    target_lifecycle: GlobalMemberLifecycle::Paused,
+                    reason: "try to pause before activation".to_string(),
+                    expected_version: Some(0),
+                },
+                actor,
+                CommandMetadata::new(
+                    "lifecycle-002",
+                    "trace-lifecycle-002",
+                    "request-hash-lifecycle-002",
+                ),
+            )
+            .await
+            .expect_err("illegal lifecycle transition should be rejected");
+
+        let member_row = sqlx::query(
+            "SELECT lifecycle, version FROM global_members WHERE global_member_id = $1",
+        )
+        .bind(hired_member.global_member_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load unchanged member row");
+        let update_history_count: i64 = sqlx::query(
+            "SELECT COUNT(*) AS count FROM lifecycle_history_entries WHERE history_entry_id = $1",
+        )
+        .bind("history:lifecycle-002")
+        .fetch_one(&pool)
+        .await
+        .expect("count update lifecycle history rows")
+        .get("count");
+        let update_outbox_count: i64 =
+            sqlx::query("SELECT COUNT(*) AS count FROM outbox_events WHERE outbox_event_id = $1")
+                .bind("outbox:lifecycle-002")
+                .fetch_one(&pool)
+                .await
+                .expect("count update outbox rows")
+                .get("count");
+
+        assert!(matches!(
+            error,
+            IdentityError::RuleViolation {
+                code: "IDENTITY_LIFECYCLE_TRANSITION_INVALID",
+                ..
+            }
+        ));
+        assert_eq!(member_row.get::<String, _>("lifecycle"), "hired");
+        assert_eq!(member_row.get::<i64, _>("version"), 0);
+        assert_eq!(update_history_count, 0);
+        assert_eq!(update_outbox_count, 0);
+    }
+
+    #[tokio::test]
+    async fn update_lifecycle_rejects_tombstone_target() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator").await;
+
+        let service = MemberLifecycleCommandService::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        let actor = ActorContext::new("human/admin-7", ActorKind::HumanUser, None);
+
+        let hired_member = service
+            .hire_global_member(
+                HireGlobalMemberCommand {
+                    display_name: "Member Lifecycle Three".to_string(),
+                    main_role_id: RoleId::new("role.member.operator"),
+                    secondary_role_ids: Vec::new(),
+                },
+                actor.clone(),
+                CommandMetadata::new("hire-007", "trace-hire-007", "request-hash-007"),
+            )
+            .await
+            .expect("hire member for tombstone guard");
+
+        let error = service
+            .update_lifecycle(
+                UpdateLifecycleCommand {
+                    global_member_id: hired_member.global_member_id.clone(),
+                    target_lifecycle: GlobalMemberLifecycle::Tombstoned,
+                    reason: "wrong endpoint".to_string(),
+                    expected_version: Some(0),
+                },
+                actor,
+                CommandMetadata::new(
+                    "lifecycle-003",
+                    "trace-lifecycle-003",
+                    "request-hash-lifecycle-003",
+                ),
+            )
+            .await
+            .expect_err("tombstone target should be rejected");
+
+        let member_row = sqlx::query(
+            "SELECT lifecycle, version FROM global_members WHERE global_member_id = $1",
+        )
+        .bind(hired_member.global_member_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load unchanged member row");
+
+        assert!(matches!(
+            error,
+            IdentityError::RuleViolation {
+                code: "IDENTITY_USE_TOMBSTONE_COMMAND",
+                ..
+            }
+        ));
+        assert_eq!(member_row.get::<String, _>("lifecycle"), "hired");
+        assert_eq!(member_row.get::<i64, _>("version"), 0);
+    }
+
+    #[tokio::test]
+    async fn update_lifecycle_rejects_stale_expected_version() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator").await;
+
+        let service = MemberLifecycleCommandService::new(SqlxUnitOfWorkFactory::new(pool.clone()));
+        let actor = ActorContext::new("human/admin-8", ActorKind::HumanUser, None);
+
+        let hired_member = service
+            .hire_global_member(
+                HireGlobalMemberCommand {
+                    display_name: "Member Lifecycle Four".to_string(),
+                    main_role_id: RoleId::new("role.member.operator"),
+                    secondary_role_ids: Vec::new(),
+                },
+                actor.clone(),
+                CommandMetadata::new("hire-008", "trace-hire-008", "request-hash-008"),
+            )
+            .await
+            .expect("hire member for version conflict");
+
+        let error = service
+            .update_lifecycle(
+                UpdateLifecycleCommand {
+                    global_member_id: hired_member.global_member_id.clone(),
+                    target_lifecycle: GlobalMemberLifecycle::Active,
+                    reason: "stale version request".to_string(),
+                    expected_version: Some(999),
+                },
+                actor,
+                CommandMetadata::new(
+                    "lifecycle-004",
+                    "trace-lifecycle-004",
+                    "request-hash-lifecycle-004",
+                ),
+            )
+            .await
+            .expect_err("stale expected_version should conflict");
+
+        let member_row = sqlx::query(
+            "SELECT lifecycle, version FROM global_members WHERE global_member_id = $1",
+        )
+        .bind(hired_member.global_member_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load unchanged member row");
+
+        assert!(matches!(
+            error,
+            IdentityError::VersionConflict { entity } if entity == "global_member"
+        ));
+        assert_eq!(member_row.get::<String, _>("lifecycle"), "hired");
+        assert_eq!(member_row.get::<i64, _>("version"), 0);
+    }
+
+    #[tokio::test]
+    async fn update_lifecycle_event_can_refresh_member_summary_projection() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator").await;
+
+        let factory = SqlxUnitOfWorkFactory::new(pool.clone());
+        let service = MemberLifecycleCommandService::new(factory.clone());
+        let rebuild_job = ProjectionRebuildJob::new(factory.clone());
+        let query_service = QueryProjectionService::new(factory);
+        let actor = ActorContext::new("human/admin-9", ActorKind::HumanUser, None);
+
+        let hired_member = service
+            .hire_global_member(
+                HireGlobalMemberCommand {
+                    display_name: "Member Lifecycle Five".to_string(),
+                    main_role_id: RoleId::new("role.member.operator"),
+                    secondary_role_ids: Vec::new(),
+                },
+                actor.clone(),
+                CommandMetadata::new("hire-009", "trace-hire-009", "request-hash-009"),
+            )
+            .await
+            .expect("hire member for projection refresh");
+
+        rebuild_job
+            .rebuild_member_summary_projection("member-summary-rebuild", 10)
+            .await
+            .expect("initial rebuild should succeed");
+
+        service
+            .update_lifecycle(
+                UpdateLifecycleCommand {
+                    global_member_id: hired_member.global_member_id.clone(),
+                    target_lifecycle: GlobalMemberLifecycle::Active,
+                    reason: "member activated after review".to_string(),
+                    expected_version: Some(0),
+                },
+                actor.clone(),
+                CommandMetadata::new(
+                    "lifecycle-005",
+                    "trace-lifecycle-005",
+                    "request-hash-lifecycle-005",
+                ),
+            )
+            .await
+            .expect("lifecycle update should succeed");
+
+        rebuild_job
+            .rebuild_member_summary_projection("member-summary-rebuild", 10)
+            .await
+            .expect("incremental rebuild should apply lifecycle event");
+
+        let summary = query_service
+            .get_member_summary(
+                GetMemberSummaryQuery {
+                    global_member_id: hired_member.global_member_id,
+                },
+                actor,
+            )
+            .await
+            .expect("query should return refreshed projection");
+
+        assert_eq!(summary.lifecycle, GlobalMemberLifecycle::Active);
+        assert_eq!(summary.projection_version, 1);
     }
 
     async fn test_pool() -> sqlx::postgres::PgPool {

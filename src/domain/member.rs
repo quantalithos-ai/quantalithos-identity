@@ -1,7 +1,7 @@
 //! Global member write-model aggregate used by repository and command layers.
 
 use serde::{Deserialize, Serialize};
-use time::PrimitiveDateTime;
+use time::{OffsetDateTime, PrimitiveDateTime};
 
 use crate::domain::role_catalog::RoleCatalogEntry;
 use crate::domain::shared::context::ActorContext;
@@ -97,6 +97,19 @@ pub struct HireGlobalMemberCommand {
     pub secondary_role_ids: Vec<RoleId>,
 }
 
+/// Explicit lifecycle-change command consumed by the `UpdateLifecycle` application service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateLifecycleCommand {
+    /// Stable global member id targeted by the lifecycle transition.
+    pub global_member_id: GlobalMemberId,
+    /// Destination lifecycle requested by the caller.
+    pub target_lifecycle: GlobalMemberLifecycle,
+    /// Human-readable reason retained in audit and outbox payloads.
+    pub reason: String,
+    /// Optional optimistic-lock version expected by the caller.
+    pub expected_version: Option<i64>,
+}
+
 /// Summary returned directly from command write paths after member creation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlobalMemberSummary {
@@ -163,6 +176,109 @@ impl GlobalMember {
         })
     }
 
+    /// Returns true when the requested lifecycle is a legal ordinary transition.
+    pub fn can_transition_to(&self, target_lifecycle: GlobalMemberLifecycle) -> bool {
+        match (self.lifecycle, target_lifecycle) {
+            (GlobalMemberLifecycle::Hired, GlobalMemberLifecycle::Active) => true,
+            (GlobalMemberLifecycle::Active, GlobalMemberLifecycle::Paused) => true,
+            (GlobalMemberLifecycle::Active, GlobalMemberLifecycle::Retired) => true,
+            (GlobalMemberLifecycle::Paused, GlobalMemberLifecycle::Active) => true,
+            (GlobalMemberLifecycle::Paused, GlobalMemberLifecycle::Retired) => true,
+            _ => false,
+        }
+    }
+
+    /// Moves the member into the `active` lifecycle when the transition is legal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current lifecycle cannot transition to `active`.
+    pub fn activate(&mut self, _actor: &ActorContext) -> Result<(), IdentityError> {
+        if !self.can_transition_to(GlobalMemberLifecycle::Active) {
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_LIFECYCLE_TRANSITION_INVALID",
+                message: format!(
+                    "member `{}` cannot transition from `{}` to `active`",
+                    self.global_member_id.as_str(),
+                    self.lifecycle.as_db()
+                ),
+            });
+        }
+
+        self.apply_lifecycle_transition(GlobalMemberLifecycle::Active);
+        Ok(())
+    }
+
+    /// Moves the member into the `paused` lifecycle when the transition is legal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reason is blank or when the current lifecycle cannot transition
+    /// to `paused`.
+    pub fn pause(
+        &mut self,
+        _actor: &ActorContext,
+        reason: impl AsRef<str>,
+    ) -> Result<(), IdentityError> {
+        if reason.as_ref().trim().is_empty() {
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_INVALID_ARGUMENT",
+                message: "reason must not be blank".to_string(),
+            });
+        }
+        if !self.can_transition_to(GlobalMemberLifecycle::Paused) {
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_LIFECYCLE_TRANSITION_INVALID",
+                message: format!(
+                    "member `{}` cannot transition from `{}` to `paused`",
+                    self.global_member_id.as_str(),
+                    self.lifecycle.as_db()
+                ),
+            });
+        }
+
+        self.apply_lifecycle_transition(GlobalMemberLifecycle::Paused);
+        Ok(())
+    }
+
+    /// Moves the member into the `retired` lifecycle when the transition is legal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reason is blank or when the current lifecycle cannot transition
+    /// to `retired`.
+    pub fn retire(
+        &mut self,
+        _actor: &ActorContext,
+        reason: impl AsRef<str>,
+    ) -> Result<(), IdentityError> {
+        if reason.as_ref().trim().is_empty() {
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_INVALID_ARGUMENT",
+                message: "reason must not be blank".to_string(),
+            });
+        }
+        if !self.can_transition_to(GlobalMemberLifecycle::Retired) {
+            return Err(IdentityError::RuleViolation {
+                code: "IDENTITY_LIFECYCLE_TRANSITION_INVALID",
+                message: format!(
+                    "member `{}` cannot transition from `{}` to `retired`",
+                    self.global_member_id.as_str(),
+                    self.lifecycle.as_db()
+                ),
+            });
+        }
+
+        self.apply_lifecycle_transition(GlobalMemberLifecycle::Retired);
+        Ok(())
+    }
+
+    fn apply_lifecycle_transition(&mut self, target_lifecycle: GlobalMemberLifecycle) {
+        self.lifecycle = target_lifecycle;
+        self.version += 1;
+        self.updated_at = current_timestamp();
+    }
+
     /// Returns the command-side summary for the current member write model.
     pub fn summary(&self) -> GlobalMemberSummary {
         GlobalMemberSummary {
@@ -175,4 +291,9 @@ impl GlobalMember {
             memory_refs_id: self.memory_refs_id.clone(),
         }
     }
+}
+
+fn current_timestamp() -> PrimitiveDateTime {
+    let now = OffsetDateTime::now_utc();
+    PrimitiveDateTime::new(now.date(), now.time())
 }

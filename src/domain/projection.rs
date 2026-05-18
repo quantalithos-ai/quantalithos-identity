@@ -47,7 +47,7 @@ impl MemberSummaryProjection {
         rebuilt_at: PrimitiveDateTime,
     ) -> Result<Option<Self>, IdentityError> {
         match event.event_type.as_str() {
-            "identity.member.created" => {
+            "identity.member.created" | "identity.member.lifecycle_changed" => {
                 let payload: MemberCreatedProjectionPayload =
                     serde_json::from_value(event.payload_json.clone()).map_err(|error| {
                         IdentityError::PersistenceData {

@@ -86,4 +86,25 @@ impl LifecycleHistoryEntry {
             created_at: member.created_at,
         }
     }
+
+    /// Creates the append-only history row produced by a successful lifecycle change.
+    pub fn for_lifecycle_change(
+        history_entry_id: impl Into<String>,
+        member: &GlobalMember,
+        from_lifecycle: GlobalMemberLifecycle,
+        actor: ActorContext,
+        metadata: CommandMetadata,
+    ) -> Self {
+        Self {
+            history_entry_id: history_entry_id.into(),
+            global_member_id: member.global_member_id.clone(),
+            event_type: LifecycleEventType::LifecycleChanged,
+            from_lifecycle: Some(from_lifecycle),
+            to_lifecycle: member.lifecycle,
+            actor,
+            gate_decision_ref_json: None,
+            metadata,
+            created_at: member.updated_at,
+        }
+    }
 }

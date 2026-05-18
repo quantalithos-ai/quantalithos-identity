@@ -129,6 +129,44 @@ impl OutboxEvent {
         }
     }
 
+    /// Creates the outbox record produced by a successful lifecycle-change command.
+    pub fn for_member_lifecycle_changed(
+        outbox_event_id: OutboxEventId,
+        member: &GlobalMember,
+        from_lifecycle: &str,
+        reason: &str,
+        idempotency_key: &str,
+        created_at: PrimitiveDateTime,
+    ) -> Self {
+        Self {
+            outbox_event_id,
+            aggregate_type: "global_member".to_string(),
+            aggregate_id: member.global_member_id.as_str().to_string(),
+            event_type: "identity.member.lifecycle_changed".to_string(),
+            payload_json: json!({
+                "global_member_id": member.global_member_id.as_str(),
+                "display_name": member.display_name,
+                "lifecycle": member.lifecycle.as_db(),
+                "from_lifecycle": from_lifecycle,
+                "reason": reason,
+                "main_role_id": member.main_role_id.as_str(),
+                "secondary_role_ids": member.secondary_role_ids.iter().map(|value| value.as_str()).collect::<Vec<_>>(),
+                "capability_profile_id": member.capability_profile_id.as_ref().map(|value| value.as_str()),
+                "memory_refs_id": member.memory_refs_id.as_ref().map(|value| value.as_str()),
+                "version": member.version,
+                "created_at": member.created_at,
+                "updated_at": member.updated_at,
+            }),
+            idempotency_key: idempotency_key.to_string(),
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            next_retry_at: None,
+            created_at,
+            published_at: None,
+            failure_reason: None,
+        }
+    }
+
     /// Creates the outbox record produced by a successful role-catalog synchronization.
     pub fn for_role_catalog_sync(
         outbox_event_id: OutboxEventId,

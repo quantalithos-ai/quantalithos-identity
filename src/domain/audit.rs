@@ -72,10 +72,50 @@ impl AuditTraceEntry {
         trace_id: impl Into<String>,
         created_at: PrimitiveDateTime,
     ) -> Self {
+        Self::for_member_command(
+            audit_trace_id,
+            "HireGlobalMember",
+            member,
+            actor,
+            trace_id,
+            created_at,
+            None,
+        )
+    }
+
+    /// Creates an audit trace row for a successful lifecycle-change command.
+    pub fn for_lifecycle_command(
+        audit_trace_id: impl Into<String>,
+        member: &GlobalMember,
+        actor: &ActorContext,
+        trace_id: impl Into<String>,
+        created_at: PrimitiveDateTime,
+        reason: Option<String>,
+    ) -> Self {
+        Self::for_member_command(
+            audit_trace_id,
+            "UpdateLifecycle",
+            member,
+            actor,
+            trace_id,
+            created_at,
+            reason,
+        )
+    }
+
+    fn for_member_command(
+        audit_trace_id: impl Into<String>,
+        action: impl Into<String>,
+        member: &GlobalMember,
+        actor: &ActorContext,
+        trace_id: impl Into<String>,
+        created_at: PrimitiveDateTime,
+        reason: Option<String>,
+    ) -> Self {
         Self {
             audit_trace_id: audit_trace_id.into(),
             trace_id: trace_id.into(),
-            action: "HireGlobalMember".to_string(),
+            action: action.into(),
             actor_json: Some(json!(actor)),
             target_ref_json: Some(json!({
                 "kind": "global_member",
@@ -83,7 +123,7 @@ impl AuditTraceEntry {
             })),
             source_module: None,
             result: AuditResult::Success,
-            reason: None,
+            reason,
             created_at,
         }
     }
