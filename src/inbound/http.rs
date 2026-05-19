@@ -3,11 +3,13 @@
 #[cfg(test)]
 use std::sync::Mutex;
 
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode, request::Parts};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPool;
 use time::{OffsetDateTime, PrimitiveDateTime};
@@ -57,6 +59,7 @@ impl HttpAppState {
         Self { pool }
     }
 
+    /// Builds a fresh unit-of-work factory for one request or background bridge call.
     fn unit_of_work_factory(&self) -> SqlxUnitOfWorkFactory {
         SqlxUnitOfWorkFactory::new(self.pool.clone())
     }
@@ -66,6 +69,11 @@ impl HttpAppState {
     // existing transaction-scoped application-service construction path while ensuring request
     // state is moved, not borrowed, across the blocking worker boundary.
 
+    /// Executes the hire-member command service on the existing application boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns command, persistence, or task-join failures as `IdentityError`.
     async fn hire_global_member(
         &self,
         command: HireGlobalMemberCommand,
@@ -86,6 +94,11 @@ impl HttpAppState {
         })?
     }
 
+    /// Loads one member summary projection without mutating write-model truth.
+    ///
+    /// # Errors
+    ///
+    /// Returns projection query, persistence, or task-join failures as `IdentityError`.
     async fn get_member_summary(
         &self,
         query: GetMemberSummaryQuery,
@@ -105,6 +118,11 @@ impl HttpAppState {
         })?
     }
 
+    /// Loads one member audit-trace page through the existing query service boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns visibility, query, persistence, or task-join failures as `IdentityError`.
     async fn get_member_audit_trace(
         &self,
         query: GetMemberAuditTraceQuery,
@@ -124,6 +142,11 @@ impl HttpAppState {
         })?
     }
 
+    /// Loads local role-catalog summary rows through the projection query service.
+    ///
+    /// # Errors
+    ///
+    /// Returns filter-validation, persistence, or task-join failures as `IdentityError`.
     async fn get_role_catalog(
         &self,
         query: GetRoleCatalogQuery,
@@ -143,6 +166,11 @@ impl HttpAppState {
         })?
     }
 
+    /// Executes a lifecycle transition command on the current application boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, persistence, or task-join failures as `IdentityError`.
     async fn update_lifecycle(
         &self,
         command: UpdateLifecycleCommand,
@@ -163,6 +191,11 @@ impl HttpAppState {
         })?
     }
 
+    /// Executes full capability-profile replacement using the current local artifact stub.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, persistence, or task-join failures as `IdentityError`.
     async fn update_capability_profile(
         &self,
         command: UpdateCapabilityProfileCommand,
@@ -183,6 +216,11 @@ impl HttpAppState {
         })?
     }
 
+    /// Executes memory-ref replacement using the current local memory-archive stub.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, persistence, or task-join failures as `IdentityError`.
     async fn update_memory_refs(
         &self,
         command: UpdateMemoryRefsCommand,
@@ -203,6 +241,11 @@ impl HttpAppState {
         })?
     }
 
+    /// Executes the high-risk tombstone flow using the current local governance and archive stubs.
+    ///
+    /// # Errors
+    ///
+    /// Returns domain, persistence, or task-join failures as `IdentityError`.
     async fn tombstone_member(
         &self,
         command: TombstoneMemberCommand,
@@ -262,13 +305,142 @@ pub async fn health_check() -> impl IntoResponse {
     (StatusCode::OK, Json(HealthResponse { status: "ok" }))
 }
 
+/// Trait implemented by command HTTP DTOs that can derive the stable idempotency request hash.
+trait CommandTransportPayload: Serialize {
+    /// Stable operation label included in the request hash payload.
+    const OPERATION: &'static str;
+
+    /// Builds the canonical request-hash payload consumed by `CommandMetadata`.
+    fn request_hash_payload(&self) -> Result<String, ApiError> {
+        request_hash_payload(Self::OPERATION, self)
+    }
+}
+
+/// Trusted actor extractor that only consumes gateway-injected headers.
+struct TrustedActor(ActorContext);
+
+impl<S> FromRequestParts<S> for TrustedActor
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        actor_context_from_headers(&parts.headers).map(Self)
+    }
+}
+
+/// Transport-local view of command metadata headers before request hashing is complete.
+struct CommandMetadataHeaders {
+    /// Idempotency key copied from trusted request headers.
+    idempotency_key: String,
+    /// Trace id copied from trusted request headers.
+    trace_id: String,
+}
+
+impl CommandMetadataHeaders {
+    /// Completes one command metadata object once the request hash is known.
+    fn into_metadata(self, request_hash: String) -> CommandMetadata {
+        CommandMetadata::new(self.idempotency_key, self.trace_id, request_hash)
+    }
+}
+
+impl<S> FromRequestParts<S> for CommandMetadataHeaders
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self {
+            idempotency_key: required_header(&parts.headers, HEADER_IDEMPOTENCY_KEY)?,
+            trace_id: required_header(&parts.headers, HEADER_TRACE_ID)?,
+        })
+    }
+}
+
+/// JSON extractor that maps all body parsing failures into the stable identity error envelope.
+struct ApiJson<T>(T);
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let Json(value) = Json::<T>::from_request(request, state)
+            .await
+            .map_err(ApiError::from)?;
+        Ok(Self(value))
+    }
+}
+
+/// Query-string extractor that maps axum query parsing failures into the stable identity error envelope.
+struct ApiQuery<T>(T);
+
+impl<S, T> FromRequestParts<S> for ApiQuery<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Query(value) = Query::<T>::from_request_parts(parts, state)
+            .await
+            .map_err(ApiError::from)?;
+        Ok(Self(value))
+    }
+}
+
+/// Command extractor that standardizes trusted actor injection, command metadata parsing, and JSON DTO loading.
+struct CommandRequest<T> {
+    /// Trusted actor context injected by the gateway.
+    actor: ActorContext,
+    /// Request metadata built from trusted transport headers plus the request hash.
+    metadata: CommandMetadata,
+    /// Parsed command DTO.
+    payload: T,
+}
+
+impl<T> CommandRequest<T> {
+    /// Splits the extractor output into the parsed DTO and transport context values.
+    fn into_parts(self) -> (T, ActorContext, CommandMetadata) {
+        (self.payload, self.actor, self.metadata)
+    }
+}
+
+impl<S, T> FromRequest<S> for CommandRequest<T>
+where
+    S: Send + Sync,
+    T: CommandTransportPayload + DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (mut parts, body) = request.into_parts();
+        let TrustedActor(actor) = TrustedActor::from_request_parts(&mut parts, state).await?;
+        let metadata_headers =
+            CommandMetadataHeaders::from_request_parts(&mut parts, state).await?;
+        let ApiJson(payload) =
+            ApiJson::<T>::from_request(Request::from_parts(parts, body), state).await?;
+        let metadata = metadata_headers.into_metadata(payload.request_hash_payload()?);
+
+        Ok(Self {
+            actor,
+            metadata,
+            payload,
+        })
+    }
+}
+
 async fn hire_global_member(
     State(state): State<HttpAppState>,
-    headers: HeaderMap,
-    Json(request): Json<HireGlobalMemberRequest>,
+    command: CommandRequest<HireGlobalMemberRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = actor_context_from_headers(&headers)?;
-    let metadata = command_metadata_from_headers(&headers, request.request_hash_payload()?)?;
+    let (request, actor, metadata) = command.into_parts();
     let summary = state
         .hire_global_member(request.into_command(), actor, metadata)
         .await
@@ -277,17 +449,18 @@ async fn hire_global_member(
     Ok((StatusCode::CREATED, Json(summary)))
 }
 
+/// Handles lifecycle transition requests for one existing member.
+///
+/// # Errors
+///
+/// Returns stable transport errors when path/header/body parsing fails or when the application
+/// service rejects the requested transition.
 async fn update_lifecycle(
     State(state): State<HttpAppState>,
     Path(global_member_id): Path<String>,
-    headers: HeaderMap,
-    Json(request): Json<UpdateLifecycleRequest>,
+    command: CommandRequest<UpdateLifecycleRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = actor_context_from_headers(&headers)?;
-    let metadata = command_metadata_from_headers(
-        &headers,
-        request_hash_payload("update_lifecycle", &request)?,
-    )?;
+    let (request, actor, metadata) = command.into_parts();
     let summary = state
         .update_lifecycle(request.into_command(global_member_id), actor, metadata)
         .await
@@ -296,17 +469,18 @@ async fn update_lifecycle(
     Ok((StatusCode::OK, Json(summary)))
 }
 
+/// Handles full capability-profile replacement for one member.
+///
+/// # Errors
+///
+/// Returns stable transport errors when path/header/body parsing fails or when the application
+/// service rejects the new capability snapshot.
 async fn update_capability_profile(
     State(state): State<HttpAppState>,
     Path(global_member_id): Path<String>,
-    headers: HeaderMap,
-    Json(request): Json<UpdateCapabilityProfileRequest>,
+    command: CommandRequest<UpdateCapabilityProfileRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = actor_context_from_headers(&headers)?;
-    let metadata = command_metadata_from_headers(
-        &headers,
-        request_hash_payload("update_capability_profile", &request)?,
-    )?;
+    let (request, actor, metadata) = command.into_parts();
     let summary = state
         .update_capability_profile(request.into_command(global_member_id), actor, metadata)
         .await
@@ -315,17 +489,18 @@ async fn update_capability_profile(
     Ok((StatusCode::OK, Json(summary)))
 }
 
+/// Handles memory-ref replacement for one member.
+///
+/// # Errors
+///
+/// Returns stable transport errors when path/header/body parsing fails or when the application
+/// service rejects the submitted memory refs.
 async fn update_memory_refs(
     State(state): State<HttpAppState>,
     Path(global_member_id): Path<String>,
-    headers: HeaderMap,
-    Json(request): Json<UpdateMemoryRefsRequest>,
+    command: CommandRequest<UpdateMemoryRefsRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = actor_context_from_headers(&headers)?;
-    let metadata = command_metadata_from_headers(
-        &headers,
-        request_hash_payload("update_memory_refs", &request)?,
-    )?;
+    let (request, actor, metadata) = command.into_parts();
     let summary = state
         .update_memory_refs(request.into_command(global_member_id), actor, metadata)
         .await
@@ -334,17 +509,18 @@ async fn update_memory_refs(
     Ok((StatusCode::OK, Json(summary)))
 }
 
+/// Handles the tombstone command endpoint for one member.
+///
+/// # Errors
+///
+/// Returns stable transport errors when path/header/body parsing fails or when governance,
+/// archive, or domain validation rejects the tombstone flow.
 async fn tombstone_member(
     State(state): State<HttpAppState>,
     Path(global_member_id): Path<String>,
-    headers: HeaderMap,
-    Json(request): Json<TombstoneMemberRequest>,
+    command: CommandRequest<TombstoneMemberRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = actor_context_from_headers(&headers)?;
-    let metadata = command_metadata_from_headers(
-        &headers,
-        request_hash_payload("tombstone_member", &request)?,
-    )?;
+    let (request, actor, metadata) = command.into_parts();
     let summary = state
         .tombstone_member(request.into_command(global_member_id), actor, metadata)
         .await
@@ -353,12 +529,17 @@ async fn tombstone_member(
     Ok((StatusCode::OK, Json(summary)))
 }
 
+/// Returns the current projection-backed summary for one member.
+///
+/// # Errors
+///
+/// Returns stable transport errors when path/header parsing fails or when the projection query
+/// reports `not_found` or `not_ready` semantics.
 async fn get_member_summary(
     State(state): State<HttpAppState>,
     Path(global_member_id): Path<String>,
-    headers: HeaderMap,
+    TrustedActor(actor): TrustedActor,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = actor_context_from_headers(&headers)?;
     let summary = state
         .get_member_summary(
             GetMemberSummaryQuery {
@@ -372,41 +553,40 @@ async fn get_member_summary(
     Ok((StatusCode::OK, Json(summary)))
 }
 
+/// Returns one audit-trace page for the requested member.
+///
+/// # Errors
+///
+/// Returns stable transport errors when path/header/query parsing fails or when visibility or
+/// member existence checks reject the request.
 async fn get_member_audit_trace(
     State(state): State<HttpAppState>,
     Path(global_member_id): Path<String>,
-    headers: HeaderMap,
-    Query(request): Query<GetMemberAuditTraceRequest>,
+    TrustedActor(actor): TrustedActor,
+    ApiQuery(request): ApiQuery<GetMemberAuditTraceRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = actor_context_from_headers(&headers)?;
-    let page = request.into_page_request()?;
+    let query = request.into_query(global_member_id)?;
     let result = state
-        .get_member_audit_trace(
-            GetMemberAuditTraceQuery {
-                global_member_id: GlobalMemberId::new(global_member_id),
-                page,
-            },
-            actor,
-        )
+        .get_member_audit_trace(query, actor)
         .await
         .map_err(ApiError::from)?;
 
     Ok((StatusCode::OK, Json(result)))
 }
 
+/// Returns local role-catalog summary rows using normalized query filters.
+///
+/// # Errors
+///
+/// Returns stable transport errors when header/query parsing fails or when the query service
+/// rejects unsupported filter values.
 async fn get_role_catalog(
     State(state): State<HttpAppState>,
-    headers: HeaderMap,
-    Query(request): Query<GetRoleCatalogRequest>,
+    TrustedActor(actor): TrustedActor,
+    ApiQuery(request): ApiQuery<GetRoleCatalogRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let actor = actor_context_from_headers(&headers)?;
     let result = state
-        .get_role_catalog(
-            GetRoleCatalogQuery {
-                filter: Some(request.into_filter()?),
-            },
-            actor,
-        )
+        .get_role_catalog(request.into_query()?, actor)
         .await
         .map_err(ApiError::from)?;
 
@@ -428,25 +608,10 @@ fn actor_context_from_headers(headers: &HeaderMap) -> Result<ActorContext, ApiEr
     Ok(ActorContext::new(actor_ref, actor_kind, global_member_id))
 }
 
-/// Builds command metadata from trusted transport headers after the request hash is known.
-fn command_metadata_from_headers(
-    headers: &HeaderMap,
-    request_hash: String,
-) -> Result<CommandMetadata, ApiError> {
-    let idempotency_key = required_header(headers, HEADER_IDEMPOTENCY_KEY)?;
-    let trace_id = required_header(headers, HEADER_TRACE_ID)?;
-
-    Ok(CommandMetadata::new(
-        idempotency_key,
-        trace_id,
-        request_hash,
-    ))
-}
-
 /// Builds a stable request hash payload string from the operation name and serialized request.
 fn request_hash_payload<T>(operation: &'static str, request: &T) -> Result<String, ApiError>
 where
-    T: Serialize,
+    T: Serialize + ?Sized,
 {
     let json = serde_json::to_string(request).map_err(|error| {
         ApiError::bad_request(
@@ -558,6 +723,24 @@ impl ApiError {
     }
 }
 
+impl From<JsonRejection> for ApiError {
+    fn from(rejection: JsonRejection) -> Self {
+        Self::bad_request(
+            "IDENTITY_INVALID_ARGUMENT",
+            format!("request body is invalid: {}", rejection.body_text()),
+        )
+    }
+}
+
+impl From<QueryRejection> for ApiError {
+    fn from(rejection: QueryRejection) -> Self {
+        Self::bad_request(
+            "IDENTITY_INVALID_ARGUMENT",
+            format!("query string is invalid: {}", rejection.body_text()),
+        )
+    }
+}
+
 impl From<IdentityError> for ApiError {
     fn from(error: IdentityError) -> Self {
         match error {
@@ -631,7 +814,9 @@ fn status_for_rule_violation(code: &str) -> StatusCode {
         | "IDENTITY_USE_TOMBSTONE_COMMAND"
         | "IDENTITY_MEMBER_NOT_MUTABLE"
         | "IDENTITY_IDEMPOTENCY_CONFLICT" => StatusCode::CONFLICT,
-        "IDENTITY_INVALID_ARGUMENT" => StatusCode::BAD_REQUEST,
+        "IDENTITY_INVALID_ARGUMENT"
+        | "IDENTITY_ARTIFACT_REF_INVALID"
+        | "IDENTITY_MEMORY_REF_INVALID" => StatusCode::BAD_REQUEST,
         _ => StatusCode::UNPROCESSABLE_ENTITY,
     }
 }
@@ -677,11 +862,10 @@ impl HireGlobalMemberRequest {
                 .collect(),
         }
     }
+}
 
-    /// Builds the stable request-hash payload persisted in `CommandMetadata`.
-    fn request_hash_payload(&self) -> Result<String, ApiError> {
-        request_hash_payload("hire_global_member", self)
-    }
+impl CommandTransportPayload for HireGlobalMemberRequest {
+    const OPERATION: &'static str = "hire_global_member";
 }
 
 /// Transport DTO for lifecycle transitions requested through the HTTP command API.
@@ -707,6 +891,10 @@ impl UpdateLifecycleRequest {
     }
 }
 
+impl CommandTransportPayload for UpdateLifecycleRequest {
+    const OPERATION: &'static str = "update_lifecycle";
+}
+
 /// Transport DTO for full capability-profile replacement through the HTTP command API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UpdateCapabilityProfileRequest {
@@ -730,6 +918,10 @@ impl UpdateCapabilityProfileRequest {
     }
 }
 
+impl CommandTransportPayload for UpdateCapabilityProfileRequest {
+    const OPERATION: &'static str = "update_capability_profile";
+}
+
 /// Transport DTO for memory-ref replacement through the HTTP command API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UpdateMemoryRefsRequest {
@@ -751,6 +943,10 @@ impl UpdateMemoryRefsRequest {
     }
 }
 
+impl CommandTransportPayload for UpdateMemoryRefsRequest {
+    const OPERATION: &'static str = "update_memory_refs";
+}
+
 /// Transport DTO for the high-risk tombstone command endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TombstoneMemberRequest {
@@ -763,6 +959,7 @@ struct TombstoneMemberRequest {
 }
 
 impl TombstoneMemberRequest {
+    /// Converts the transport DTO into the tombstone command scoped to one member id.
     fn into_command(self, global_member_id: String) -> TombstoneMemberCommand {
         TombstoneMemberCommand {
             global_member_id: GlobalMemberId::new(global_member_id),
@@ -771,6 +968,10 @@ impl TombstoneMemberRequest {
             gate_decision_ref: self.gate_decision_ref,
         }
     }
+}
+
+impl CommandTransportPayload for TombstoneMemberRequest {
+    const OPERATION: &'static str = "tombstone_member";
 }
 
 /// Query-string DTO for the audit-trace endpoint.
@@ -783,10 +984,8 @@ struct GetMemberAuditTraceRequest {
 }
 
 impl GetMemberAuditTraceRequest {
-    /// Converts raw query-string fields into the shared page-request DTO.
-    fn into_page_request(
-        self,
-    ) -> Result<Option<crate::domain::shared::pagination::PageRequest>, ApiError> {
+    /// Converts raw query-string fields into the shared audit-trace query DTO.
+    fn into_query(self, global_member_id: String) -> Result<GetMemberAuditTraceQuery, ApiError> {
         let cursor = match self.cursor {
             None => None,
             Some(cursor) => {
@@ -801,14 +1000,19 @@ impl GetMemberAuditTraceRequest {
             }
         };
 
-        if self.limit.is_none() && cursor.is_none() {
-            return Ok(None);
-        }
+        let page = if self.limit.is_none() && cursor.is_none() {
+            None
+        } else {
+            Some(crate::domain::shared::pagination::PageRequest {
+                limit: self.limit,
+                cursor,
+            })
+        };
 
-        Ok(Some(crate::domain::shared::pagination::PageRequest {
-            limit: self.limit,
-            cursor,
-        }))
+        Ok(GetMemberAuditTraceQuery {
+            global_member_id: GlobalMemberId::new(global_member_id),
+            page,
+        })
     }
 }
 
@@ -824,8 +1028,8 @@ struct GetRoleCatalogRequest {
 }
 
 impl GetRoleCatalogRequest {
-    /// Converts raw query-string filters into the shared role-catalog filter DTO.
-    fn into_filter(self) -> Result<RoleCatalogFilter, ApiError> {
+    /// Converts raw query-string filters into the shared role-catalog query DTO.
+    fn into_query(self) -> Result<GetRoleCatalogQuery, ApiError> {
         let role_ids = match self.role_ids {
             None => Vec::new(),
             Some(raw) => raw
@@ -845,10 +1049,12 @@ impl GetRoleCatalogRequest {
                 .collect::<Result<Vec<_>, _>>()?,
         };
 
-        Ok(RoleCatalogFilter {
-            status: self.status,
-            role_ids,
-            keyword: self.keyword,
+        Ok(GetRoleCatalogQuery {
+            filter: Some(RoleCatalogFilter {
+                status: self.status,
+                role_ids,
+                keyword: self.keyword,
+            }),
         })
     }
 }
@@ -1008,9 +1214,9 @@ mod tests {
     use time::{Duration, OffsetDateTime, PrimitiveDateTime};
 
     use super::{
-        ErrorResponse, HEADER_ACTOR_KIND, HEADER_ACTOR_REF, HEADER_IDEMPOTENCY_KEY,
-        HEADER_TRACE_ID, HttpAppState, HttpStubArchiveFailureGuard, rejected_gate_decision_http,
-        router,
+        ErrorResponse, HEADER_ACTOR_KIND, HEADER_ACTOR_MEMBER_ID, HEADER_ACTOR_REF,
+        HEADER_IDEMPOTENCY_KEY, HEADER_TRACE_ID, HttpAppState, HttpStubArchiveFailureGuard,
+        rejected_gate_decision_http, router,
     };
 
     #[tokio::test]
@@ -1151,6 +1357,100 @@ mod tests {
 
         let error: ErrorResponse = read_json_body(second).await;
         assert_eq!(error.error, "IDENTITY_IDEMPOTENCY_CONFLICT");
+    }
+
+    #[tokio::test]
+    async fn command_endpoints_reject_missing_idempotency_header_with_stable_error_shape() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let response = router(HttpAppState::new(pool))
+            .oneshot(json_request_without_idempotency(
+                "POST",
+                "/identity/global-members",
+                "trace-http-hire-missing-idem",
+                json!({
+                    "display_name": "Member Missing Idem",
+                    "main_role_id": "role.member.operator",
+                    "secondary_role_ids": []
+                }),
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: ErrorResponse = read_json_body(response).await;
+        assert_eq!(error.error, "IDENTITY_INVALID_ARGUMENT");
+        assert!(error.message.contains(HEADER_IDEMPOTENCY_KEY));
+    }
+
+    #[tokio::test]
+    async fn query_endpoints_reject_ai_actor_without_member_id_with_stable_error_shape() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+
+        let response = router(HttpAppState::new(pool))
+            .oneshot(summary_request_as_ai_without_member_id(
+                "member:missing-ai-header",
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: ErrorResponse = read_json_body(response).await;
+        assert_eq!(error.error, "IDENTITY_INVALID_ARGUMENT");
+        assert!(error.message.contains(HEADER_ACTOR_MEMBER_ID));
+    }
+
+    #[tokio::test]
+    async fn query_endpoints_map_query_parse_failures_into_stable_error_shape() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+
+        let response = router(HttpAppState::new(pool))
+            .oneshot(audit_trace_request(
+                "member-query-parse-001",
+                Some("limit=abc"),
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: ErrorResponse = read_json_body(response).await;
+        assert_eq!(error.error, "IDENTITY_INVALID_ARGUMENT");
+        assert!(error.message.contains("query string is invalid"));
+    }
+
+    #[tokio::test]
+    async fn command_endpoints_map_json_parse_failures_into_stable_error_shape() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let response = router(HttpAppState::new(pool))
+            .oneshot(invalid_json_request(
+                "POST",
+                "/identity/global-members",
+                "idem-http-hire-invalid-json",
+                "trace-http-hire-invalid-json",
+                "{",
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: ErrorResponse = read_json_body(response).await;
+        assert_eq!(error.error, "IDENTITY_INVALID_ARGUMENT");
+        assert!(error.message.contains("request body is invalid"));
     }
 
     #[tokio::test]
@@ -1826,6 +2126,17 @@ mod tests {
             .expect("request should build")
     }
 
+    fn summary_request_as_ai_without_member_id(global_member_id: &str) -> Request<Body> {
+        Request::builder()
+            .uri(format!(
+                "/identity/global-members/{global_member_id}/summary"
+            ))
+            .header(HEADER_ACTOR_REF, "ai/member-http")
+            .header(HEADER_ACTOR_KIND, "ai_member")
+            .body(Body::empty())
+            .expect("request should build")
+    }
+
     fn audit_trace_request(global_member_id: &str, query: Option<&str>) -> Request<Body> {
         let mut uri = format!("/identity/global-members/{global_member_id}/audit-trace");
         if let Some(query) = query {
@@ -1944,6 +2255,43 @@ mod tests {
             .header(HEADER_IDEMPOTENCY_KEY, idempotency_key)
             .header(HEADER_TRACE_ID, trace_id)
             .body(Body::from(body))
+            .expect("request should build")
+    }
+
+    fn json_request_without_idempotency(
+        method: &str,
+        uri: &str,
+        trace_id: &str,
+        payload: serde_json::Value,
+    ) -> Request<Body> {
+        let body = serde_json::to_vec(&payload).expect("payload should serialize");
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header(HEADER_ACTOR_REF, "human/admin-http")
+            .header(HEADER_ACTOR_KIND, "human")
+            .header(HEADER_TRACE_ID, trace_id)
+            .body(Body::from(body))
+            .expect("request should build")
+    }
+
+    fn invalid_json_request(
+        method: &str,
+        uri: &str,
+        idempotency_key: &str,
+        trace_id: &str,
+        invalid_body: &str,
+    ) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header(HEADER_ACTOR_REF, "human/admin-http")
+            .header(HEADER_ACTOR_KIND, "human")
+            .header(HEADER_IDEMPOTENCY_KEY, idempotency_key)
+            .header(HEADER_TRACE_ID, trace_id)
+            .body(Body::from(invalid_body.to_string()))
             .expect("request should build")
     }
 

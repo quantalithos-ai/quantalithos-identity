@@ -370,6 +370,8 @@ fn trim_member_summary(
     projection: MemberSummaryProjection,
     _actor: &ActorContext,
 ) -> MemberSummaryDto {
+    // NOTE: The current summary DTO is already projection-safe and excludes upstream raw bodies,
+    // so every actor class receives the same field set until a stricter policy is designed.
     MemberSummaryDto::from_projection(projection)
 }
 
@@ -390,6 +392,8 @@ fn can_view_member_trace(actor: &ActorContext, global_member_id: &GlobalMemberId
     match actor.actor_kind {
         ActorKind::HumanUser => true,
         ActorKind::AiMember => actor.actor_member_id() == Some(global_member_id),
+        // CAUTION: System callers are intentionally blocked here so internal jobs do not
+        // accidentally turn this endpoint into a generic audit-log dump path.
         ActorKind::System => false,
     }
 }
