@@ -1,5 +1,8 @@
 //! HTTP route registration and first real command/query adapters.
 
+#[cfg(test)]
+use std::sync::Mutex;
+
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -7,6 +10,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPool;
+use time::{OffsetDateTime, PrimitiveDateTime};
 use tokio::runtime::Handle;
 
 use crate::application::capability_profile::CapabilityProfileCommandService;
@@ -15,18 +19,22 @@ use crate::application::memory_refs::MemoryRefsCommandService;
 use crate::application::query_projection::{
     GetMemberSummaryQuery, MemberSummaryDto, QueryProjectionService,
 };
+use crate::application::tombstone_flow::TombstoneFlowService;
 use crate::domain::capability_profile::{
     ArtifactRef, CapabilityItem, CapabilityProfileSummary, UpdateCapabilityProfileCommand,
 };
 use crate::domain::member::{
     GlobalMemberLifecycle, GlobalMemberSummary, HireGlobalMemberCommand, UpdateLifecycleCommand,
 };
-use crate::domain::memory_refs::{MemoryRef, MemoryRefsSummary, UpdateMemoryRefsCommand};
+use crate::domain::memory_refs::{
+    ArchiveRef, MemoryRef, MemoryRefsSummary, UpdateMemoryRefsCommand,
+};
 use crate::domain::shared::context::{ActorContext, ActorKind};
-use crate::domain::shared::ids::{GlobalMemberId, RoleId};
+use crate::domain::shared::ids::{GateDecisionId, GlobalMemberId, RoleId};
 use crate::domain::shared::metadata::CommandMetadata;
+use crate::domain::tombstone::{GateDecision, GateDecisionRef, TombstoneMemberCommand};
 use crate::error::IdentityError;
-use crate::outbound::{ArtifactPort, MemoryArchivePort};
+use crate::outbound::{ArchiveRequestPort, ArtifactPort, GovernancePort, MemoryArchivePort};
 use crate::persistence::unit_of_work::SqlxUnitOfWorkFactory;
 
 const HEADER_ACTOR_REF: &str = "x-identity-actor-ref";
@@ -149,6 +157,26 @@ impl HttpAppState {
             message: format!("update_memory_refs task join failed: {error}"),
         })?
     }
+
+    async fn tombstone_member(
+        &self,
+        command: TombstoneMemberCommand,
+        actor: ActorContext,
+        metadata: CommandMetadata,
+    ) -> Result<GlobalMemberSummary, IdentityError> {
+        let factory = self.unit_of_work_factory();
+        tokio::task::spawn_blocking(move || {
+            Handle::current().block_on(async move {
+                TombstoneFlowService::new(factory, HttpStubGovernancePort, HttpStubArchiveRequester)
+                    .tombstone_member(command, actor, metadata)
+                    .await
+            })
+        })
+        .await
+        .map_err(|error| IdentityError::PersistenceData {
+            message: format!("tombstone_member task join failed: {error}"),
+        })?
+    }
 }
 
 /// Builds the HTTP router for the current service state.
@@ -261,8 +289,23 @@ async fn update_memory_refs(
     Ok((StatusCode::OK, Json(summary)))
 }
 
-async fn tombstone_member(Path(_global_member_id): Path<String>) -> impl IntoResponse {
-    not_implemented("TombstoneMember")
+async fn tombstone_member(
+    State(state): State<HttpAppState>,
+    Path(global_member_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<TombstoneMemberRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = actor_context_from_headers(&headers)?;
+    let metadata = command_metadata_from_headers(
+        &headers,
+        request_hash_payload("tombstone_member", &request)?,
+    )?;
+    let summary = state
+        .tombstone_member(request.into_command(global_member_id), actor, metadata)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok((StatusCode::OK, Json(summary)))
 }
 
 async fn get_member_summary(
@@ -377,6 +420,36 @@ fn required_header(headers: &HeaderMap, name: &'static str) -> Result<String, Ap
     Ok(value)
 }
 
+fn approved_gate_decision_http(gate_decision_id: &str) -> GateDecisionRef {
+    GateDecisionRef {
+        gate_decision_id: GateDecisionId::new(gate_decision_id),
+        decision: GateDecision::Approved,
+        policy_ref_json: serde_json::json!({
+            "kind": "governance_policy",
+            "id": "policy-http-default",
+        }),
+        decided_at: gate_decision_decided_at_http(),
+    }
+}
+
+#[cfg(test)]
+fn rejected_gate_decision_http(gate_decision_id: &str) -> GateDecisionRef {
+    GateDecisionRef {
+        gate_decision_id: GateDecisionId::new(gate_decision_id),
+        decision: GateDecision::Rejected,
+        policy_ref_json: serde_json::json!({
+            "kind": "governance_policy",
+            "id": "policy-http-rejected",
+        }),
+        decided_at: gate_decision_decided_at_http(),
+    }
+}
+
+fn gate_decision_decided_at_http() -> PrimitiveDateTime {
+    let now = OffsetDateTime::now_utc();
+    PrimitiveDateTime::new(now.date(), now.time())
+}
+
 fn not_implemented(operation: &'static str) -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,
@@ -471,6 +544,8 @@ fn status_for_rule_violation(code: &str) -> StatusCode {
     match code {
         "IDENTITY_MEMBER_NOT_FOUND" | "IDENTITY_ROLE_NOT_FOUND" => StatusCode::NOT_FOUND,
         "IDENTITY_PROJECTION_NOT_READY" => StatusCode::SERVICE_UNAVAILABLE,
+        "IDENTITY_MEMORY_ARCHIVE_UNAVAILABLE" => StatusCode::SERVICE_UNAVAILABLE,
+        "IDENTITY_GATE_REJECTED" => StatusCode::FORBIDDEN,
         "IDENTITY_LIFECYCLE_TRANSITION_INVALID"
         | "IDENTITY_USE_TOMBSTONE_COMMAND"
         | "IDENTITY_MEMBER_NOT_MUTABLE"
@@ -588,6 +663,24 @@ impl UpdateMemoryRefsRequest {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TombstoneMemberRequest {
+    reason: String,
+    expected_version: Option<i64>,
+    gate_decision_ref: Option<GateDecisionRef>,
+}
+
+impl TombstoneMemberRequest {
+    fn into_command(self, global_member_id: String) -> TombstoneMemberCommand {
+        TombstoneMemberCommand {
+            global_member_id: GlobalMemberId::new(global_member_id),
+            reason: self.reason,
+            expected_version: self.expected_version,
+            gate_decision_ref: self.gate_decision_ref,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct NoopArtifactPort;
 
@@ -608,6 +701,81 @@ impl MemoryArchivePort for NoopMemoryArchivePort {
     async fn validate_ref(&self, memory_ref: &MemoryRef) -> Result<(), IdentityError> {
         memory_ref.validate()?;
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct HttpStubGovernancePort;
+
+impl GovernancePort for HttpStubGovernancePort {
+    async fn require_gate_decision(
+        &self,
+        _action_name: &str,
+        _member: &crate::domain::member::GlobalMember,
+        _actor: &ActorContext,
+        _reason: &str,
+        supplied_gate_ref: Option<&GateDecisionRef>,
+    ) -> Result<GateDecisionRef, IdentityError> {
+        if let Some(gate_ref) = supplied_gate_ref {
+            return Ok(gate_ref.clone());
+        }
+
+        Ok(approved_gate_decision_http("gate-http-default"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct HttpStubArchiveRequester;
+
+impl ArchiveRequestPort for HttpStubArchiveRequester {
+    async fn request_archive(
+        &self,
+        global_member_id: &GlobalMemberId,
+        _reason: &str,
+    ) -> Result<ArchiveRef, IdentityError> {
+        #[cfg(test)]
+        if let Some(message) = http_stub_archive_failure_message() {
+            return Err(IdentityError::PersistenceData { message });
+        }
+
+        Ok(ArchiveRef {
+            archive_id: format!("archive:{}", global_member_id.as_str()),
+            archive_kind: "memory_archive".to_string(),
+            archive_version: Some("v1".to_string()),
+        })
+    }
+}
+
+#[cfg(test)]
+static HTTP_STUB_ARCHIVE_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+
+#[cfg(test)]
+fn http_stub_archive_failure_message() -> Option<String> {
+    HTTP_STUB_ARCHIVE_FAILURE
+        .lock()
+        .expect("lock archive failure override")
+        .clone()
+}
+
+#[cfg(test)]
+struct HttpStubArchiveFailureGuard;
+
+#[cfg(test)]
+impl HttpStubArchiveFailureGuard {
+    fn failing(message: &str) -> Self {
+        *HTTP_STUB_ARCHIVE_FAILURE
+            .lock()
+            .expect("lock archive failure override") = Some(message.to_string());
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for HttpStubArchiveFailureGuard {
+    fn drop(&mut self) {
+        *HTTP_STUB_ARCHIVE_FAILURE
+            .lock()
+            .expect("lock archive failure override") = None;
     }
 }
 
@@ -637,7 +805,8 @@ mod tests {
 
     use super::{
         ErrorResponse, HEADER_ACTOR_KIND, HEADER_ACTOR_REF, HEADER_IDEMPOTENCY_KEY,
-        HEADER_TRACE_ID, HttpAppState, router,
+        HEADER_TRACE_ID, HttpAppState, HttpStubArchiveFailureGuard, rejected_gate_decision_http,
+        router,
     };
 
     #[tokio::test]
@@ -1167,6 +1336,164 @@ mod tests {
         assert_eq!(error.error, "IDENTITY_INVALID_ARGUMENT");
     }
 
+    #[tokio::test]
+    async fn tombstone_member_endpoint_tombstones_member_without_supplied_gate_ref() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let app = router(HttpAppState::new(pool.clone()));
+        let hire = app
+            .clone()
+            .oneshot(hire_request(
+                "idem-http-tombstone-hire-001",
+                "trace-http-tombstone-hire-001",
+                json!({
+                    "display_name": "Member Tombstone Http",
+                    "main_role_id": "role.member.operator",
+                    "secondary_role_ids": []
+                }),
+            ))
+            .await
+            .expect("hire request should succeed");
+        let member: GlobalMemberSummary = read_json_body(hire).await;
+
+        let response = app
+            .oneshot(tombstone_member_request(
+                member.global_member_id.as_str(),
+                "idem-http-tombstone-001",
+                "trace-http-tombstone-001",
+                json!({
+                    "reason": "tombstone through http",
+                    "expected_version": 0
+                }),
+            ))
+            .await
+            .expect("tombstone request should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let summary: GlobalMemberSummary = read_json_body(response).await;
+        assert_eq!(summary.lifecycle, GlobalMemberLifecycle::Tombstoned);
+
+        let persisted_lifecycle =
+            sqlx::query("SELECT lifecycle FROM global_members WHERE global_member_id = $1")
+                .bind(summary.global_member_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("member row should exist after tombstone")
+                .get::<String, _>("lifecycle");
+
+        assert_eq!(persisted_lifecycle, "tombstoned");
+    }
+
+    #[tokio::test]
+    async fn tombstone_member_endpoint_rejects_rejected_gate_decision() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let app = router(HttpAppState::new(pool.clone()));
+        let hire = app
+            .clone()
+            .oneshot(hire_request(
+                "idem-http-tombstone-hire-002",
+                "trace-http-tombstone-hire-002",
+                json!({
+                    "display_name": "Member Tombstone Rejected Http",
+                    "main_role_id": "role.member.operator",
+                    "secondary_role_ids": []
+                }),
+            ))
+            .await
+            .expect("hire request should succeed");
+        let member: GlobalMemberSummary = read_json_body(hire).await;
+
+        let response = app
+            .oneshot(tombstone_member_request(
+                member.global_member_id.as_str(),
+                "idem-http-tombstone-002",
+                "trace-http-tombstone-002",
+                json!({
+                    "reason": "gate rejected",
+                    "expected_version": 0,
+                    "gate_decision_ref": rejected_gate_decision_http("gate-http-rejected-001")
+                }),
+            ))
+            .await
+            .expect("tombstone request should respond");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let error: ErrorResponse = read_json_body(response).await;
+        assert_eq!(error.error, "IDENTITY_GATE_REJECTED");
+
+        let persisted_lifecycle =
+            sqlx::query("SELECT lifecycle FROM global_members WHERE global_member_id = $1")
+                .bind(member.global_member_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("member row should remain available")
+                .get::<String, _>("lifecycle");
+
+        assert_eq!(persisted_lifecycle, "hired");
+    }
+
+    #[tokio::test]
+    async fn tombstone_member_endpoint_returns_unavailable_when_archive_request_fails() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let app = router(HttpAppState::new(pool.clone()));
+        let hire = app
+            .clone()
+            .oneshot(hire_request(
+                "idem-http-tombstone-hire-003",
+                "trace-http-tombstone-hire-003",
+                json!({
+                    "display_name": "Member Tombstone Archive Failure Http",
+                    "main_role_id": "role.member.operator",
+                    "secondary_role_ids": []
+                }),
+            ))
+            .await
+            .expect("hire request should succeed");
+        let member: GlobalMemberSummary = read_json_body(hire).await;
+        let _archive_failure = HttpStubArchiveFailureGuard::failing("archive service unavailable");
+
+        let response = app
+            .oneshot(tombstone_member_request(
+                member.global_member_id.as_str(),
+                "idem-http-tombstone-003",
+                "trace-http-tombstone-003",
+                json!({
+                    "reason": "archive unavailable",
+                    "expected_version": 0
+                }),
+            ))
+            .await
+            .expect("tombstone request should respond");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let error: ErrorResponse = read_json_body(response).await;
+        assert_eq!(error.error, "IDENTITY_MEMORY_ARCHIVE_UNAVAILABLE");
+
+        let persisted_lifecycle =
+            sqlx::query("SELECT lifecycle FROM global_members WHERE global_member_id = $1")
+                .bind(member.global_member_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("member row should remain available")
+                .get::<String, _>("lifecycle");
+
+        assert_eq!(persisted_lifecycle, "hired");
+    }
+
     fn hire_request(
         idempotency_key: &str,
         trace_id: &str,
@@ -1235,6 +1562,21 @@ mod tests {
         json_request(
             "PUT",
             &format!("/identity/global-members/{global_member_id}/memory-refs"),
+            idempotency_key,
+            trace_id,
+            payload,
+        )
+    }
+
+    fn tombstone_member_request(
+        global_member_id: &str,
+        idempotency_key: &str,
+        trace_id: &str,
+        payload: serde_json::Value,
+    ) -> Request<Body> {
+        json_request(
+            "POST",
+            &format!("/identity/global-members/{global_member_id}/tombstone"),
             idempotency_key,
             trace_id,
             payload,
