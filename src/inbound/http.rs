@@ -47,6 +47,7 @@ const HEADER_IDEMPOTENCY_KEY: &str = "idempotency-key";
 /// Shared HTTP application state for the first production adapter slice.
 #[derive(Debug, Clone)]
 pub struct HttpAppState {
+    /// Shared PostgreSQL pool cloned into each request-scoped service bridge.
     pool: PgPool,
 }
 
@@ -59,6 +60,11 @@ impl HttpAppState {
     fn unit_of_work_factory(&self) -> SqlxUnitOfWorkFactory {
         SqlxUnitOfWorkFactory::new(self.pool.clone())
     }
+
+    // NOTE: The service bridges below intentionally use `spawn_blocking` plus
+    // `Handle::block_on` during the current phase. This keeps the HTTP adapter aligned with the
+    // existing transaction-scoped application-service construction path while ensuring request
+    // state is moved, not borrowed, across the blocking worker boundary.
 
     async fn hire_global_member(
         &self,
@@ -407,6 +413,7 @@ async fn get_role_catalog(
     Ok((StatusCode::OK, Json(result)))
 }
 
+/// Builds one trusted actor context snapshot from the identity HTTP headers.
 fn actor_context_from_headers(headers: &HeaderMap) -> Result<ActorContext, ApiError> {
     let actor_ref = required_header(headers, HEADER_ACTOR_REF)?;
     let actor_kind = actor_kind_from_header(&required_header(headers, HEADER_ACTOR_KIND)?)?;
@@ -421,6 +428,7 @@ fn actor_context_from_headers(headers: &HeaderMap) -> Result<ActorContext, ApiEr
     Ok(ActorContext::new(actor_ref, actor_kind, global_member_id))
 }
 
+/// Builds command metadata from trusted transport headers after the request hash is known.
 fn command_metadata_from_headers(
     headers: &HeaderMap,
     request_hash: String,
@@ -435,6 +443,7 @@ fn command_metadata_from_headers(
     ))
 }
 
+/// Builds a stable request hash payload string from the operation name and serialized request.
 fn request_hash_payload<T>(operation: &'static str, request: &T) -> Result<String, ApiError>
 where
     T: Serialize,
@@ -449,6 +458,7 @@ where
     Ok(format!("{operation}|payload={json}"))
 }
 
+/// Parses the canonical transport representation of one actor kind.
 fn actor_kind_from_header(value: &str) -> Result<ActorKind, ApiError> {
     match value {
         "human" | "human_user" => Ok(ActorKind::HumanUser),
@@ -463,6 +473,7 @@ fn actor_kind_from_header(value: &str) -> Result<ActorKind, ApiError> {
     }
 }
 
+/// Loads one required trusted header and rejects missing, non-UTF8, or blank values.
 fn required_header(headers: &HeaderMap, name: &'static str) -> Result<String, ApiError> {
     let value = headers
         .get(name)
@@ -492,6 +503,7 @@ fn required_header(headers: &HeaderMap, name: &'static str) -> Result<String, Ap
     Ok(value)
 }
 
+/// Builds default approved governance evidence for HTTP-only tombstone adapter tests and stubs.
 fn approved_gate_decision_http(gate_decision_id: &str) -> GateDecisionRef {
     GateDecisionRef {
         gate_decision_id: GateDecisionId::new(gate_decision_id),
@@ -505,6 +517,7 @@ fn approved_gate_decision_http(gate_decision_id: &str) -> GateDecisionRef {
 }
 
 #[cfg(test)]
+/// Builds rejected governance evidence for HTTP tombstone transport tests.
 fn rejected_gate_decision_http(gate_decision_id: &str) -> GateDecisionRef {
     GateDecisionRef {
         gate_decision_id: GateDecisionId::new(gate_decision_id),
@@ -517,18 +530,23 @@ fn rejected_gate_decision_http(gate_decision_id: &str) -> GateDecisionRef {
     }
 }
 
+/// Returns the current UTC timestamp in the primitive form used by governance evidence refs.
 fn gate_decision_decided_at_http() -> PrimitiveDateTime {
     let now = OffsetDateTime::now_utc();
     PrimitiveDateTime::new(now.date(), now.time())
 }
 
+/// Transport-local error envelope used to map domain and persistence failures into HTTP.
 #[derive(Debug)]
 struct ApiError {
+    /// Final HTTP status returned to the caller.
     status: StatusCode,
+    /// Stable machine-readable error body.
     body: ErrorResponse,
 }
 
 impl ApiError {
+    /// Creates one bad-request error with the stable identity error response shape.
     fn bad_request(error: &'static str, message: String) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -602,6 +620,7 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Maps stable identity rule-violation codes into the documented HTTP status contract.
 fn status_for_rule_violation(code: &str) -> StatusCode {
     match code {
         "IDENTITY_MEMBER_NOT_FOUND" | "IDENTITY_ROLE_NOT_FOUND" => StatusCode::NOT_FOUND,
@@ -646,6 +665,7 @@ struct HireGlobalMemberRequest {
 }
 
 impl HireGlobalMemberRequest {
+    /// Converts the transport DTO into the command DTO consumed by the lifecycle service.
     fn into_command(self) -> HireGlobalMemberCommand {
         HireGlobalMemberCommand {
             display_name: self.display_name,
@@ -658,19 +678,25 @@ impl HireGlobalMemberRequest {
         }
     }
 
+    /// Builds the stable request-hash payload persisted in `CommandMetadata`.
     fn request_hash_payload(&self) -> Result<String, ApiError> {
         request_hash_payload("hire_global_member", self)
     }
 }
 
+/// Transport DTO for lifecycle transitions requested through the HTTP command API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UpdateLifecycleRequest {
+    /// Target lifecycle requested by the caller.
     target_lifecycle: GlobalMemberLifecycle,
+    /// Human-readable reason retained in audit and history.
     reason: String,
+    /// Optional optimistic-lock version expected by the caller.
     expected_version: Option<i64>,
 }
 
 impl UpdateLifecycleRequest {
+    /// Converts the transport DTO into the lifecycle command scoped to one member id.
     fn into_command(self, global_member_id: String) -> UpdateLifecycleCommand {
         UpdateLifecycleCommand {
             global_member_id: GlobalMemberId::new(global_member_id),
@@ -681,14 +707,19 @@ impl UpdateLifecycleRequest {
     }
 }
 
+/// Transport DTO for full capability-profile replacement through the HTTP command API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UpdateCapabilityProfileRequest {
+    /// Full capability snapshot that replaces the current local summary.
     capabilities: Vec<CapabilityItem>,
+    /// Evidence refs retained as ref-only artifacts.
     evidence_refs: Vec<ArtifactRef>,
+    /// Optional optimistic-lock version expected by the caller.
     expected_version: Option<i64>,
 }
 
 impl UpdateCapabilityProfileRequest {
+    /// Converts the transport DTO into the capability-profile command for one member.
     fn into_command(self, global_member_id: String) -> UpdateCapabilityProfileCommand {
         UpdateCapabilityProfileCommand {
             global_member_id: GlobalMemberId::new(global_member_id),
@@ -699,14 +730,18 @@ impl UpdateCapabilityProfileRequest {
     }
 }
 
+/// Transport DTO for memory-ref replacement through the HTTP command API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UpdateMemoryRefsRequest {
+    /// Optional semantic memory ref snapshot retained for the member.
     semantic_memory_ref: Option<MemoryRef>,
+    /// Optional episodic memory ref snapshots retained for the member.
     #[serde(default)]
     episodic_memory_refs: Vec<MemoryRef>,
 }
 
 impl UpdateMemoryRefsRequest {
+    /// Converts the transport DTO into the memory-ref command for one member.
     fn into_command(self, global_member_id: String) -> UpdateMemoryRefsCommand {
         UpdateMemoryRefsCommand {
             global_member_id: GlobalMemberId::new(global_member_id),
@@ -716,10 +751,14 @@ impl UpdateMemoryRefsRequest {
     }
 }
 
+/// Transport DTO for the high-risk tombstone command endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TombstoneMemberRequest {
+    /// Human-readable reason retained for audit and archive coordination.
     reason: String,
+    /// Optional optimistic-lock version expected by the caller.
     expected_version: Option<i64>,
+    /// Optional governance evidence supplied by the caller when already available.
     gate_decision_ref: Option<GateDecisionRef>,
 }
 
@@ -734,13 +773,17 @@ impl TombstoneMemberRequest {
     }
 }
 
+/// Query-string DTO for the audit-trace endpoint.
 #[derive(Debug, Clone, Deserialize, Default)]
 struct GetMemberAuditTraceRequest {
+    /// Optional page size override passed as `?limit=<u32>`.
     limit: Option<u32>,
+    /// Optional opaque pagination cursor passed as `?cursor=<audit_trace_id>`.
     cursor: Option<String>,
 }
 
 impl GetMemberAuditTraceRequest {
+    /// Converts raw query-string fields into the shared page-request DTO.
     fn into_page_request(
         self,
     ) -> Result<Option<crate::domain::shared::pagination::PageRequest>, ApiError> {
@@ -769,14 +812,19 @@ impl GetMemberAuditTraceRequest {
     }
 }
 
+/// Query-string DTO for the role-catalog endpoint.
 #[derive(Debug, Clone, Deserialize, Default)]
 struct GetRoleCatalogRequest {
+    /// Optional status filter passed as `?status=active|deprecated|source_drift`.
     status: Option<String>,
+    /// Optional comma-separated role id subset passed as `?role_ids=id1,id2`.
     role_ids: Option<String>,
+    /// Optional case-insensitive display-name keyword passed as `?keyword=value`.
     keyword: Option<String>,
 }
 
 impl GetRoleCatalogRequest {
+    /// Converts raw query-string filters into the shared role-catalog filter DTO.
     fn into_filter(self) -> Result<RoleCatalogFilter, ApiError> {
         let role_ids = match self.role_ids {
             None => Vec::new(),
@@ -805,6 +853,10 @@ impl GetRoleCatalogRequest {
     }
 }
 
+/// Artifact-port stub used by the current HTTP adapter phase.
+///
+/// NOTE: This stub only validates local artifact-ref shape. It does not prove upstream artifact
+/// existence, authorization, or reachability.
 #[derive(Debug, Clone, Copy, Default)]
 struct NoopArtifactPort;
 
@@ -818,6 +870,10 @@ impl ArtifactPort for NoopArtifactPort {
     }
 }
 
+/// Memory-archive validation stub used by the current HTTP adapter phase.
+///
+/// NOTE: This stub only validates local memory-ref shape. It does not call the real memory-archive
+/// boundary or reserve external archive capacity.
 #[derive(Debug, Clone, Copy, Default)]
 struct NoopMemoryArchivePort;
 
@@ -828,6 +884,11 @@ impl MemoryArchivePort for NoopMemoryArchivePort {
     }
 }
 
+/// Governance-port stub used by the tombstone HTTP adapter.
+///
+/// CAUTION: When the caller omits governance evidence, this stub synthesizes a default approved
+/// decision so the local transport flow can be exercised before the real governance integration
+/// lands. Successful tombstone requests here therefore do not prove end-to-end governance checks.
 #[derive(Debug, Clone, Copy, Default)]
 struct HttpStubGovernancePort;
 
@@ -848,6 +909,10 @@ impl GovernancePort for HttpStubGovernancePort {
     }
 }
 
+/// Archive-request stub used by the tombstone HTTP adapter.
+///
+/// CAUTION: This stub fabricates archive refs locally and only exposes failure injection in tests.
+/// It does not prove downstream archive acceptance, persistence, or recovery semantics.
 #[derive(Debug, Clone, Copy, Default)]
 struct HttpStubArchiveRequester;
 
@@ -882,10 +947,12 @@ fn http_stub_archive_failure_message() -> Option<String> {
 }
 
 #[cfg(test)]
+/// Test-only guard that forces the HTTP archive requester stub to fail while it is held.
 struct HttpStubArchiveFailureGuard;
 
 #[cfg(test)]
 impl HttpStubArchiveFailureGuard {
+    /// Enables deterministic archive-request failure injection for the duration of the guard.
     fn failing(message: &str) -> Self {
         *HTTP_STUB_ARCHIVE_FAILURE
             .lock()
@@ -2004,6 +2071,8 @@ mod tests {
         }
     }
 
+    /// Seeds one member audit trail through application services so HTTP audit queries can verify
+    /// pagination and field trimming on realistic append-only rows.
     async fn seed_member_audit_trail_http(
         pool: &sqlx::postgres::PgPool,
     ) -> crate::domain::member::GlobalMemberSummary {
@@ -2072,6 +2141,7 @@ mod tests {
         member
     }
 
+    /// Adjusts one local role-catalog row for HTTP query filter tests.
     async fn update_role_catalog_row_http(
         pool: &sqlx::postgres::PgPool,
         role_id: &str,
@@ -2089,6 +2159,7 @@ mod tests {
         .expect("update role catalog row");
     }
 
+    /// Reorders audit rows deterministically so pagination assertions do not depend on runtime timing.
     async fn update_audit_created_at_http(
         pool: &sqlx::postgres::PgPool,
         audit_trace_id: &str,
@@ -2102,6 +2173,7 @@ mod tests {
             .expect("update audit trace created_at");
     }
 
+    /// Builds one deterministic work-fact event used to seed HTTP audit-trace tests.
     fn sample_work_event_http(global_member_id: &str) -> InboundWorkFactEvent {
         InboundWorkFactEvent {
             envelope: InboundEventEnvelope {
@@ -2129,6 +2201,7 @@ mod tests {
         }
     }
 
+    /// Returns the current UTC timestamp in the primitive form used by HTTP test fixtures.
     fn now_http() -> PrimitiveDateTime {
         let now = OffsetDateTime::now_utc();
         PrimitiveDateTime::new(now.date(), now.time())

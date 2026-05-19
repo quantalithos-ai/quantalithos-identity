@@ -58,7 +58,7 @@ pub trait RoleCatalogRepository {
         &mut self,
     ) -> impl std::future::Future<Output = Result<Vec<RoleCatalogEntry>, IdentityError>> + Send;
 
-    /// Lists local role catalog rows after applying in-memory query-side filtering semantics.
+    /// Lists local role catalog rows for query-side filtering and DTO assembly.
     fn list(
         &mut self,
     ) -> impl std::future::Future<Output = Result<Vec<RoleCatalogEntry>, IdentityError>> + Send;

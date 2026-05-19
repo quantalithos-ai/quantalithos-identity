@@ -63,10 +63,10 @@ pub struct GetRoleCatalogQuery {
 pub struct RoleCatalogFilter {
     /// Optional local status filter: `active`, `deprecated`, or `source_drift`.
     pub status: Option<String>,
-    /// Optional explicit role-id subset filter.
+    /// Optional explicit role-id subset filter matched by exact local role id.
     #[serde(default)]
     pub role_ids: Vec<RoleId>,
-    /// Optional case-insensitive keyword matched against the cached display name.
+    /// Optional case-insensitive keyword matched against the cached local display name.
     pub keyword: Option<String>,
 }
 
@@ -162,6 +162,7 @@ impl MemberSummaryDto {
 }
 
 impl AuditTraceDto {
+    /// Builds one audit DTO without field trimming for callers that may inspect the full entry.
     fn from_entry(entry: AuditTraceEntry) -> Self {
         Self {
             audit_trace_id: entry.audit_trace_id,
@@ -176,6 +177,7 @@ impl AuditTraceDto {
         }
     }
 
+    /// Builds one audit DTO after removing fields hidden from the current caller class.
     fn from_trimmed_entry(entry: AuditTraceEntry) -> Self {
         Self {
             audit_trace_id: entry.audit_trace_id,
@@ -192,6 +194,7 @@ impl AuditTraceDto {
 }
 
 impl RoleCatalogEntryDto {
+    /// Builds the read-facing DTO from one persisted local role-catalog entry.
     fn from_entry(entry: RoleCatalogEntry) -> Self {
         Self {
             role_id: entry.role_id,
@@ -333,6 +336,14 @@ where
     }
 
     /// Lists local role-catalog summary rows without reading upstream role-definition bodies.
+    ///
+    /// The current query path does not apply actor-based field trimming because every returned
+    /// field is already part of the identity-local role index summary.
+    ///
+    /// # Errors
+    ///
+    /// Returns `IDENTITY_INVALID_ARGUMENT` when the supplied filter contains an unsupported status
+    /// value or a blank keyword after trimming.
     pub async fn get_role_catalog(
         &self,
         query: GetRoleCatalogQuery,
@@ -354,6 +365,7 @@ where
     }
 }
 
+/// Applies any read-side field trimming required by the current caller.
 fn trim_member_summary(
     projection: MemberSummaryProjection,
     _actor: &ActorContext,
@@ -361,6 +373,7 @@ fn trim_member_summary(
     MemberSummaryDto::from_projection(projection)
 }
 
+/// Trims one audit-trace page according to the caller visibility policy.
 fn trim_audit_trace(traces: Vec<AuditTraceEntry>, actor: &ActorContext) -> Vec<AuditTraceDto> {
     match actor.actor_kind {
         ActorKind::HumanUser => traces.into_iter().map(AuditTraceDto::from_entry).collect(),
@@ -372,6 +385,7 @@ fn trim_audit_trace(traces: Vec<AuditTraceEntry>, actor: &ActorContext) -> Vec<A
     }
 }
 
+/// Returns whether the current caller may read the requested member audit trail.
 fn can_view_member_trace(actor: &ActorContext, global_member_id: &GlobalMemberId) -> bool {
     match actor.actor_kind {
         ActorKind::HumanUser => true,
@@ -380,6 +394,7 @@ fn can_view_member_trace(actor: &ActorContext, global_member_id: &GlobalMemberId
     }
 }
 
+/// Expands the repository page size by one row so the caller can derive `next_cursor`.
 fn page_for_fetch(page: &NormalizedPageRequest) -> NormalizedPageRequest {
     NormalizedPageRequest {
         limit: page.limit.saturating_add(1),
@@ -387,13 +402,18 @@ fn page_for_fetch(page: &NormalizedPageRequest) -> NormalizedPageRequest {
     }
 }
 
+/// Normalized role-catalog filter used after transport or DTO-level cleanup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NormalizedRoleCatalogFilter {
+    /// Optional validated local status filter.
     status: Option<RoleCatalogStatus>,
+    /// Optional exact-match local role id subset.
     role_ids: Vec<RoleId>,
+    /// Optional lower-cased keyword matched against the cached role display name.
     keyword: Option<String>,
 }
 
+/// Validates and normalizes one role-catalog filter before repository results are matched.
 fn normalize_role_catalog_filter(
     filter: Option<RoleCatalogFilter>,
 ) -> Result<Option<NormalizedRoleCatalogFilter>, IdentityError> {
@@ -438,6 +458,7 @@ fn normalize_role_catalog_filter(
     }))
 }
 
+/// Returns whether one local role-catalog entry satisfies the normalized query filter.
 fn role_catalog_entry_matches(
     entry: &RoleCatalogEntry,
     filter: Option<&NormalizedRoleCatalogFilter>,
