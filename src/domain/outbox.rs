@@ -64,6 +64,8 @@ pub struct OutboxEvent {
     pub event_type: String,
     /// Canonical event payload persisted inside the local transaction.
     pub payload_json: Value,
+    /// Trace id retained for later bus-envelope construction and cross-system diagnostics.
+    pub trace_id: String,
     /// Publish-side idempotency key unique across all outbox rows.
     pub idempotency_key: String,
     /// Current durable publication status for the outbox row.
@@ -114,6 +116,7 @@ impl OutboxEvent {
     pub fn for_member_hired(
         outbox_event_id: OutboxEventId,
         member: &GlobalMember,
+        trace_id: &str,
         idempotency_key: &str,
         created_at: PrimitiveDateTime,
     ) -> Self {
@@ -134,6 +137,7 @@ impl OutboxEvent {
                 "created_at": member.created_at,
                 "updated_at": member.updated_at,
             }),
+            trace_id: trace_id.to_string(),
             idempotency_key: idempotency_key.to_string(),
             status: OutboxStatus::Pending,
             retry_count: 0,
@@ -150,6 +154,7 @@ impl OutboxEvent {
         member: &GlobalMember,
         from_lifecycle: &str,
         reason: &str,
+        trace_id: &str,
         idempotency_key: &str,
         created_at: PrimitiveDateTime,
     ) -> Self {
@@ -172,6 +177,7 @@ impl OutboxEvent {
                 "created_at": member.created_at,
                 "updated_at": member.updated_at,
             }),
+            trace_id: trace_id.to_string(),
             idempotency_key: idempotency_key.to_string(),
             status: OutboxStatus::Pending,
             retry_count: 0,
@@ -189,6 +195,7 @@ impl OutboxEvent {
         memory_ref_summary_json: Value,
         gate_decision_ref: &GateDecisionRef,
         reason: &str,
+        trace_id: &str,
         idempotency_key: &str,
         created_at: PrimitiveDateTime,
     ) -> Self {
@@ -212,6 +219,7 @@ impl OutboxEvent {
                 "created_at": member.created_at,
                 "updated_at": member.updated_at,
             }),
+            trace_id: trace_id.to_string(),
             idempotency_key: idempotency_key.to_string(),
             status: OutboxStatus::Pending,
             retry_count: 0,
@@ -227,6 +235,7 @@ impl OutboxEvent {
         outbox_event_id: OutboxEventId,
         member: &GlobalMember,
         profile: &CapabilityProfile,
+        trace_id: &str,
         idempotency_key: &str,
         created_at: PrimitiveDateTime,
     ) -> Self {
@@ -245,6 +254,7 @@ impl OutboxEvent {
                 "version": profile.version,
                 "updated_at": profile.updated_at,
             }),
+            trace_id: trace_id.to_string(),
             idempotency_key: idempotency_key.to_string(),
             status: OutboxStatus::Pending,
             retry_count: 0,
@@ -260,6 +270,7 @@ impl OutboxEvent {
         outbox_event_id: OutboxEventId,
         member: &GlobalMember,
         memory_refs: &MemoryRefs,
+        trace_id: &str,
         idempotency_key: &str,
         created_at: PrimitiveDateTime,
     ) -> Self {
@@ -278,6 +289,7 @@ impl OutboxEvent {
                 "version": memory_refs.version,
                 "updated_at": memory_refs.updated_at,
             }),
+            trace_id: trace_id.to_string(),
             idempotency_key: idempotency_key.to_string(),
             status: OutboxStatus::Pending,
             retry_count: 0,
@@ -293,6 +305,7 @@ impl OutboxEvent {
         outbox_event_id: OutboxEventId,
         member: &GlobalMember,
         memory_refs: &MemoryRefs,
+        trace_id: &str,
         idempotency_key: &str,
         created_at: PrimitiveDateTime,
     ) -> Self {
@@ -311,6 +324,7 @@ impl OutboxEvent {
                 "version": memory_refs.version,
                 "updated_at": memory_refs.updated_at,
             }),
+            trace_id: trace_id.to_string(),
             idempotency_key: idempotency_key.to_string(),
             status: OutboxStatus::Pending,
             retry_count: 0,
@@ -326,6 +340,7 @@ impl OutboxEvent {
         outbox_event_id: OutboxEventId,
         member: &GlobalMember,
         history: &CareerHistory,
+        trace_id: &str,
         idempotency_key: &str,
         created_at: PrimitiveDateTime,
     ) -> Self {
@@ -343,6 +358,7 @@ impl OutboxEvent {
                 "version": history.version(),
                 "updated_at": history.latest_created_at().unwrap_or(created_at),
             }),
+            trace_id: trace_id.to_string(),
             idempotency_key: idempotency_key.to_string(),
             status: OutboxStatus::Pending,
             retry_count: 0,
@@ -357,6 +373,7 @@ impl OutboxEvent {
     pub fn for_role_catalog_sync(
         outbox_event_id: OutboxEventId,
         entry: &RoleCatalogEntry,
+        trace_id: &str,
         idempotency_key: &str,
         created_at: PrimitiveDateTime,
     ) -> Self {
@@ -374,6 +391,7 @@ impl OutboxEvent {
                 "status": entry.status.as_db(),
                 "updated_at": entry.updated_at,
             }),
+            trace_id: trace_id.to_string(),
             idempotency_key: idempotency_key.to_string(),
             status: OutboxStatus::Pending,
             retry_count: 0,
@@ -388,6 +406,7 @@ impl OutboxEvent {
     pub fn for_gate_decision_recorded(
         outbox_event_id: OutboxEventId,
         pending_flow: &PendingTombstoneFlow,
+        trace_id: &str,
         idempotency_key: &str,
         created_at: PrimitiveDateTime,
     ) -> Self {
@@ -405,6 +424,7 @@ impl OutboxEvent {
                 "status": pending_flow.status.as_db(),
                 "updated_at": pending_flow.updated_at,
             }),
+            trace_id: trace_id.to_string(),
             idempotency_key: idempotency_key.to_string(),
             status: OutboxStatus::Pending,
             retry_count: 0,

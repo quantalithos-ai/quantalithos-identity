@@ -4591,6 +4591,9 @@ mod tests {
                 "postgres://postgres:postgres@127.0.0.1:5432/quantalithos_identity".to_string(),
             ),
             database_max_connections: 5,
+            outbox_publisher_enabled: false,
+            outbox_publisher_batch_size: 50,
+            outbox_publisher_poll_interval_ms: 1_000,
         };
 
         let pool = PgPoolOptions::new()
@@ -4639,6 +4642,7 @@ mod tests {
                 aggregate_id,
                 event_type,
                 payload_json,
+                trace_id,
                 idempotency_key,
                 status,
                 retry_count,
@@ -4646,7 +4650,7 @@ mod tests {
                 created_at,
                 published_at,
                 failure_reason
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             "#,
         )
         .bind(event.outbox_event_id.as_str())
@@ -4654,6 +4658,7 @@ mod tests {
         .bind(event.aggregate_id)
         .bind(event.event_type)
         .bind(event.payload_json)
+        .bind(event.trace_id)
         .bind(event.idempotency_key)
         .bind(event.status.as_db())
         .bind(event.retry_count)
@@ -4912,6 +4917,7 @@ mod tests {
                 "global_member_id": "member-001",
                 "display_name": "Member Zero One",
             }),
+            trace_id: format!("trace-{outbox_event_id}"),
             idempotency_key: format!("idem-{outbox_event_id}"),
             status: OutboxStatus::Pending,
             retry_count: 0,
@@ -5007,6 +5013,7 @@ mod tests {
                 "status": "active",
                 "updated_at": created_at,
             }),
+            trace_id: format!("trace-{outbox_event_id}"),
             idempotency_key: format!("idem-{outbox_event_id}"),
             status: OutboxStatus::Pending,
             retry_count: 0,
@@ -5041,6 +5048,7 @@ mod tests {
                 "created_at": created_at,
                 "updated_at": created_at,
             }),
+            trace_id: format!("trace-{outbox_event_id}"),
             idempotency_key: format!("idem-{outbox_event_id}"),
             status: OutboxStatus::Pending,
             retry_count: 0,
@@ -5092,6 +5100,7 @@ mod tests {
                 "version": 1,
                 "updated_at": created_at,
             }),
+            trace_id: format!("trace-{outbox_event_id}"),
             idempotency_key: format!("idem-{outbox_event_id}"),
             status: OutboxStatus::Pending,
             retry_count: 0,
@@ -5142,6 +5151,7 @@ mod tests {
                 "version": 2,
                 "updated_at": created_at,
             }),
+            trace_id: format!("trace-{outbox_event_id}"),
             idempotency_key: format!("idem-{outbox_event_id}"),
             status: OutboxStatus::Pending,
             retry_count: 0,
@@ -5196,6 +5206,7 @@ mod tests {
                 "version": 3,
                 "updated_at": created_at,
             }),
+            trace_id: format!("trace-{outbox_event_id}"),
             idempotency_key: format!("idem-{outbox_event_id}"),
             status: OutboxStatus::Pending,
             retry_count: 0,
@@ -5272,6 +5283,7 @@ mod tests {
                 "version": 2,
                 "updated_at": later_created_at,
             }),
+            trace_id: format!("trace-{outbox_event_id}"),
             idempotency_key: format!("idem-{outbox_event_id}"),
             status: OutboxStatus::Pending,
             retry_count: 0,

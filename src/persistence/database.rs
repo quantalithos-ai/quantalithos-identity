@@ -57,6 +57,9 @@ mod tests {
             listen_addr: "127.0.0.1:8080".to_string(),
             database_url: None,
             database_max_connections: 10,
+            outbox_publisher_enabled: false,
+            outbox_publisher_batch_size: 50,
+            outbox_publisher_poll_interval_ms: 1_000,
         };
 
         let error = connect_pool(&config)

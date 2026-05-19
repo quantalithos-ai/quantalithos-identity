@@ -1103,6 +1103,7 @@ impl OutboxStore for SqlxOutboxStore<'_, '_> {
                 aggregate_id,
                 event_type,
                 payload_json,
+                trace_id,
                 idempotency_key,
                 status,
                 retry_count,
@@ -1110,7 +1111,7 @@ impl OutboxStore for SqlxOutboxStore<'_, '_> {
                 created_at,
                 published_at,
                 failure_reason
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             "#,
         )
         .bind(event.outbox_event_id.as_str())
@@ -1118,6 +1119,7 @@ impl OutboxStore for SqlxOutboxStore<'_, '_> {
         .bind(event.aggregate_id.as_str())
         .bind(event.event_type.as_str())
         .bind(event.payload_json.clone())
+        .bind(event.trace_id.as_str())
         .bind(event.idempotency_key.as_str())
         .bind(event.status.as_db())
         .bind(event.retry_count)
@@ -1142,6 +1144,7 @@ impl OutboxStore for SqlxOutboxStore<'_, '_> {
                 aggregate_id,
                 event_type,
                 payload_json,
+                trace_id,
                 idempotency_key,
                 status,
                 retry_count,
@@ -1197,6 +1200,7 @@ impl OutboxStore for SqlxOutboxStore<'_, '_> {
                         aggregate_id,
                         event_type,
                         payload_json,
+                        trace_id,
                         idempotency_key,
                         status,
                         retry_count,
@@ -1228,6 +1232,7 @@ impl OutboxStore for SqlxOutboxStore<'_, '_> {
                     aggregate_id,
                     event_type,
                     payload_json,
+                    trace_id,
                     idempotency_key,
                     status,
                     retry_count,
@@ -1261,6 +1266,7 @@ impl OutboxStore for SqlxOutboxStore<'_, '_> {
                 aggregate_id,
                 event_type,
                 payload_json,
+                trace_id,
                 idempotency_key,
                 status,
                 retry_count,
@@ -1301,6 +1307,7 @@ impl OutboxStore for SqlxOutboxStore<'_, '_> {
                 aggregate_id,
                 event_type,
                 payload_json,
+                trace_id,
                 idempotency_key,
                 status,
                 retry_count,
@@ -1329,13 +1336,14 @@ impl OutboxStore for SqlxOutboxStore<'_, '_> {
                 aggregate_id = $3,
                 event_type = $4,
                 payload_json = $5,
-                idempotency_key = $6,
-                status = $7,
-                retry_count = $8,
-                next_retry_at = $9,
-                created_at = $10,
-                published_at = $11,
-                failure_reason = $12
+                trace_id = $6,
+                idempotency_key = $7,
+                status = $8,
+                retry_count = $9,
+                next_retry_at = $10,
+                created_at = $11,
+                published_at = $12,
+                failure_reason = $13
             WHERE outbox_event_id = $1
             "#,
         )
@@ -1344,6 +1352,7 @@ impl OutboxStore for SqlxOutboxStore<'_, '_> {
         .bind(event.aggregate_id.as_str())
         .bind(event.event_type.as_str())
         .bind(event.payload_json.clone())
+        .bind(event.trace_id.as_str())
         .bind(event.idempotency_key.as_str())
         .bind(event.status.as_db())
         .bind(event.retry_count)
@@ -1897,6 +1906,7 @@ fn map_outbox_row(row: sqlx::postgres::PgRow) -> Result<OutboxEvent, IdentityErr
         aggregate_id: row.get("aggregate_id"),
         event_type: row.get("event_type"),
         payload_json: row.get("payload_json"),
+        trace_id: row.get("trace_id"),
         idempotency_key: row.get("idempotency_key"),
         status,
         retry_count: row.get("retry_count"),

@@ -199,6 +199,7 @@ where
             memory_ref_summary_json,
             &gate_decision_ref,
             &command.reason,
+            metadata.trace_id(),
             metadata.idempotency_key(),
             member.updated_at,
         );
@@ -370,6 +371,7 @@ where
         let outbox_event = OutboxEvent::for_gate_decision_recorded(
             OutboxEventId::new(format!("outbox:{}", envelope.source_event_id.as_str())),
             &pending_flow,
+            envelope.source_event_id.as_str(),
             envelope.source_event_id.as_str(),
             now,
         );
@@ -1262,6 +1264,9 @@ mod tests {
                 "postgres://postgres:postgres@127.0.0.1:5432/quantalithos_identity".to_string(),
             ),
             database_max_connections: 5,
+            outbox_publisher_enabled: false,
+            outbox_publisher_batch_size: 50,
+            outbox_publisher_poll_interval_ms: 1_000,
         };
 
         let pool = PgPoolOptions::new()

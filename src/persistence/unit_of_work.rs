@@ -594,6 +594,7 @@ mod tests {
                     aggregate_id: "member-001".to_string(),
                     event_type: "identity.member.created".to_string(),
                     payload_json: json!({ "global_member_id": "member-001" }),
+                    trace_id: "trace-outbox-001".to_string(),
                     idempotency_key: "idem-outbox-001".to_string(),
                     status: OutboxStatus::Pending,
                     retry_count: 0,
@@ -611,6 +612,7 @@ mod tests {
                     aggregate_id: "member-002".to_string(),
                     event_type: "identity.member.updated".to_string(),
                     payload_json: json!({ "global_member_id": "member-002" }),
+                    trace_id: "trace-outbox-002".to_string(),
                     idempotency_key: "idem-outbox-002".to_string(),
                     status: OutboxStatus::Published,
                     retry_count: 0,
@@ -634,6 +636,7 @@ mod tests {
 
             assert_eq!(pending_events.len(), 1);
             assert_eq!(pending_events[0].outbox_event_id.as_str(), "outbox-001");
+            assert_eq!(pending_events[0].trace_id, "trace-outbox-001");
             uow.rollback().await.expect("rollback pending scan");
         }
 
@@ -692,6 +695,7 @@ mod tests {
                         aggregate_id: aggregate_id.to_string(),
                         event_type: "identity.member.changed".to_string(),
                         payload_json: json!({ "global_member_id": aggregate_id }),
+                        trace_id: format!("trace-{event_id}"),
                         idempotency_key: format!("idem-{event_id}"),
                         status: OutboxStatus::Pending,
                         retry_count: 0,
@@ -742,6 +746,7 @@ mod tests {
                     aggregate_id: "member-proj-001".to_string(),
                     event_type: "identity.member.created".to_string(),
                     payload_json: json!({ "global_member_id": "member-proj-001" }),
+                    trace_id: "trace-proj-001".to_string(),
                     idempotency_key: "idem-proj-001".to_string(),
                     status: OutboxStatus::Pending,
                     retry_count: 0,
@@ -856,6 +861,9 @@ mod tests {
                 "postgres://postgres:postgres@127.0.0.1:5432/quantalithos_identity".to_string(),
             ),
             database_max_connections: 5,
+            outbox_publisher_enabled: false,
+            outbox_publisher_batch_size: 50,
+            outbox_publisher_poll_interval_ms: 1_000,
         };
         let pool = PgPoolOptions::new()
             .max_connections(config.database_max_connections)
