@@ -295,6 +295,10 @@ impl RoleCatalogRepository for SqlxRoleCatalogRepository<'_, '_> {
         rows.into_iter().map(map_role_catalog_row).collect()
     }
 
+    async fn list(&mut self) -> Result<Vec<RoleCatalogEntry>, IdentityError> {
+        self.list_all().await
+    }
+
     async fn upsert(&mut self, entry: &RoleCatalogEntry) -> Result<(), IdentityError> {
         sqlx::query(
             r#"

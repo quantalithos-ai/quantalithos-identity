@@ -5,12 +5,13 @@ use serde_json::Value;
 use time::PrimitiveDateTime;
 
 use crate::application::persistence::{
-    AuditTraceRepository, GlobalMemberRepository, MemberSummaryProjectionRepository, UnitOfWork,
-    UnitOfWorkFactory,
+    AuditTraceRepository, GlobalMemberRepository, MemberSummaryProjectionRepository,
+    RoleCatalogRepository, UnitOfWork, UnitOfWorkFactory,
 };
 use crate::domain::audit::{AuditResult, AuditTraceEntry};
 use crate::domain::member::GlobalMemberLifecycle;
 use crate::domain::projection::MemberSummaryProjection;
+use crate::domain::role_catalog::{RoleCatalogEntry, RoleCatalogStatus};
 use crate::domain::shared::context::{ActorContext, ActorKind};
 use crate::domain::shared::ids::{GlobalMemberId, RoleId};
 use crate::domain::shared::pagination::{NormalizedPageRequest, PageRequest};
@@ -48,6 +49,25 @@ pub struct GetMemberAuditTraceQuery {
     pub global_member_id: GlobalMemberId,
     /// Optional pagination input controlling the returned slice.
     pub page: Option<PageRequest>,
+}
+
+/// Query DTO for local role-catalog summary lookups.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct GetRoleCatalogQuery {
+    /// Optional filter controlling which local role rows are returned.
+    pub filter: Option<RoleCatalogFilter>,
+}
+
+/// Optional filter used by the local role-catalog query API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RoleCatalogFilter {
+    /// Optional local status filter: `active`, `deprecated`, or `source_drift`.
+    pub status: Option<String>,
+    /// Optional explicit role-id subset filter.
+    #[serde(default)]
+    pub role_ids: Vec<RoleId>,
+    /// Optional case-insensitive keyword matched against the cached display name.
+    pub keyword: Option<String>,
 }
 
 /// Read-facing member summary DTO returned by query flows.
@@ -105,6 +125,25 @@ pub struct MemberAuditTracePageDto {
     pub next_cursor: Option<String>,
 }
 
+/// One read-facing local role-catalog summary row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoleCatalogEntryDto {
+    /// Stable local role identifier.
+    pub role_id: RoleId,
+    /// Cached role display name.
+    pub role_name: String,
+    /// Upstream role version retained for diagnostics and compatibility.
+    pub role_version: String,
+    /// Ref-only upstream source pointer without role-definition body duplication.
+    pub source_ref_json: Value,
+    /// Cached upstream fingerprint used for drift diagnostics.
+    pub fingerprint: String,
+    /// Current local index status.
+    pub status: RoleCatalogStatus,
+    /// Last successful local synchronization timestamp.
+    pub updated_at: PrimitiveDateTime,
+}
+
 impl MemberSummaryDto {
     /// Builds the query DTO from the persisted projection row.
     pub fn from_projection(projection: MemberSummaryProjection) -> Self {
@@ -148,6 +187,20 @@ impl AuditTraceDto {
             result: entry.result,
             reason: None,
             created_at: entry.created_at,
+        }
+    }
+}
+
+impl RoleCatalogEntryDto {
+    fn from_entry(entry: RoleCatalogEntry) -> Self {
+        Self {
+            role_id: entry.role_id,
+            role_name: entry.role_name,
+            role_version: entry.role_version,
+            source_ref_json: entry.source_ref_json,
+            fingerprint: entry.fingerprint,
+            status: entry.status,
+            updated_at: entry.updated_at,
         }
     }
 }
@@ -278,6 +331,27 @@ where
             next_cursor,
         })
     }
+
+    /// Lists local role-catalog summary rows without reading upstream role-definition bodies.
+    pub async fn get_role_catalog(
+        &self,
+        query: GetRoleCatalogQuery,
+        _actor: ActorContext,
+    ) -> Result<Vec<RoleCatalogEntryDto>, IdentityError> {
+        let mut uow = self.unit_of_work_factory.begin().await?;
+        let entries = {
+            let mut repository = uow.role_catalog();
+            repository.list().await?
+        };
+        uow.rollback().await?;
+
+        let filter = normalize_role_catalog_filter(query.filter)?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| role_catalog_entry_matches(entry, filter.as_ref()))
+            .map(RoleCatalogEntryDto::from_entry)
+            .collect())
+    }
 }
 
 fn trim_member_summary(
@@ -313,6 +387,86 @@ fn page_for_fetch(page: &NormalizedPageRequest) -> NormalizedPageRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedRoleCatalogFilter {
+    status: Option<RoleCatalogStatus>,
+    role_ids: Vec<RoleId>,
+    keyword: Option<String>,
+}
+
+fn normalize_role_catalog_filter(
+    filter: Option<RoleCatalogFilter>,
+) -> Result<Option<NormalizedRoleCatalogFilter>, IdentityError> {
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
+
+    let status = match filter.status.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(value) => Some(RoleCatalogStatus::from_db(value).ok_or(IdentityError::RuleViolation {
+            code: "IDENTITY_INVALID_ARGUMENT",
+            message: format!(
+                "role_catalog.filter.status must be one of `active`, `deprecated`, or `source_drift`, got `{value}`"
+            ),
+        })?),
+    };
+
+    let role_ids = filter
+        .role_ids
+        .into_iter()
+        .filter(|role_id| !role_id.as_str().trim().is_empty())
+        .collect::<Vec<_>>();
+
+    let keyword = match filter.keyword {
+        None => None,
+        Some(keyword) => {
+            let trimmed = keyword.trim().to_ascii_lowercase();
+            if trimmed.is_empty() {
+                return Err(IdentityError::RuleViolation {
+                    code: "IDENTITY_INVALID_ARGUMENT",
+                    message: "role_catalog.filter.keyword must not be blank".to_string(),
+                });
+            }
+            Some(trimmed)
+        }
+    };
+
+    Ok(Some(NormalizedRoleCatalogFilter {
+        status,
+        role_ids,
+        keyword,
+    }))
+}
+
+fn role_catalog_entry_matches(
+    entry: &RoleCatalogEntry,
+    filter: Option<&NormalizedRoleCatalogFilter>,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+
+    if filter.status.is_some_and(|status| entry.status != status) {
+        return false;
+    }
+    if !filter.role_ids.is_empty()
+        && !filter
+            .role_ids
+            .iter()
+            .any(|role_id| role_id == &entry.role_id)
+    {
+        return false;
+    }
+    if let Some(keyword) = filter.keyword.as_deref() {
+        let role_name = entry.role_name.to_ascii_lowercase();
+        if !role_name.contains(keyword) {
+            return false;
+        }
+    }
+
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -327,6 +481,7 @@ mod tests {
     use crate::config::AppConfig;
     use crate::domain::member::{GlobalMemberLifecycle, HireGlobalMemberCommand};
     use crate::domain::memory_refs::{MemoryRef, UpdateMemoryRefsCommand};
+    use crate::domain::role_catalog::RoleCatalogStatus;
     use crate::domain::shared::context::{ActorContext, ActorKind};
     use crate::domain::shared::ids::{EventId, GlobalMemberId, ProjectId, RoleId};
     use crate::domain::shared::metadata::CommandMetadata;
@@ -340,7 +495,10 @@ mod tests {
     use crate::persistence::test_support::DB_TEST_MUTEX;
     use crate::persistence::unit_of_work::SqlxUnitOfWorkFactory;
 
-    use super::{GetMemberAuditTraceQuery, GetMemberSummaryQuery, QueryProjectionService};
+    use super::{
+        GetMemberAuditTraceQuery, GetMemberSummaryQuery, GetRoleCatalogQuery,
+        QueryProjectionService, RoleCatalogFilter,
+    };
 
     #[derive(Debug, Clone, Default)]
     struct StubMemoryArchiveValidator;
@@ -707,6 +865,75 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn get_role_catalog_returns_local_summary_rows_with_filtering() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+        seed_role(&pool, "role.member.reviewer", "Reviewer").await;
+        rename_role_status(
+            &pool,
+            "role.member.reviewer",
+            "Senior Reviewer",
+            "source_drift",
+        )
+        .await;
+
+        let query_service = QueryProjectionService::new(SqlxUnitOfWorkFactory::new(pool));
+        let roles = query_service
+            .get_role_catalog(
+                GetRoleCatalogQuery {
+                    filter: Some(RoleCatalogFilter {
+                        status: Some("source_drift".to_string()),
+                        role_ids: vec![RoleId::new("role.member.reviewer")],
+                        keyword: Some("review".to_string()),
+                    }),
+                },
+                ActorContext::new("human/admin-role-query-1", ActorKind::HumanUser, None),
+            )
+            .await
+            .expect("role catalog query should succeed");
+
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].role_id.as_str(), "role.member.reviewer");
+        assert_eq!(roles[0].role_name, "Senior Reviewer");
+        assert_eq!(roles[0].status, RoleCatalogStatus::SourceDrift);
+        assert_eq!(roles[0].source_ref_json["id"], "role.member.reviewer");
+    }
+
+    #[tokio::test]
+    async fn get_role_catalog_rejects_invalid_status_filter() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+
+        let query_service = QueryProjectionService::new(SqlxUnitOfWorkFactory::new(pool));
+        let error = query_service
+            .get_role_catalog(
+                GetRoleCatalogQuery {
+                    filter: Some(RoleCatalogFilter {
+                        status: Some("unknown".to_string()),
+                        role_ids: Vec::new(),
+                        keyword: None,
+                    }),
+                },
+                ActorContext::new("human/admin-role-query-2", ActorKind::HumanUser, None),
+            )
+            .await
+            .expect_err("invalid status should be rejected");
+
+        assert!(matches!(
+            error,
+            IdentityError::RuleViolation {
+                code: "IDENTITY_INVALID_ARGUMENT",
+                ..
+            }
+        ));
+    }
+
     async fn test_pool() -> sqlx::postgres::PgPool {
         let config = AppConfig {
             listen_addr: "127.0.0.1:8080".to_string(),
@@ -765,6 +992,7 @@ mod tests {
                 status,
                 updated_at
             ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            ON CONFLICT (role_id) DO NOTHING
             "#,
         )
         .bind(role_id)
@@ -848,6 +1076,23 @@ mod tests {
         .await;
 
         member
+    }
+
+    async fn rename_role_status(
+        pool: &sqlx::postgres::PgPool,
+        role_id: &str,
+        role_name: &str,
+        status: &str,
+    ) {
+        sqlx::query(
+            "UPDATE role_catalog_entries SET role_name = $2, status = $3 WHERE role_id = $1",
+        )
+        .bind(role_id)
+        .bind(role_name)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("update role catalog row");
     }
 
     async fn update_audit_created_at(

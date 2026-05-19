@@ -3,7 +3,7 @@
 #[cfg(test)]
 use std::sync::Mutex;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -17,7 +17,8 @@ use crate::application::capability_profile::CapabilityProfileCommandService;
 use crate::application::member_lifecycle::MemberLifecycleCommandService;
 use crate::application::memory_refs::MemoryRefsCommandService;
 use crate::application::query_projection::{
-    GetMemberSummaryQuery, MemberSummaryDto, QueryProjectionService,
+    GetMemberAuditTraceQuery, GetMemberSummaryQuery, GetRoleCatalogQuery, MemberAuditTracePageDto,
+    MemberSummaryDto, QueryProjectionService, RoleCatalogEntryDto, RoleCatalogFilter,
 };
 use crate::application::tombstone_flow::TombstoneFlowService;
 use crate::domain::capability_profile::{
@@ -95,6 +96,44 @@ impl HttpAppState {
         .await
         .map_err(|error| IdentityError::PersistenceData {
             message: format!("get_member_summary task join failed: {error}"),
+        })?
+    }
+
+    async fn get_member_audit_trace(
+        &self,
+        query: GetMemberAuditTraceQuery,
+        actor: ActorContext,
+    ) -> Result<MemberAuditTracePageDto, IdentityError> {
+        let factory = self.unit_of_work_factory();
+        tokio::task::spawn_blocking(move || {
+            Handle::current().block_on(async move {
+                QueryProjectionService::new(factory)
+                    .get_member_audit_trace(query, actor)
+                    .await
+            })
+        })
+        .await
+        .map_err(|error| IdentityError::PersistenceData {
+            message: format!("get_member_audit_trace task join failed: {error}"),
+        })?
+    }
+
+    async fn get_role_catalog(
+        &self,
+        query: GetRoleCatalogQuery,
+        actor: ActorContext,
+    ) -> Result<Vec<RoleCatalogEntryDto>, IdentityError> {
+        let factory = self.unit_of_work_factory();
+        tokio::task::spawn_blocking(move || {
+            Handle::current().block_on(async move {
+                QueryProjectionService::new(factory)
+                    .get_role_catalog(query, actor)
+                    .await
+            })
+        })
+        .await
+        .map_err(|error| IdentityError::PersistenceData {
+            message: format!("get_role_catalog task join failed: {error}"),
         })?
     }
 
@@ -327,12 +366,45 @@ async fn get_member_summary(
     Ok((StatusCode::OK, Json(summary)))
 }
 
-async fn get_member_audit_trace(Path(_global_member_id): Path<String>) -> impl IntoResponse {
-    not_implemented("GetMemberAuditTrace")
+async fn get_member_audit_trace(
+    State(state): State<HttpAppState>,
+    Path(global_member_id): Path<String>,
+    headers: HeaderMap,
+    Query(request): Query<GetMemberAuditTraceRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = actor_context_from_headers(&headers)?;
+    let page = request.into_page_request()?;
+    let result = state
+        .get_member_audit_trace(
+            GetMemberAuditTraceQuery {
+                global_member_id: GlobalMemberId::new(global_member_id),
+                page,
+            },
+            actor,
+        )
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok((StatusCode::OK, Json(result)))
 }
 
-async fn get_role_catalog() -> impl IntoResponse {
-    not_implemented("GetRoleCatalog")
+async fn get_role_catalog(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    Query(request): Query<GetRoleCatalogRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = actor_context_from_headers(&headers)?;
+    let result = state
+        .get_role_catalog(
+            GetRoleCatalogQuery {
+                filter: Some(request.into_filter()?),
+            },
+            actor,
+        )
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok((StatusCode::OK, Json(result)))
 }
 
 fn actor_context_from_headers(headers: &HeaderMap) -> Result<ActorContext, ApiError> {
@@ -450,16 +522,6 @@ fn gate_decision_decided_at_http() -> PrimitiveDateTime {
     PrimitiveDateTime::new(now.date(), now.time())
 }
 
-fn not_implemented(operation: &'static str) -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(NotImplementedResponse {
-            error: "IDENTITY_NOT_IMPLEMENTED",
-            operation,
-        }),
-    )
-}
-
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
@@ -545,7 +607,7 @@ fn status_for_rule_violation(code: &str) -> StatusCode {
         "IDENTITY_MEMBER_NOT_FOUND" | "IDENTITY_ROLE_NOT_FOUND" => StatusCode::NOT_FOUND,
         "IDENTITY_PROJECTION_NOT_READY" => StatusCode::SERVICE_UNAVAILABLE,
         "IDENTITY_MEMORY_ARCHIVE_UNAVAILABLE" => StatusCode::SERVICE_UNAVAILABLE,
-        "IDENTITY_GATE_REJECTED" => StatusCode::FORBIDDEN,
+        "IDENTITY_GATE_REJECTED" | "IDENTITY_AUDIT_TRACE_NOT_VISIBLE" => StatusCode::FORBIDDEN,
         "IDENTITY_LIFECYCLE_TRANSITION_INVALID"
         | "IDENTITY_USE_TOMBSTONE_COMMAND"
         | "IDENTITY_MEMBER_NOT_MUTABLE"
@@ -560,15 +622,6 @@ fn status_for_rule_violation(code: &str) -> StatusCode {
 struct HealthResponse {
     /// Process liveness marker.
     status: &'static str,
-}
-
-/// Placeholder error DTO returned by unimplemented handlers.
-#[derive(Debug, Clone, Copy, Serialize)]
-struct NotImplementedResponse {
-    /// Stable placeholder error code for unimplemented endpoints.
-    error: &'static str,
-    /// Operation name that has not been implemented yet.
-    operation: &'static str,
 }
 
 /// Stable error DTO returned by implemented handlers.
@@ -678,6 +731,77 @@ impl TombstoneMemberRequest {
             expected_version: self.expected_version,
             gate_decision_ref: self.gate_decision_ref,
         }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct GetMemberAuditTraceRequest {
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+
+impl GetMemberAuditTraceRequest {
+    fn into_page_request(
+        self,
+    ) -> Result<Option<crate::domain::shared::pagination::PageRequest>, ApiError> {
+        let cursor = match self.cursor {
+            None => None,
+            Some(cursor) => {
+                let trimmed = cursor.trim().to_string();
+                if trimmed.is_empty() {
+                    return Err(ApiError::bad_request(
+                        "IDENTITY_INVALID_ARGUMENT",
+                        "query parameter `cursor` must not be blank".to_string(),
+                    ));
+                }
+                Some(trimmed)
+            }
+        };
+
+        if self.limit.is_none() && cursor.is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(crate::domain::shared::pagination::PageRequest {
+            limit: self.limit,
+            cursor,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct GetRoleCatalogRequest {
+    status: Option<String>,
+    role_ids: Option<String>,
+    keyword: Option<String>,
+}
+
+impl GetRoleCatalogRequest {
+    fn into_filter(self) -> Result<RoleCatalogFilter, ApiError> {
+        let role_ids = match self.role_ids {
+            None => Vec::new(),
+            Some(raw) => raw
+                .split(',')
+                .map(str::trim)
+                .map(|value| {
+                    if value.is_empty() {
+                        Err(ApiError::bad_request(
+                            "IDENTITY_INVALID_ARGUMENT",
+                            "query parameter `role_ids` must not contain blank role ids"
+                                .to_string(),
+                        ))
+                    } else {
+                        Ok(RoleId::new(value))
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+
+        Ok(RoleCatalogFilter {
+            status: self.status,
+            role_ids,
+            keyword: self.keyword,
+        })
     }
 }
 
@@ -791,17 +915,30 @@ mod tests {
     use sqlx::{Executor, Row, postgres::PgPoolOptions};
     use tower::util::ServiceExt;
 
+    use crate::application::career_event::CareerEventConsumerService;
+    use crate::application::member_lifecycle::MemberLifecycleCommandService;
+    use crate::application::memory_refs::MemoryRefsCommandService;
     use crate::application::query_projection::MemberSummaryDto;
+    use crate::application::query_projection::{MemberAuditTracePageDto, RoleCatalogEntryDto};
     use crate::config::AppConfig;
     use crate::domain::capability_profile::{
         ArtifactRef, CapabilityItem, CapabilityProfileSummary,
     };
     use crate::domain::member::{GlobalMemberLifecycle, GlobalMemberSummary};
-    use crate::domain::memory_refs::{MemoryRef, MemoryRefsSummary};
+    use crate::domain::memory_refs::{MemoryRef, MemoryRefsSummary, UpdateMemoryRefsCommand};
+    use crate::domain::role_catalog::RoleCatalogStatus;
+    use crate::domain::shared::context::{ActorContext, ActorKind};
+    use crate::domain::shared::ids::{EventId, GlobalMemberId, ProjectId, RoleId};
+    use crate::domain::shared::metadata::CommandMetadata;
+    use crate::error::IdentityError;
+    use crate::inbound::event_consumers::CareerEventConsumer;
+    use crate::inbound::events::{InboundEventEnvelope, InboundWorkFactEvent};
     use crate::operations::ProjectionRebuildJob;
+    use crate::outbound::MemoryArchivePort;
     use crate::persistence::database::run_migrations;
     use crate::persistence::test_support::DB_TEST_MUTEX;
     use crate::persistence::unit_of_work::SqlxUnitOfWorkFactory;
+    use time::{Duration, OffsetDateTime, PrimitiveDateTime};
 
     use super::{
         ErrorResponse, HEADER_ACTOR_KIND, HEADER_ACTOR_REF, HEADER_IDEMPOTENCY_KEY,
@@ -1337,6 +1474,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_member_audit_trace_endpoint_returns_paginated_rows_for_human_actor() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let member = seed_member_audit_trail_http(&pool).await;
+        let response = router(HttpAppState::new(pool))
+            .oneshot(audit_trace_request(
+                member.global_member_id.as_str(),
+                Some("limit=2"),
+            ))
+            .await
+            .expect("audit trace request should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let page: MemberAuditTracePageDto = read_json_body(response).await;
+        assert_eq!(page.traces.len(), 2);
+        assert_eq!(page.traces[0].action, "AppendCareerEntry");
+        assert_eq!(page.traces[1].action, "UpdateMemoryRefs");
+        assert!(page.traces[0].actor_json.is_some());
+        assert_eq!(
+            page.next_cursor.as_deref(),
+            Some("audit:idem-audit-http-memory")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_member_audit_trace_endpoint_rejects_invisible_actor() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let member = seed_member_audit_trail_http(&pool).await;
+        let response = router(HttpAppState::new(pool))
+            .oneshot(audit_trace_request_as_system(
+                member.global_member_id.as_str(),
+            ))
+            .await
+            .expect("audit trace request should respond");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let error: ErrorResponse = read_json_body(response).await;
+        assert_eq!(error.error, "IDENTITY_AUDIT_TRACE_NOT_VISIBLE");
+    }
+
+    #[tokio::test]
+    async fn get_role_catalog_endpoint_returns_filtered_local_summary_rows() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+        seed_role(&pool, "role.member.reviewer", "Reviewer").await;
+        update_role_catalog_row_http(
+            &pool,
+            "role.member.reviewer",
+            "Senior Reviewer",
+            "source_drift",
+        )
+        .await;
+
+        let response = router(HttpAppState::new(pool))
+            .oneshot(role_catalog_request(Some(
+                "status=source_drift&keyword=review&role_ids=role.member.reviewer",
+            )))
+            .await
+            .expect("role catalog request should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let roles: Vec<RoleCatalogEntryDto> = read_json_body(response).await;
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].role_id.as_str(), "role.member.reviewer");
+        assert_eq!(roles[0].role_name, "Senior Reviewer");
+        assert_eq!(roles[0].status, RoleCatalogStatus::SourceDrift);
+        assert_eq!(roles[0].source_ref_json["id"], "role.member.reviewer");
+    }
+
+    #[tokio::test]
+    async fn get_role_catalog_endpoint_rejects_invalid_status_filter() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+
+        let response = router(HttpAppState::new(pool))
+            .oneshot(role_catalog_request(Some("status=invalid")))
+            .await
+            .expect("role catalog request should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: ErrorResponse = read_json_body(response).await;
+        assert_eq!(error.error, "IDENTITY_INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
     async fn tombstone_member_endpoint_tombstones_member_without_supplied_gate_ref() {
         let db_mutex = Arc::clone(&DB_TEST_MUTEX);
         let _guard = db_mutex.lock().await;
@@ -1517,6 +1753,47 @@ mod tests {
             .uri(format!(
                 "/identity/global-members/{global_member_id}/summary"
             ))
+            .header(HEADER_ACTOR_REF, "human/admin-http")
+            .header(HEADER_ACTOR_KIND, "human")
+            .body(Body::empty())
+            .expect("request should build")
+    }
+
+    fn audit_trace_request(global_member_id: &str, query: Option<&str>) -> Request<Body> {
+        let mut uri = format!("/identity/global-members/{global_member_id}/audit-trace");
+        if let Some(query) = query {
+            uri.push('?');
+            uri.push_str(query);
+        }
+
+        Request::builder()
+            .uri(uri)
+            .header(HEADER_ACTOR_REF, "human/admin-http")
+            .header(HEADER_ACTOR_KIND, "human")
+            .body(Body::empty())
+            .expect("request should build")
+    }
+
+    fn audit_trace_request_as_system(global_member_id: &str) -> Request<Body> {
+        Request::builder()
+            .uri(format!(
+                "/identity/global-members/{global_member_id}/audit-trace"
+            ))
+            .header(HEADER_ACTOR_REF, "system/http-query")
+            .header(HEADER_ACTOR_KIND, "system")
+            .body(Body::empty())
+            .expect("request should build")
+    }
+
+    fn role_catalog_request(query: Option<&str>) -> Request<Body> {
+        let mut uri = "/identity/role-catalog".to_string();
+        if let Some(query) = query {
+            uri.push('?');
+            uri.push_str(query);
+        }
+
+        Request::builder()
+            .uri(uri)
             .header(HEADER_ACTOR_REF, "human/admin-http")
             .header(HEADER_ACTOR_KIND, "human")
             .body(Body::empty())
@@ -1716,6 +1993,145 @@ mod tests {
             memory_kind: "episodic".to_string(),
             memory_version: Some("v1".to_string()),
         }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct StubMemoryArchiveValidator;
+
+    impl MemoryArchivePort for StubMemoryArchiveValidator {
+        async fn validate_ref(&self, memory_ref: &MemoryRef) -> Result<(), IdentityError> {
+            memory_ref.validate()
+        }
+    }
+
+    async fn seed_member_audit_trail_http(
+        pool: &sqlx::postgres::PgPool,
+    ) -> crate::domain::member::GlobalMemberSummary {
+        let factory = SqlxUnitOfWorkFactory::new(pool.clone());
+        let command_service = MemberLifecycleCommandService::new(factory.clone());
+        let memory_service =
+            MemoryRefsCommandService::new(factory.clone(), StubMemoryArchiveValidator);
+        let career_consumer = CareerEventConsumer::new(CareerEventConsumerService::new(factory));
+        let actor = ActorContext::new("human/admin-audit-http", ActorKind::HumanUser, None);
+
+        let member = command_service
+            .hire_global_member(
+                crate::domain::member::HireGlobalMemberCommand {
+                    display_name: "Member Audit Http".to_string(),
+                    main_role_id: RoleId::new("role.member.operator"),
+                    secondary_role_ids: Vec::new(),
+                },
+                actor.clone(),
+                CommandMetadata::new(
+                    "idem-audit-http-hire",
+                    "trace-audit-http-hire",
+                    "hash-audit-http-hire",
+                ),
+            )
+            .await
+            .expect("hire member for audit http query");
+        memory_service
+            .update_memory_refs(
+                UpdateMemoryRefsCommand {
+                    global_member_id: member.global_member_id.clone(),
+                    semantic_memory_ref: Some(MemoryRef {
+                        memory_id: "memory-audit-http".to_string(),
+                        memory_kind: "semantic".to_string(),
+                        memory_version: Some("v1".to_string()),
+                    }),
+                    episodic_memory_refs: Vec::new(),
+                },
+                actor.clone(),
+                CommandMetadata::new(
+                    "idem-audit-http-memory",
+                    "trace-audit-http-memory",
+                    "hash-audit-http-memory",
+                ),
+            )
+            .await
+            .expect("update memory refs for audit http query");
+        career_consumer
+            .consume_work_event(sample_work_event_http(member.global_member_id.as_str()))
+            .await
+            .expect("append career event for audit http query");
+
+        update_audit_created_at_http(pool, "audit:idem-audit-http-hire", now_http()).await;
+        update_audit_created_at_http(
+            pool,
+            "audit:idem-audit-http-memory",
+            now_http() + Duration::seconds(1),
+        )
+        .await;
+        update_audit_created_at_http(
+            pool,
+            "audit:audit-career-http-event",
+            now_http() + Duration::seconds(2),
+        )
+        .await;
+
+        member
+    }
+
+    async fn update_role_catalog_row_http(
+        pool: &sqlx::postgres::PgPool,
+        role_id: &str,
+        role_name: &str,
+        status: &str,
+    ) {
+        sqlx::query(
+            "UPDATE role_catalog_entries SET role_name = $2, status = $3 WHERE role_id = $1",
+        )
+        .bind(role_id)
+        .bind(role_name)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("update role catalog row");
+    }
+
+    async fn update_audit_created_at_http(
+        pool: &sqlx::postgres::PgPool,
+        audit_trace_id: &str,
+        created_at: PrimitiveDateTime,
+    ) {
+        sqlx::query("UPDATE audit_trace_entries SET created_at = $2 WHERE audit_trace_id = $1")
+            .bind(audit_trace_id)
+            .bind(created_at)
+            .execute(pool)
+            .await
+            .expect("update audit trace created_at");
+    }
+
+    fn sample_work_event_http(global_member_id: &str) -> InboundWorkFactEvent {
+        InboundWorkFactEvent {
+            envelope: InboundEventEnvelope {
+                source_event_id: EventId::new("audit-career-http-event"),
+                source_module: "work".to_string(),
+                event_type: "work.fact.recorded".to_string(),
+                occurred_at: now_http(),
+                payload_hash: "audit-career-http-hash".to_string(),
+                payload: json!({
+                    "global_member_id": GlobalMemberId::new(global_member_id),
+                    "project_id": ProjectId::new("project-audit-http-001"),
+                    "work_ref": {
+                        "work_id": "work-audit-http-001",
+                        "work_kind": "task",
+                        "work_version": "v1",
+                    },
+                    "entry_kind": "assigned",
+                    "started_at": now_http(),
+                    "ended_at": now_http() + Duration::seconds(30),
+                    "payload_summary": {
+                        "title": "Audit query work item http",
+                    }
+                }),
+            },
+        }
+    }
+
+    fn now_http() -> PrimitiveDateTime {
+        let now = OffsetDateTime::now_utc();
+        PrimitiveDateTime::new(now.date(), now.time())
     }
 
     #[test]
