@@ -9,15 +9,24 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPool;
 use tokio::runtime::Handle;
 
+use crate::application::capability_profile::CapabilityProfileCommandService;
 use crate::application::member_lifecycle::MemberLifecycleCommandService;
+use crate::application::memory_refs::MemoryRefsCommandService;
 use crate::application::query_projection::{
     GetMemberSummaryQuery, MemberSummaryDto, QueryProjectionService,
 };
-use crate::domain::member::{GlobalMemberSummary, HireGlobalMemberCommand};
+use crate::domain::capability_profile::{
+    ArtifactRef, CapabilityItem, CapabilityProfileSummary, UpdateCapabilityProfileCommand,
+};
+use crate::domain::member::{
+    GlobalMemberLifecycle, GlobalMemberSummary, HireGlobalMemberCommand, UpdateLifecycleCommand,
+};
+use crate::domain::memory_refs::{MemoryRef, MemoryRefsSummary, UpdateMemoryRefsCommand};
 use crate::domain::shared::context::{ActorContext, ActorKind};
 use crate::domain::shared::ids::{GlobalMemberId, RoleId};
 use crate::domain::shared::metadata::CommandMetadata;
 use crate::error::IdentityError;
+use crate::outbound::{ArtifactPort, MemoryArchivePort};
 use crate::persistence::unit_of_work::SqlxUnitOfWorkFactory;
 
 const HEADER_ACTOR_REF: &str = "x-identity-actor-ref";
@@ -80,6 +89,66 @@ impl HttpAppState {
             message: format!("get_member_summary task join failed: {error}"),
         })?
     }
+
+    async fn update_lifecycle(
+        &self,
+        command: UpdateLifecycleCommand,
+        actor: ActorContext,
+        metadata: CommandMetadata,
+    ) -> Result<GlobalMemberSummary, IdentityError> {
+        let factory = self.unit_of_work_factory();
+        tokio::task::spawn_blocking(move || {
+            Handle::current().block_on(async move {
+                MemberLifecycleCommandService::new(factory)
+                    .update_lifecycle(command, actor, metadata)
+                    .await
+            })
+        })
+        .await
+        .map_err(|error| IdentityError::PersistenceData {
+            message: format!("update_lifecycle task join failed: {error}"),
+        })?
+    }
+
+    async fn update_capability_profile(
+        &self,
+        command: UpdateCapabilityProfileCommand,
+        actor: ActorContext,
+        metadata: CommandMetadata,
+    ) -> Result<CapabilityProfileSummary, IdentityError> {
+        let factory = self.unit_of_work_factory();
+        tokio::task::spawn_blocking(move || {
+            Handle::current().block_on(async move {
+                CapabilityProfileCommandService::new(factory, NoopArtifactPort)
+                    .update_capability_profile(command, actor, metadata)
+                    .await
+            })
+        })
+        .await
+        .map_err(|error| IdentityError::PersistenceData {
+            message: format!("update_capability_profile task join failed: {error}"),
+        })?
+    }
+
+    async fn update_memory_refs(
+        &self,
+        command: UpdateMemoryRefsCommand,
+        actor: ActorContext,
+        metadata: CommandMetadata,
+    ) -> Result<MemoryRefsSummary, IdentityError> {
+        let factory = self.unit_of_work_factory();
+        tokio::task::spawn_blocking(move || {
+            Handle::current().block_on(async move {
+                MemoryRefsCommandService::new(factory, NoopMemoryArchivePort)
+                    .update_memory_refs(command, actor, metadata)
+                    .await
+            })
+        })
+        .await
+        .map_err(|error| IdentityError::PersistenceData {
+            message: format!("update_memory_refs task join failed: {error}"),
+        })?
+    }
 }
 
 /// Builds the HTTP router for the current service state.
@@ -126,7 +195,7 @@ async fn hire_global_member(
     Json(request): Json<HireGlobalMemberRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let actor = actor_context_from_headers(&headers)?;
-    let metadata = command_metadata_from_headers(&headers, &request)?;
+    let metadata = command_metadata_from_headers(&headers, request.request_hash_payload()?)?;
     let summary = state
         .hire_global_member(request.into_command(), actor, metadata)
         .await
@@ -135,16 +204,61 @@ async fn hire_global_member(
     Ok((StatusCode::CREATED, Json(summary)))
 }
 
-async fn update_lifecycle(Path(_global_member_id): Path<String>) -> impl IntoResponse {
-    not_implemented("UpdateLifecycle")
+async fn update_lifecycle(
+    State(state): State<HttpAppState>,
+    Path(global_member_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateLifecycleRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = actor_context_from_headers(&headers)?;
+    let metadata = command_metadata_from_headers(
+        &headers,
+        request_hash_payload("update_lifecycle", &request)?,
+    )?;
+    let summary = state
+        .update_lifecycle(request.into_command(global_member_id), actor, metadata)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok((StatusCode::OK, Json(summary)))
 }
 
-async fn update_capability_profile(Path(_global_member_id): Path<String>) -> impl IntoResponse {
-    not_implemented("UpdateCapabilityProfile")
+async fn update_capability_profile(
+    State(state): State<HttpAppState>,
+    Path(global_member_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateCapabilityProfileRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = actor_context_from_headers(&headers)?;
+    let metadata = command_metadata_from_headers(
+        &headers,
+        request_hash_payload("update_capability_profile", &request)?,
+    )?;
+    let summary = state
+        .update_capability_profile(request.into_command(global_member_id), actor, metadata)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok((StatusCode::OK, Json(summary)))
 }
 
-async fn update_memory_refs(Path(_global_member_id): Path<String>) -> impl IntoResponse {
-    not_implemented("UpdateMemoryRefs")
+async fn update_memory_refs(
+    State(state): State<HttpAppState>,
+    Path(global_member_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateMemoryRefsRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let actor = actor_context_from_headers(&headers)?;
+    let metadata = command_metadata_from_headers(
+        &headers,
+        request_hash_payload("update_memory_refs", &request)?,
+    )?;
+    let summary = state
+        .update_memory_refs(request.into_command(global_member_id), actor, metadata)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok((StatusCode::OK, Json(summary)))
 }
 
 async fn tombstone_member(Path(_global_member_id): Path<String>) -> impl IntoResponse {
@@ -194,7 +308,7 @@ fn actor_context_from_headers(headers: &HeaderMap) -> Result<ActorContext, ApiEr
 
 fn command_metadata_from_headers(
     headers: &HeaderMap,
-    request: &HireGlobalMemberRequest,
+    request_hash: String,
 ) -> Result<CommandMetadata, ApiError> {
     let idempotency_key = required_header(headers, HEADER_IDEMPOTENCY_KEY)?;
     let trace_id = required_header(headers, HEADER_TRACE_ID)?;
@@ -202,8 +316,22 @@ fn command_metadata_from_headers(
     Ok(CommandMetadata::new(
         idempotency_key,
         trace_id,
-        request.request_hash(),
+        request_hash,
     ))
+}
+
+fn request_hash_payload<T>(operation: &'static str, request: &T) -> Result<String, ApiError>
+where
+    T: Serialize,
+{
+    let json = serde_json::to_string(request).map_err(|error| {
+        ApiError::bad_request(
+            "IDENTITY_INVALID_ARGUMENT",
+            format!("request payload for `{operation}` could not be serialized: {error}"),
+        )
+    })?;
+
+    Ok(format!("{operation}|payload={json}"))
 }
 
 fn actor_kind_from_header(value: &str) -> Result<ActorKind, ApiError> {
@@ -402,21 +530,84 @@ impl HireGlobalMemberRequest {
         }
     }
 
-    fn request_hash(&self) -> String {
-        let display_name =
-            serde_json::to_string(self.display_name.trim()).expect("display_name should serialize");
-        let main_role_id =
-            serde_json::to_string(self.main_role_id.trim()).expect("main_role_id should serialize");
-        let secondary_role_ids = self
-            .secondary_role_ids
-            .iter()
-            .map(|value| serde_json::to_string(value).expect("secondary role should serialize"))
-            .collect::<Vec<_>>()
-            .join(",");
+    fn request_hash_payload(&self) -> Result<String, ApiError> {
+        request_hash_payload("hire_global_member", self)
+    }
+}
 
-        format!(
-            "hire_global_member|display_name={display_name}|main_role_id={main_role_id}|secondary_role_ids=[{secondary_role_ids}]"
-        )
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpdateLifecycleRequest {
+    target_lifecycle: GlobalMemberLifecycle,
+    reason: String,
+    expected_version: Option<i64>,
+}
+
+impl UpdateLifecycleRequest {
+    fn into_command(self, global_member_id: String) -> UpdateLifecycleCommand {
+        UpdateLifecycleCommand {
+            global_member_id: GlobalMemberId::new(global_member_id),
+            target_lifecycle: self.target_lifecycle,
+            reason: self.reason,
+            expected_version: self.expected_version,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpdateCapabilityProfileRequest {
+    capabilities: Vec<CapabilityItem>,
+    evidence_refs: Vec<ArtifactRef>,
+    expected_version: Option<i64>,
+}
+
+impl UpdateCapabilityProfileRequest {
+    fn into_command(self, global_member_id: String) -> UpdateCapabilityProfileCommand {
+        UpdateCapabilityProfileCommand {
+            global_member_id: GlobalMemberId::new(global_member_id),
+            capabilities: self.capabilities,
+            evidence_refs: self.evidence_refs,
+            expected_version: self.expected_version,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpdateMemoryRefsRequest {
+    semantic_memory_ref: Option<MemoryRef>,
+    #[serde(default)]
+    episodic_memory_refs: Vec<MemoryRef>,
+}
+
+impl UpdateMemoryRefsRequest {
+    fn into_command(self, global_member_id: String) -> UpdateMemoryRefsCommand {
+        UpdateMemoryRefsCommand {
+            global_member_id: GlobalMemberId::new(global_member_id),
+            semantic_memory_ref: self.semantic_memory_ref,
+            episodic_memory_refs: self.episodic_memory_refs,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct NoopArtifactPort;
+
+impl ArtifactPort for NoopArtifactPort {
+    async fn validate_refs(&self, refs: &[ArtifactRef]) -> Result<(), IdentityError> {
+        for artifact_ref in refs {
+            artifact_ref.validate()?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct NoopMemoryArchivePort;
+
+impl MemoryArchivePort for NoopMemoryArchivePort {
+    async fn validate_ref(&self, memory_ref: &MemoryRef) -> Result<(), IdentityError> {
+        memory_ref.validate()?;
+        Ok(())
     }
 }
 
@@ -434,7 +625,11 @@ mod tests {
 
     use crate::application::query_projection::MemberSummaryDto;
     use crate::config::AppConfig;
-    use crate::domain::member::GlobalMemberSummary;
+    use crate::domain::capability_profile::{
+        ArtifactRef, CapabilityItem, CapabilityProfileSummary,
+    };
+    use crate::domain::member::{GlobalMemberLifecycle, GlobalMemberSummary};
+    use crate::domain::memory_refs::{MemoryRef, MemoryRefsSummary};
     use crate::operations::ProjectionRebuildJob;
     use crate::persistence::database::run_migrations;
     use crate::persistence::test_support::DB_TEST_MUTEX;
@@ -677,6 +872,301 @@ mod tests {
         assert_eq!(summary.main_role_name.as_deref(), Some("Member Operator"));
     }
 
+    #[tokio::test]
+    async fn update_lifecycle_endpoint_updates_member_state() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let app = router(HttpAppState::new(pool.clone()));
+        let hire = app
+            .clone()
+            .oneshot(hire_request(
+                "idem-http-lifecycle-hire-001",
+                "trace-http-lifecycle-hire-001",
+                json!({
+                    "display_name": "Member Lifecycle Http",
+                    "main_role_id": "role.member.operator",
+                    "secondary_role_ids": []
+                }),
+            ))
+            .await
+            .expect("hire request should succeed");
+        let member: GlobalMemberSummary = read_json_body(hire).await;
+
+        let response = app
+            .oneshot(update_lifecycle_request(
+                member.global_member_id.as_str(),
+                "idem-http-lifecycle-001",
+                "trace-http-lifecycle-001",
+                json!({
+                    "target_lifecycle": "active",
+                    "reason": "activate through http",
+                    "expected_version": 0
+                }),
+            ))
+            .await
+            .expect("lifecycle update should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let summary: GlobalMemberSummary = read_json_body(response).await;
+        assert_eq!(summary.lifecycle, GlobalMemberLifecycle::Active);
+    }
+
+    #[tokio::test]
+    async fn update_lifecycle_endpoint_rejects_illegal_transition() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let app = router(HttpAppState::new(pool));
+        let hire = app
+            .clone()
+            .oneshot(hire_request(
+                "idem-http-lifecycle-hire-002",
+                "trace-http-lifecycle-hire-002",
+                json!({
+                    "display_name": "Member Lifecycle Invalid Http",
+                    "main_role_id": "role.member.operator",
+                    "secondary_role_ids": []
+                }),
+            ))
+            .await
+            .expect("hire request should succeed");
+        let member: GlobalMemberSummary = read_json_body(hire).await;
+
+        let response = app
+            .oneshot(update_lifecycle_request(
+                member.global_member_id.as_str(),
+                "idem-http-lifecycle-002",
+                "trace-http-lifecycle-002",
+                json!({
+                    "target_lifecycle": "paused",
+                    "reason": "pause before activation",
+                    "expected_version": 0
+                }),
+            ))
+            .await
+            .expect("lifecycle update should respond");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error: ErrorResponse = read_json_body(response).await;
+        assert_eq!(error.error, "IDENTITY_LIFECYCLE_TRANSITION_INVALID");
+    }
+
+    #[tokio::test]
+    async fn update_capability_profile_endpoint_updates_profile() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let app = router(HttpAppState::new(pool));
+        let hire = app
+            .clone()
+            .oneshot(hire_request(
+                "idem-http-capability-hire-001",
+                "trace-http-capability-hire-001",
+                json!({
+                    "display_name": "Member Capability Http",
+                    "main_role_id": "role.member.operator",
+                    "secondary_role_ids": []
+                }),
+            ))
+            .await
+            .expect("hire request should succeed");
+        let member: GlobalMemberSummary = read_json_body(hire).await;
+
+        let response = app
+            .oneshot(update_capability_profile_request(
+                member.global_member_id.as_str(),
+                "idem-http-capability-001",
+                "trace-http-capability-001",
+                json!({
+                    "capabilities": [{
+                        "capability_id": "cap.http.1",
+                        "capability_name": "HTTP Capability",
+                        "proficiency": "advanced",
+                        "notes": "added via http"
+                    }],
+                    "evidence_refs": [{
+                        "artifact_id": "artifact-http-1",
+                        "artifact_kind": "evidence",
+                        "artifact_version": "v1"
+                    }],
+                    "expected_version": 0
+                }),
+            ))
+            .await
+            .expect("capability update should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let summary: CapabilityProfileSummary = read_json_body(response).await;
+        assert_eq!(summary.version, 1);
+        assert_eq!(summary.capabilities, sample_capabilities_http());
+        assert_eq!(summary.evidence_refs, sample_evidence_refs_http());
+    }
+
+    #[tokio::test]
+    async fn update_capability_profile_endpoint_rejects_invalid_artifact_ref() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let app = router(HttpAppState::new(pool));
+        let hire = app
+            .clone()
+            .oneshot(hire_request(
+                "idem-http-capability-hire-002",
+                "trace-http-capability-hire-002",
+                json!({
+                    "display_name": "Member Capability Invalid Http",
+                    "main_role_id": "role.member.operator",
+                    "secondary_role_ids": []
+                }),
+            ))
+            .await
+            .expect("hire request should succeed");
+        let member: GlobalMemberSummary = read_json_body(hire).await;
+
+        let response = app
+            .oneshot(update_capability_profile_request(
+                member.global_member_id.as_str(),
+                "idem-http-capability-002",
+                "trace-http-capability-002",
+                json!({
+                    "capabilities": [{
+                        "capability_id": "cap.http.2",
+                        "capability_name": "Bad Artifact Capability",
+                        "proficiency": null,
+                        "notes": null
+                    }],
+                    "evidence_refs": [{
+                        "artifact_id": "   ",
+                        "artifact_kind": "evidence",
+                        "artifact_version": null
+                    }],
+                    "expected_version": 0
+                }),
+            ))
+            .await
+            .expect("capability update should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: ErrorResponse = read_json_body(response).await;
+        assert_eq!(error.error, "IDENTITY_INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
+    async fn update_memory_refs_endpoint_updates_refs() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let app = router(HttpAppState::new(pool));
+        let hire = app
+            .clone()
+            .oneshot(hire_request(
+                "idem-http-memory-hire-001",
+                "trace-http-memory-hire-001",
+                json!({
+                    "display_name": "Member Memory Http",
+                    "main_role_id": "role.member.operator",
+                    "secondary_role_ids": []
+                }),
+            ))
+            .await
+            .expect("hire request should succeed");
+        let member: GlobalMemberSummary = read_json_body(hire).await;
+
+        let response = app
+            .oneshot(update_memory_refs_request(
+                member.global_member_id.as_str(),
+                "idem-http-memory-001",
+                "trace-http-memory-001",
+                json!({
+                    "semantic_memory_ref": {
+                        "memory_id": "memory-semantic-http-1",
+                        "memory_kind": "semantic",
+                        "memory_version": "v1"
+                    },
+                    "episodic_memory_refs": [{
+                        "memory_id": "memory-episodic-http-1",
+                        "memory_kind": "episodic",
+                        "memory_version": "v1"
+                    }]
+                }),
+            ))
+            .await
+            .expect("memory refs update should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let summary: MemoryRefsSummary = read_json_body(response).await;
+        assert_eq!(
+            summary.semantic_memory_ref,
+            Some(sample_semantic_memory_ref_http())
+        );
+        assert_eq!(
+            summary.episodic_memory_refs,
+            vec![sample_episodic_memory_ref_http()]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_memory_refs_endpoint_rejects_invalid_memory_ref() {
+        let db_mutex = Arc::clone(&DB_TEST_MUTEX);
+        let _guard = db_mutex.lock().await;
+        let pool = test_pool().await;
+        reset_tables(&pool).await;
+        seed_role(&pool, "role.member.operator", "Member Operator").await;
+
+        let app = router(HttpAppState::new(pool));
+        let hire = app
+            .clone()
+            .oneshot(hire_request(
+                "idem-http-memory-hire-002",
+                "trace-http-memory-hire-002",
+                json!({
+                    "display_name": "Member Memory Invalid Http",
+                    "main_role_id": "role.member.operator",
+                    "secondary_role_ids": []
+                }),
+            ))
+            .await
+            .expect("hire request should succeed");
+        let member: GlobalMemberSummary = read_json_body(hire).await;
+
+        let response = app
+            .oneshot(update_memory_refs_request(
+                member.global_member_id.as_str(),
+                "idem-http-memory-002",
+                "trace-http-memory-002",
+                json!({
+                    "semantic_memory_ref": {
+                        "memory_id": "   ",
+                        "memory_kind": "semantic",
+                        "memory_version": null
+                    },
+                    "episodic_memory_refs": []
+                }),
+            ))
+            .await
+            .expect("memory refs update should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: ErrorResponse = read_json_body(response).await;
+        assert_eq!(error.error, "IDENTITY_INVALID_ARGUMENT");
+    }
+
     fn hire_request(
         idempotency_key: &str,
         trace_id: &str,
@@ -703,6 +1193,71 @@ mod tests {
             .header(HEADER_ACTOR_REF, "human/admin-http")
             .header(HEADER_ACTOR_KIND, "human")
             .body(Body::empty())
+            .expect("request should build")
+    }
+
+    fn update_lifecycle_request(
+        global_member_id: &str,
+        idempotency_key: &str,
+        trace_id: &str,
+        payload: serde_json::Value,
+    ) -> Request<Body> {
+        json_request(
+            "POST",
+            &format!("/identity/global-members/{global_member_id}/lifecycle"),
+            idempotency_key,
+            trace_id,
+            payload,
+        )
+    }
+
+    fn update_capability_profile_request(
+        global_member_id: &str,
+        idempotency_key: &str,
+        trace_id: &str,
+        payload: serde_json::Value,
+    ) -> Request<Body> {
+        json_request(
+            "PUT",
+            &format!("/identity/global-members/{global_member_id}/capability-profile"),
+            idempotency_key,
+            trace_id,
+            payload,
+        )
+    }
+
+    fn update_memory_refs_request(
+        global_member_id: &str,
+        idempotency_key: &str,
+        trace_id: &str,
+        payload: serde_json::Value,
+    ) -> Request<Body> {
+        json_request(
+            "PUT",
+            &format!("/identity/global-members/{global_member_id}/memory-refs"),
+            idempotency_key,
+            trace_id,
+            payload,
+        )
+    }
+
+    fn json_request(
+        method: &str,
+        uri: &str,
+        idempotency_key: &str,
+        trace_id: &str,
+        payload: serde_json::Value,
+    ) -> Request<Body> {
+        let body = serde_json::to_vec(&payload).expect("payload should serialize");
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header(HEADER_ACTOR_REF, "human/admin-http")
+            .header(HEADER_ACTOR_KIND, "human")
+            .header(HEADER_IDEMPOTENCY_KEY, idempotency_key)
+            .header(HEADER_TRACE_ID, trace_id)
+            .body(Body::from(body))
             .expect("request should build")
     }
 
@@ -786,6 +1341,39 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed role catalog entry");
+    }
+
+    fn sample_capabilities_http() -> Vec<CapabilityItem> {
+        vec![CapabilityItem {
+            capability_id: "cap.http.1".to_string(),
+            capability_name: "HTTP Capability".to_string(),
+            proficiency: Some("advanced".to_string()),
+            notes: Some("added via http".to_string()),
+        }]
+    }
+
+    fn sample_evidence_refs_http() -> Vec<ArtifactRef> {
+        vec![ArtifactRef {
+            artifact_id: "artifact-http-1".to_string(),
+            artifact_kind: "evidence".to_string(),
+            artifact_version: Some("v1".to_string()),
+        }]
+    }
+
+    fn sample_semantic_memory_ref_http() -> MemoryRef {
+        MemoryRef {
+            memory_id: "memory-semantic-http-1".to_string(),
+            memory_kind: "semantic".to_string(),
+            memory_version: Some("v1".to_string()),
+        }
+    }
+
+    fn sample_episodic_memory_ref_http() -> MemoryRef {
+        MemoryRef {
+            memory_id: "memory-episodic-http-1".to_string(),
+            memory_kind: "episodic".to_string(),
+            memory_version: Some("v1".to_string()),
+        }
     }
 
     #[test]
