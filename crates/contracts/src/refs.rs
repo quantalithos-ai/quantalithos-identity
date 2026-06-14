@@ -142,6 +142,16 @@ validated_string_newtype!(
     "memory_reference_id",
     "Stable opaque identifier for an identity memory reference relation."
 );
+validated_string_newtype!(
+    ProjectionStateId,
+    "projection_state_id",
+    "Stable opaque identifier for an identity projection state."
+);
+validated_string_newtype!(
+    ReferenceResolutionStateId,
+    "reference_resolution_state_id",
+    "Stable opaque identifier for an identity reference resolution state."
+);
 
 /// Entry channel that explains why identity code is executing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -226,6 +236,38 @@ impl GlobalMemberId {
     /// Returns whether both typed identifiers are equal.
     pub fn same_id(&self, other: &GlobalMemberId) -> bool {
         self == other
+    }
+}
+
+/// Typed reference to an identity projection state.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ProjectionStateRef {
+    /// Stable projection state identifier.
+    pub projection_state_id: ProjectionStateId,
+}
+
+impl ProjectionStateRef {
+    /// Creates a typed ref from a validated projection state identifier.
+    pub fn from_id(projection_state_id: ProjectionStateId) -> Self {
+        Self {
+            projection_state_id,
+        }
+    }
+}
+
+/// Typed reference to an identity reference resolution state.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ReferenceResolutionStateRef {
+    /// Stable reference resolution state identifier.
+    pub resolution_state_id: ReferenceResolutionStateId,
+}
+
+impl ReferenceResolutionStateRef {
+    /// Creates a typed ref from a validated reference resolution state identifier.
+    pub fn from_id(resolution_state_id: ReferenceResolutionStateId) -> Self {
+        Self {
+            resolution_state_id,
+        }
     }
 }
 
@@ -1654,6 +1696,206 @@ pub struct MemoryReferenceChangeMaterialMarker {
     pub material_kind: MemoryReferenceChangeMaterialKind,
     /// Optional body-free source marker.
     pub source_ref: Option<IdentitySourceRef>,
+}
+
+/// Projection source cursor marker used by projection freshness helpers.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct IdentityProjectionCursorRef {
+    /// Opaque projection source cursor marker.
+    pub source_cursor_ref: IdentitySourceRef,
+}
+
+impl IdentityProjectionCursorRef {
+    /// Creates a new projection source cursor marker.
+    pub fn new(source_cursor_ref: IdentitySourceRef) -> Self {
+        Self { source_cursor_ref }
+    }
+}
+
+/// External reference category used by identity without owning external truth.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalReferenceKind {
+    /// Method-library role or capability source.
+    MethodSource,
+    /// Work participation source.
+    WorkParticipation,
+    /// Governance basis source.
+    GovernanceBasis,
+    /// Memory carrier source.
+    Memory,
+    /// Archive package or handoff target source.
+    Archive,
+    /// Runtime or observability source marker.
+    RuntimeSignal,
+}
+
+/// Body-free reference to an external truth owner.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct ExternalReferenceRef {
+    /// External reference category.
+    pub reference_kind: ExternalReferenceKind,
+    /// Opaque external reference marker.
+    pub source_ref: IdentitySourceRef,
+}
+
+impl ExternalReferenceRef {
+    /// Creates a new external reference marker.
+    pub fn new(reference_kind: ExternalReferenceKind, source_ref: IdentitySourceRef) -> Self {
+        Self {
+            reference_kind,
+            source_ref,
+        }
+    }
+}
+
+/// Identity object category that owns the local use of an external reference.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityReferenceOwnerKind {
+    /// Role capability summary or source snapshot.
+    RoleCapability,
+    /// Career record or career source marker.
+    CareerRecord,
+    /// Memory reference relation.
+    MemoryReference,
+    /// Lifecycle governance basis.
+    LifecycleBasis,
+    /// Projection or maintenance marker.
+    Maintenance,
+}
+
+/// Body-free reference to the local identity owner of an external reference.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct IdentityReferenceOwnerRef {
+    /// Owner category.
+    pub owner_kind: IdentityReferenceOwnerKind,
+    /// Opaque owner marker.
+    pub owner_ref: IdentitySourceRef,
+}
+
+impl IdentityReferenceOwnerRef {
+    /// Creates a new local owner marker for an external reference.
+    pub fn new(owner_kind: IdentityReferenceOwnerKind, owner_ref: IdentitySourceRef) -> Self {
+        Self {
+            owner_kind,
+            owner_ref,
+        }
+    }
+}
+
+/// External source version marker.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct ExternalSourceVersionRef {
+    /// Opaque external version marker.
+    pub version_ref: IdentitySourceRef,
+}
+
+impl ExternalSourceVersionRef {
+    /// Creates a new external source version marker.
+    pub fn new(version_ref: IdentitySourceRef) -> Self {
+        Self { version_ref }
+    }
+}
+
+/// Body-free safe summary marker for a resolved external reference.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExternalReferenceSafeSummaryRef {
+    /// External reference being summarized.
+    pub external_reference_ref: ExternalReferenceRef,
+    /// Opaque safe summary source marker.
+    pub safe_summary_ref: IdentitySourceRef,
+}
+
+impl ExternalReferenceSafeSummaryRef {
+    /// Creates a new safe summary marker for an external reference.
+    pub fn new(
+        external_reference_ref: ExternalReferenceRef,
+        safe_summary_ref: IdentitySourceRef,
+    ) -> Self {
+        Self {
+            external_reference_ref,
+            safe_summary_ref,
+        }
+    }
+}
+
+/// Maintenance scope marker for rebuild, refresh, and reconciliation paths.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceScopeRef {
+    /// Opaque maintenance scope marker.
+    pub scope_ref: IdentitySourceRef,
+}
+
+impl MaintenanceScopeRef {
+    /// Creates a new maintenance scope marker.
+    pub fn new(scope_ref: IdentitySourceRef) -> Self {
+        Self { scope_ref }
+    }
+}
+
+/// Formal outbox delivery attempt marker.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct OutboxDeliveryAttemptRef {
+    /// Opaque attempt source marker.
+    pub attempt_ref: IdentitySourceRef,
+}
+
+impl OutboxDeliveryAttemptRef {
+    /// Creates a new outbox delivery attempt marker.
+    pub fn new(attempt_ref: IdentitySourceRef) -> Self {
+        Self { attempt_ref }
+    }
+}
+
+/// Safe outbox delivery issue marker.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct OutboxDeliveryIssueRef {
+    /// Opaque issue source marker.
+    pub issue_ref: IdentitySourceRef,
+}
+
+impl OutboxDeliveryIssueRef {
+    /// Creates a new outbox delivery issue marker.
+    pub fn new(issue_ref: IdentitySourceRef) -> Self {
+        Self { issue_ref }
+    }
+}
+
+string_newtype!(AuditTrailRef, "Audit trail reference.");
+string_newtype!(HandoffScopeRef, "Handoff scope marker.");
+string_newtype!(HandoffTargetRef, "Handoff target marker.");
+string_newtype!(
+    TraceHandoffSafeMaterialRef,
+    "Safe trace handoff material marker."
+);
+
+/// Formal handoff attempt marker.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct HandoffAttemptRef {
+    /// Opaque attempt source marker.
+    pub attempt_ref: IdentitySourceRef,
+}
+
+impl HandoffAttemptRef {
+    /// Creates a new handoff attempt marker.
+    pub fn new(attempt_ref: IdentitySourceRef) -> Self {
+        Self { attempt_ref }
+    }
+}
+
+/// Safe handoff issue marker.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct HandoffIssueRef {
+    /// Opaque issue source marker.
+    pub issue_ref: IdentitySourceRef,
+}
+
+impl HandoffIssueRef {
+    /// Creates a new handoff issue marker.
+    pub fn new(issue_ref: IdentitySourceRef) -> Self {
+        Self { issue_ref }
+    }
 }
 
 string_newtype!(

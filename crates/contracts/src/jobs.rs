@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::protocol::{IdentityJobName, IdentityProtocolSchemaVersionRef};
 use crate::refs::{
-    GlobalMemberRef, HandoffReceiptRef, IdentityJobCursorRef, IdentityJobReportRef,
-    IdentityJobRunMetadataRef, IdentityJobRunRef, IdentityJobScopeMarkerRef,
+    ExternalReferenceRef, GlobalMemberRef, HandoffReceiptRef, IdentityJobCursorRef,
+    IdentityJobReportRef, IdentityJobRunMetadataRef, IdentityJobRunRef, IdentityJobScopeMarkerRef,
     IdentityMaintenanceTargetRef, IdentityOutboxRecordRef, IdentityProjectionRef,
     IdentityStoredResultRef, IdentityTimestamp, ReconciliationReportRef,
 };
@@ -65,9 +65,9 @@ pub struct IdentityJobReportSurface {
     /// Failed projection refs.
     pub failed_projection_refs: Vec<IdentityProjectionRef>,
     /// Refreshed external reference refs.
-    pub refreshed_reference_refs: Vec<core_contracts::metadata::ExternalReferenceRef>,
+    pub refreshed_reference_refs: Vec<ExternalReferenceRef>,
     /// Failed external reference refs.
-    pub failed_reference_refs: Vec<core_contracts::metadata::ExternalReferenceRef>,
+    pub failed_reference_refs: Vec<ExternalReferenceRef>,
     /// Inspected maintenance targets.
     pub inspected_target_refs: Vec<IdentityMaintenanceTargetRef>,
     /// Generated report refs.
