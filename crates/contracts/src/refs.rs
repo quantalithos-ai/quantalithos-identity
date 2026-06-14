@@ -1862,6 +1862,50 @@ impl OutboxDeliveryIssueRef {
     }
 }
 
+/// Identity accepted change category.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityChangeKind {
+    /// Member anchor was established or held.
+    MemberAnchorChanged,
+    /// Lifecycle state changed.
+    LifecycleChanged,
+    /// Role capability summary changed.
+    RoleCapabilitySummaryChanged,
+    /// Career record was appended or corrected.
+    CareerRecordChanged,
+    /// Memory reference changed.
+    MemoryReferenceChanged,
+    /// Trace correction was appended.
+    TraceCorrectionAppended,
+    /// Derived marker changed without creating core truth.
+    DerivedMarkerChanged,
+}
+
+/// Body-free change kind marker used by trace and outbox helpers.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct IdentityChangeKindRef {
+    /// Change kind category.
+    pub change_kind: IdentityChangeKind,
+    /// Optional body-free source marker for versioned change kinds.
+    pub source_ref: Option<IdentitySourceRef>,
+}
+
+impl IdentityChangeKindRef {
+    /// Creates a new change kind marker.
+    pub fn new(change_kind: IdentityChangeKind, source_ref: Option<IdentitySourceRef>) -> Self {
+        Self {
+            change_kind,
+            source_ref,
+        }
+    }
+
+    /// Returns whether both change kind markers are equal.
+    pub fn same_kind(&self, other: &IdentityChangeKindRef) -> bool {
+        self.change_kind == other.change_kind && self.source_ref == other.source_ref
+    }
+}
+
 string_newtype!(AuditTrailRef, "Audit trail reference.");
 string_newtype!(HandoffScopeRef, "Handoff scope marker.");
 string_newtype!(HandoffTargetRef, "Handoff target marker.");

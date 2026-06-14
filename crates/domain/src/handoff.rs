@@ -1,0 +1,393 @@
+//! Handoff propagation state helpers.
+
+use identity_contracts::receipts::TraceHandoffIntentRef;
+use identity_contracts::refs::{
+    AuditTrailRef, GlobalMemberRef, HandoffAttemptRef, HandoffIssueRef, HandoffReceiptRef,
+    HandoffScopeRef, HandoffTargetRef, IdentityTimestamp, IdentityTraceRecordRef,
+    TraceHandoffSafeMaterialRef,
+};
+
+use crate::errors::IdentityDomainError;
+
+/// Handoff delivery lifecycle state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HandoffStateKind {
+    /// Handoff exists and is waiting for delivery.
+    PendingHandoff,
+    /// Formal delivery receipt was accepted.
+    Delivered,
+    /// Delivery failed but may be retried.
+    RetryableFailed,
+    /// Delivery failed terminally.
+    Failed,
+    /// Delivery was cancelled before completion.
+    Cancelled,
+}
+
+/// Handoff delivery state marker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HandoffState {
+    /// Current delivery state.
+    pub state_kind: HandoffStateKind,
+    /// Optional handoff attempt marker.
+    pub attempt_ref: Option<HandoffAttemptRef>,
+    /// Optional formal receipt marker.
+    pub receipt_ref: Option<HandoffReceiptRef>,
+    /// Optional safe issue marker.
+    pub issue_ref: Option<HandoffIssueRef>,
+    /// Latest state change timestamp.
+    pub changed_at: IdentityTimestamp,
+}
+
+impl HandoffState {
+    /// Creates a pending handoff state.
+    pub fn pending(changed_at: IdentityTimestamp) -> Self {
+        Self {
+            state_kind: HandoffStateKind::PendingHandoff,
+            attempt_ref: None,
+            receipt_ref: None,
+            issue_ref: None,
+            changed_at,
+        }
+    }
+
+    /// Creates a delivered handoff state.
+    pub fn delivered(
+        attempt_ref: HandoffAttemptRef,
+        receipt_ref: HandoffReceiptRef,
+        changed_at: IdentityTimestamp,
+    ) -> Self {
+        Self {
+            state_kind: HandoffStateKind::Delivered,
+            attempt_ref: Some(attempt_ref),
+            receipt_ref: Some(receipt_ref),
+            issue_ref: None,
+            changed_at,
+        }
+    }
+
+    /// Creates a retryable failed handoff state.
+    pub fn retryable_failed(
+        attempt_ref: HandoffAttemptRef,
+        issue_ref: HandoffIssueRef,
+        changed_at: IdentityTimestamp,
+    ) -> Self {
+        Self {
+            state_kind: HandoffStateKind::RetryableFailed,
+            attempt_ref: Some(attempt_ref),
+            receipt_ref: None,
+            issue_ref: Some(issue_ref),
+            changed_at,
+        }
+    }
+
+    /// Creates a terminal failed handoff state.
+    pub fn failed(
+        attempt_ref: HandoffAttemptRef,
+        issue_ref: HandoffIssueRef,
+        changed_at: IdentityTimestamp,
+    ) -> Self {
+        Self {
+            state_kind: HandoffStateKind::Failed,
+            attempt_ref: Some(attempt_ref),
+            receipt_ref: None,
+            issue_ref: Some(issue_ref),
+            changed_at,
+        }
+    }
+
+    /// Creates a cancelled handoff state.
+    pub fn cancelled(issue_ref: HandoffIssueRef, changed_at: IdentityTimestamp) -> Self {
+        Self {
+            state_kind: HandoffStateKind::Cancelled,
+            attempt_ref: None,
+            receipt_ref: None,
+            issue_ref: Some(issue_ref),
+            changed_at,
+        }
+    }
+
+    /// Returns whether retry may select this state.
+    pub fn is_retryable(&self) -> bool {
+        self.state_kind == HandoffStateKind::RetryableFailed
+    }
+
+    /// Returns whether this state is terminal.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.state_kind,
+            HandoffStateKind::Delivered | HandoffStateKind::Failed | HandoffStateKind::Cancelled
+        )
+    }
+}
+
+/// Trace handoff intent shell with terminal delivery guards.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceHandoffIntent {
+    /// Handoff identity.
+    pub handoff_intent_ref: TraceHandoffIntentRef,
+    /// Member that owns the handoff subject.
+    pub member_ref: GlobalMemberRef,
+    /// Trace refs included in the handoff.
+    pub trace_record_refs: Vec<IdentityTraceRecordRef>,
+    /// Optional audit trail ref included in the handoff.
+    pub audit_trail_ref: Option<AuditTrailRef>,
+    /// Handoff target marker.
+    pub handoff_target_ref: HandoffTargetRef,
+    /// Handoff scope marker.
+    pub handoff_scope_ref: HandoffScopeRef,
+    /// Safe handoff material marker.
+    pub safe_material_ref: TraceHandoffSafeMaterialRef,
+    /// Current handoff state.
+    pub handoff_state: HandoffState,
+    /// Create timestamp.
+    pub created_at: IdentityTimestamp,
+    /// Update timestamp.
+    pub updated_at: IdentityTimestamp,
+}
+
+impl TraceHandoffIntent {
+    /// Returns whether the intent targets the provided handoff target.
+    pub fn targets(&self, target_ref: &HandoffTargetRef) -> bool {
+        self.handoff_target_ref == *target_ref
+    }
+
+    /// Returns whether the intent contains the provided trace ref.
+    pub fn contains_trace(&self, trace_record_ref: &IdentityTraceRecordRef) -> bool {
+        self.trace_record_refs.contains(trace_record_ref)
+    }
+
+    /// Returns whether retry may select this handoff.
+    pub fn is_retryable(&self) -> bool {
+        self.handoff_state.is_retryable()
+    }
+
+    /// Marks the handoff delivered.
+    pub fn mark_delivered(&mut self, state: HandoffState) -> Result<(), IdentityDomainError> {
+        if state.state_kind != HandoffStateKind::Delivered
+            || state.attempt_ref.is_none()
+            || state.receipt_ref.is_none()
+        {
+            return Err(IdentityDomainError::invalid_input(
+                "handoff_state",
+                "delivered handoff state requires attempt and receipt markers",
+            ));
+        }
+
+        match self.handoff_state.state_kind {
+            HandoffStateKind::PendingHandoff | HandoffStateKind::RetryableFailed => {
+                self.updated_at = state.changed_at;
+                self.handoff_state = state;
+                Ok(())
+            }
+            _ => Err(IdentityDomainError::invalid_state_transition(
+                "TraceHandoffIntent",
+                "terminal handoff state cannot be delivered again",
+            )),
+        }
+    }
+
+    /// Marks the handoff retryable failed.
+    pub fn mark_retryable_failed(
+        &mut self,
+        state: HandoffState,
+    ) -> Result<(), IdentityDomainError> {
+        if state.state_kind != HandoffStateKind::RetryableFailed
+            || state.attempt_ref.is_none()
+            || state.issue_ref.is_none()
+        {
+            return Err(IdentityDomainError::invalid_input(
+                "handoff_state",
+                "retryable failed handoff state requires attempt and issue markers",
+            ));
+        }
+
+        match self.handoff_state.state_kind {
+            HandoffStateKind::PendingHandoff | HandoffStateKind::RetryableFailed => {
+                self.updated_at = state.changed_at;
+                self.handoff_state = state;
+                Ok(())
+            }
+            _ => Err(IdentityDomainError::invalid_state_transition(
+                "TraceHandoffIntent",
+                "terminal handoff state cannot become retryable failed",
+            )),
+        }
+    }
+
+    /// Marks the handoff terminal failed.
+    pub fn mark_failed(&mut self, state: HandoffState) -> Result<(), IdentityDomainError> {
+        if state.state_kind != HandoffStateKind::Failed
+            || state.attempt_ref.is_none()
+            || state.issue_ref.is_none()
+        {
+            return Err(IdentityDomainError::invalid_input(
+                "handoff_state",
+                "failed handoff state requires attempt and issue markers",
+            ));
+        }
+
+        match self.handoff_state.state_kind {
+            HandoffStateKind::PendingHandoff | HandoffStateKind::RetryableFailed => {
+                self.updated_at = state.changed_at;
+                self.handoff_state = state;
+                Ok(())
+            }
+            _ => Err(IdentityDomainError::invalid_state_transition(
+                "TraceHandoffIntent",
+                "terminal handoff state cannot fail again",
+            )),
+        }
+    }
+
+    /// Marks the handoff cancelled.
+    pub fn mark_cancelled(&mut self, state: HandoffState) -> Result<(), IdentityDomainError> {
+        if state.state_kind != HandoffStateKind::Cancelled || state.issue_ref.is_none() {
+            return Err(IdentityDomainError::invalid_input(
+                "handoff_state",
+                "cancelled handoff state requires an issue marker",
+            ));
+        }
+
+        match self.handoff_state.state_kind {
+            HandoffStateKind::PendingHandoff | HandoffStateKind::RetryableFailed => {
+                self.updated_at = state.changed_at;
+                self.handoff_state = state;
+                Ok(())
+            }
+            _ => Err(IdentityDomainError::invalid_state_transition(
+                "TraceHandoffIntent",
+                "terminal handoff state cannot be cancelled again",
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use identity_contracts::receipts::TraceHandoffIntentRef;
+    use identity_contracts::refs::{
+        AuditTrailRef, ExternalSourceRef, GlobalMemberId, GlobalMemberRef, HandoffAttemptRef,
+        HandoffIssueRef, HandoffReceiptRef, HandoffScopeRef, HandoffTargetRef, IdentitySourceOwner,
+        IdentitySourceRef, IdentityTimestamp, IdentityTraceRecordRef, TraceHandoffSafeMaterialRef,
+    };
+
+    use super::{HandoffState, TraceHandoffIntent};
+    use crate::errors::IdentityDomainError;
+
+    fn timestamp(value: i64) -> IdentityTimestamp {
+        IdentityTimestamp::from_clock(value).expect("valid timestamp")
+    }
+
+    fn source(token: &str) -> IdentitySourceRef {
+        IdentitySourceRef::new(
+            IdentitySourceOwner::Identity,
+            ExternalSourceRef::new(token.to_owned()).expect("valid external source ref"),
+        )
+        .expect("valid source ref")
+    }
+
+    fn member_ref() -> GlobalMemberRef {
+        GlobalMemberRef::from_id(
+            GlobalMemberId::new("member-1".to_owned()).expect("valid member id"),
+        )
+    }
+
+    fn handoff_intent() -> TraceHandoffIntent {
+        TraceHandoffIntent {
+            handoff_intent_ref: TraceHandoffIntentRef::new("handoff-1"),
+            member_ref: member_ref(),
+            trace_record_refs: vec![IdentityTraceRecordRef::new("trace-1")],
+            audit_trail_ref: Some(AuditTrailRef::new("audit-1")),
+            handoff_target_ref: HandoffTargetRef::new("target-1"),
+            handoff_scope_ref: HandoffScopeRef::new("scope-1"),
+            safe_material_ref: TraceHandoffSafeMaterialRef::new("material-1"),
+            handoff_state: HandoffState::pending(timestamp(1)),
+            created_at: timestamp(1),
+            updated_at: timestamp(1),
+        }
+    }
+
+    fn attempt_ref() -> HandoffAttemptRef {
+        HandoffAttemptRef::new(source("attempt-1"))
+    }
+
+    fn receipt_ref() -> HandoffReceiptRef {
+        HandoffReceiptRef::new("receipt-1")
+    }
+
+    fn issue_ref() -> HandoffIssueRef {
+        HandoffIssueRef::new(source("issue-1"))
+    }
+
+    #[test]
+    fn retry_selector_only_picks_retryable_handoff() {
+        let pending = HandoffState::pending(timestamp(1));
+        let retryable = HandoffState::retryable_failed(attempt_ref(), issue_ref(), timestamp(2));
+        let delivered = HandoffState::delivered(attempt_ref(), receipt_ref(), timestamp(3));
+        let cancelled = HandoffState::cancelled(issue_ref(), timestamp(4));
+
+        assert!(!pending.is_retryable());
+        assert!(retryable.is_retryable());
+        assert!(!delivered.is_retryable());
+        assert!(!cancelled.is_retryable());
+    }
+
+    #[test]
+    fn delivered_handoff_is_terminal_for_retry() {
+        let mut intent = handoff_intent();
+        intent
+            .mark_delivered(HandoffState::delivered(
+                attempt_ref(),
+                receipt_ref(),
+                timestamp(2),
+            ))
+            .expect("pending handoff can be delivered");
+
+        assert!(intent.handoff_state.is_terminal());
+        assert!(!intent.is_retryable());
+
+        let error = intent
+            .mark_retryable_failed(HandoffState::retryable_failed(
+                attempt_ref(),
+                issue_ref(),
+                timestamp(3),
+            ))
+            .expect_err("delivered handoff must remain terminal");
+
+        assert_eq!(
+            error,
+            IdentityDomainError::InvalidStateTransition {
+                entity: "TraceHandoffIntent",
+                message: "terminal handoff state cannot become retryable failed",
+            }
+        );
+    }
+
+    #[test]
+    fn cancelled_handoff_remains_terminal() {
+        let mut intent = handoff_intent();
+        intent
+            .mark_cancelled(HandoffState::cancelled(issue_ref(), timestamp(2)))
+            .expect("pending handoff can be cancelled");
+
+        assert!(intent.handoff_state.is_terminal());
+        assert!(!intent.is_retryable());
+
+        let error = intent
+            .mark_delivered(HandoffState::delivered(
+                attempt_ref(),
+                receipt_ref(),
+                timestamp(3),
+            ))
+            .expect_err("cancelled handoff must not deliver later");
+
+        assert_eq!(
+            error,
+            IdentityDomainError::InvalidStateTransition {
+                entity: "TraceHandoffIntent",
+                message: "terminal handoff state cannot be delivered again",
+            }
+        );
+    }
+}
