@@ -1999,6 +1999,10 @@ string_newtype!(IdentityStoredResultRef, "Stored replay surface reference.");
 string_newtype!(IdentityTraceContextRef, "Runtime trace context marker.");
 string_newtype!(IdentityTraceRecordRef, "Identity trace record reference.");
 string_newtype!(
+    IdentityTraceSubjectRef,
+    "Canonical trace subject reference."
+);
+string_newtype!(
     IdentityTruthCursor,
     "Committed identity truth cursor marker."
 );

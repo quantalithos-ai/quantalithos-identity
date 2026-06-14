@@ -15,8 +15,8 @@ use identity_contracts::refs::{
     IdentityJobRunMetadataRef, IdentityJobRunRef, IdentityJobScopeMarkerRef,
     IdentityMaintenanceTargetRef, IdentityOutboxRecordRef, IdentityProjectionRef,
     IdentityRedactionMarkerRef, IdentitySourceEventRef, IdentityStoredResultRef, IdentityTimestamp,
-    IdentityTraceContextRef, IdentityTraceRecordRef, IdentityTruthCursor, ReconciliationReportRef,
-    VisibilityContextRef, VisibilityResultRef, VisibilityScopeRef,
+    IdentityTraceContextRef, IdentityTraceRecordRef, IdentityTraceSubjectRef, IdentityTruthCursor,
+    ReconciliationReportRef, VisibilityContextRef, VisibilityResultRef, VisibilityScopeRef,
 };
 use serde::{Deserialize, Serialize};
 
@@ -207,6 +207,17 @@ pub struct IdentityProjectionRefSet {
 pub struct ExternalReferenceRefSet {
     /// External reference refs in deterministic order.
     pub reference_refs: Vec<ExternalReferenceRef>,
+}
+
+/// Accepted subject refs that share one canonical identity subject key.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityAcceptedSubjectRefs {
+    /// Trace subject used by accepted trace records.
+    pub trace_subject_ref: IdentityTraceSubjectRef,
+    /// Audit subject used by audit trails.
+    pub audit_subject_ref: identity_contracts::refs::IdentityAuditSubjectRef,
+    /// Outbox subject used by accepted outbox records.
+    pub outbox_subject_ref: identity_contracts::refs::IdentityOutboxSubjectRef,
 }
 
 /// Application-local entry surface classification.

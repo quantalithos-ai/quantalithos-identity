@@ -1,23 +1,27 @@
 //! Application-local port traits for shared helpers and runtime foundations.
 
 use core_contracts::actor::ActorRef;
+use identity_contracts::protocol::IdentityJobName;
+use identity_contracts::receipts::MaintenanceIssueRef;
 use identity_contracts::receipts::TraceHandoffIntentRef;
 use identity_contracts::refs::{
-    GlobalMemberId, HandoffIssueRef, HandoffReceiptRef, IdentityJobRunRef,
-    IdentityOutboxPayloadMarkerRef, IdentityOutboxRecordRef, IdentitySourceEventRef,
-    IdentityStoredResultRef, IdentityTruthCursor, RoleCapabilitySourceSnapshotId,
-    RoleCapabilitySummaryId,
+    ExternalReferenceRef, GlobalMemberId, GlobalMemberRef, HandoffIssueRef, HandoffReceiptRef,
+    IdentityConsumerBindingRef, IdentityJobRunRef, IdentityOutboxPayloadMarkerRef,
+    IdentityOutboxRecordRef, IdentityProjectionRef, IdentitySourceEventRef,
+    IdentityStoredResultRef, IdentityTraceSubjectRef, IdentityTruthCursor,
+    RoleCapabilitySourceSnapshotId, RoleCapabilitySummaryId,
 };
 
 use crate::errors::ApplicationError;
 use crate::support::{
-    AuditTrailId, IdentityApiEntryRef, IdentityCommandEffectSummaryRef, IdentityEntryDispatchRef,
-    IdentityIdempotencyKey, IdentityIdempotencyRecordRef, IdentityJobDispatchRef,
-    IdentityJobEntryRef, IdentityOperationContext, IdentityOperationContextRef,
-    IdentityOperationName, IdentityRequestDigest, IdentityRequestMetadataRef,
-    IdentityRuntimeAssemblyRef, IdentityStoredSurfaceMarkerRef, IdentityTraceRecordId,
-    IdentityTransactionRef, IdentityWorkerDispatchRef, IdentityWorkerEntryRef, MemberSummaryViewId,
-    ReconciliationReportId,
+    AuditTrailId, IdentityAcceptedSubjectRefs, IdentityApiEntryRef, IdentityApiRouteRef,
+    IdentityCommandEffectSummaryRef, IdentityDispatchTargetRef, IdentityEntryDispatchRef,
+    IdentityEntrySurfaceKind, IdentityIdempotencyKey, IdentityIdempotencyRecordRef,
+    IdentityJobDispatchRef, IdentityJobEntryRef, IdentityOperationContext,
+    IdentityOperationContextRef, IdentityOperationName, IdentityRequestDigest,
+    IdentityRequestMetadataRef, IdentityRuntimeAssemblyRef, IdentityStoredSurfaceMarkerRef,
+    IdentityTraceRecordId, IdentityTransactionRef, IdentityWorkerDispatchRef,
+    IdentityWorkerEntryRef, MemberSummaryViewId, ReconciliationReportId,
 };
 
 /// Shared unit-of-work handle used by all write-side application flows.
@@ -238,4 +242,185 @@ pub trait IdentityOperationContextFactoryPort {
         context_ref: IdentityOperationContextRef,
         started_at: identity_contracts::refs::IdentityTimestamp,
     ) -> Result<IdentityOperationContext, ApplicationError>;
+}
+
+/// Maps accepted truth refs to canonical trace, audit, and outbox subjects.
+pub trait IdentityTruthChangeSubjectMapper {
+    /// Returns accepted subject refs for a member truth.
+    fn member_subjects(&self, member_ref: GlobalMemberRef) -> IdentityAcceptedSubjectRefs;
+
+    /// Returns accepted subject refs for a role capability summary truth.
+    fn role_capability_subjects(
+        &self,
+        summary_ref: identity_contracts::refs::RoleCapabilitySummaryRef,
+    ) -> IdentityAcceptedSubjectRefs;
+
+    /// Returns accepted subject refs for a role capability source snapshot truth.
+    fn role_capability_source_snapshot_subjects(
+        &self,
+        snapshot_ref: identity_contracts::refs::RoleCapabilitySourceSnapshotRef,
+    ) -> IdentityAcceptedSubjectRefs;
+
+    /// Returns accepted subject refs for a career record truth.
+    fn career_record_subjects(
+        &self,
+        record_ref: identity_contracts::refs::CareerRecordRef,
+    ) -> IdentityAcceptedSubjectRefs;
+
+    /// Returns accepted subject refs for a memory reference truth.
+    fn memory_reference_subjects(
+        &self,
+        reference_ref: identity_contracts::refs::MemoryReferenceRef,
+    ) -> IdentityAcceptedSubjectRefs;
+
+    /// Returns accepted subject refs for an outbox record.
+    fn outbox_record_subjects(
+        &self,
+        outbox_ref: IdentityOutboxRecordRef,
+    ) -> IdentityAcceptedSubjectRefs;
+
+    /// Returns accepted subject refs for a handoff intent.
+    fn handoff_intent_subjects(
+        &self,
+        intent_ref: TraceHandoffIntentRef,
+    ) -> IdentityAcceptedSubjectRefs;
+}
+
+/// Maps body-free identity marker refs into trace subject refs.
+pub trait IdentityMarkerSubjectMapper {
+    /// Returns the trace subject for a source marker.
+    fn source_marker_subject(
+        &self,
+        source_ref: identity_contracts::refs::IdentitySourceRef,
+    ) -> IdentityTraceSubjectRef;
+
+    /// Returns the trace subject for an external reference marker.
+    fn external_reference_marker_subject(
+        &self,
+        reference_ref: ExternalReferenceRef,
+    ) -> IdentityTraceSubjectRef;
+
+    /// Returns the trace subject for a projection marker.
+    fn projection_marker_subject(
+        &self,
+        projection_ref: IdentityProjectionRef,
+    ) -> IdentityTraceSubjectRef;
+
+    /// Returns the trace subject for a job run marker.
+    fn job_marker_subject(&self, job_run_ref: IdentityJobRunRef) -> IdentityTraceSubjectRef;
+
+    /// Returns the trace subject for a handoff receipt marker.
+    fn handoff_receipt_marker_subject(
+        &self,
+        receipt_ref: HandoffReceiptRef,
+    ) -> IdentityTraceSubjectRef;
+}
+
+/// Maps maintenance and propagation issues into safe maintenance issue refs.
+pub trait IdentityMaintenanceIssueMapper {
+    /// Converts a missing projection state into a safe maintenance issue ref.
+    fn projection_missing_state_issue(
+        &self,
+        projection_ref: IdentityProjectionRef,
+    ) -> MaintenanceIssueRef;
+
+    /// Converts a missing projection cursor into a safe maintenance issue ref.
+    fn projection_missing_cursor_issue(
+        &self,
+        projection_ref: IdentityProjectionRef,
+    ) -> MaintenanceIssueRef;
+
+    /// Converts an unsupported projection writer into a safe maintenance issue ref.
+    fn projection_unsupported_writer_issue(
+        &self,
+        projection_ref: IdentityProjectionRef,
+    ) -> MaintenanceIssueRef;
+
+    /// Converts a missing external reference state into a safe maintenance issue ref.
+    fn reference_missing_state_issue(
+        &self,
+        reference_ref: ExternalReferenceRef,
+    ) -> MaintenanceIssueRef;
+
+    /// Converts a failed external reference refresh into a safe maintenance issue ref.
+    fn reference_refresh_failed_issue(
+        &self,
+        reference_ref: ExternalReferenceRef,
+    ) -> MaintenanceIssueRef;
+
+    /// Converts an outbox retryable issue into a safe maintenance issue ref.
+    fn outbox_retryable_issue(
+        &self,
+        issue_ref: identity_contracts::refs::OutboxDeliveryIssueRef,
+    ) -> MaintenanceIssueRef;
+
+    /// Converts an outbox permanent issue into a safe maintenance issue ref.
+    fn outbox_permanent_issue(
+        &self,
+        issue_ref: identity_contracts::refs::OutboxDeliveryIssueRef,
+    ) -> MaintenanceIssueRef;
+
+    /// Converts an outbox skipped issue into a safe maintenance issue ref.
+    fn outbox_skipped_issue(
+        &self,
+        issue_ref: identity_contracts::refs::OutboxDeliveryIssueRef,
+    ) -> MaintenanceIssueRef;
+
+    /// Converts an outbox unsupported-topic issue into a safe maintenance issue ref.
+    fn outbox_unsupported_topic_issue(
+        &self,
+        issue_ref: identity_contracts::refs::OutboxDeliveryIssueRef,
+    ) -> MaintenanceIssueRef;
+
+    /// Converts a retryable handoff issue into a safe maintenance issue ref.
+    fn handoff_retryable_issue(&self, issue_ref: HandoffIssueRef) -> MaintenanceIssueRef;
+
+    /// Converts a permanent handoff issue into a safe maintenance issue ref.
+    fn handoff_permanent_issue(&self, issue_ref: HandoffIssueRef) -> MaintenanceIssueRef;
+
+    /// Converts a cancelled handoff issue into a safe maintenance issue ref.
+    fn handoff_cancelled_issue(&self, issue_ref: HandoffIssueRef) -> MaintenanceIssueRef;
+
+    /// Converts an unsupported-target handoff issue into a safe maintenance issue ref.
+    fn handoff_unsupported_target_issue(&self, issue_ref: HandoffIssueRef) -> MaintenanceIssueRef;
+}
+
+/// Returns application service targets for API, worker, and job entry guards.
+pub trait IdentityDispatchTargetCatalogPort {
+    /// Returns the application command target for the given API route.
+    fn api_command_target(
+        &self,
+        route_ref: IdentityApiRouteRef,
+    ) -> Result<IdentityDispatchTargetRef, ApplicationError>;
+
+    /// Returns the application query target for the given API route.
+    fn api_query_target(
+        &self,
+        route_ref: IdentityApiRouteRef,
+    ) -> Result<IdentityDispatchTargetRef, ApplicationError>;
+
+    /// Returns the worker consumer target for the given consumer binding.
+    fn worker_consumer_target(
+        &self,
+        binding_ref: IdentityConsumerBindingRef,
+    ) -> Result<IdentityDispatchTargetRef, ApplicationError>;
+
+    /// Returns the worker callback target for the given consumer binding.
+    fn worker_callback_target(
+        &self,
+        binding_ref: IdentityConsumerBindingRef,
+    ) -> Result<IdentityDispatchTargetRef, ApplicationError>;
+
+    /// Returns the job target for the given public job name.
+    fn job_target(
+        &self,
+        job_name: IdentityJobName,
+    ) -> Result<IdentityDispatchTargetRef, ApplicationError>;
+
+    /// Asserts that the provided target is a valid application service target for the surface.
+    fn assert_application_target(
+        &self,
+        surface_kind: IdentityEntrySurfaceKind,
+        target_ref: IdentityDispatchTargetRef,
+    ) -> Result<(), ApplicationError>;
 }
