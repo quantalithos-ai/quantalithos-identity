@@ -47,16 +47,17 @@ mod tests {
         IdentityPublicPageRequest, IdentityQueryRequest, IdentityQueryResponse,
     };
     use crate::refs::{
-        GlobalMemberRef, HandoffReceiptRef, IdentityApiRequestMarkerRef, IdentityAuditSubjectRef,
-        IdentityCanonicalRequestMarkerRef, IdentityConsumerBindingRef, IdentityConsumerReceiptRef,
-        IdentityDegradedMarkerRef, IdentityJobCursorRef, IdentityJobReportRef,
-        IdentityJobRunMetadataRef, IdentityJobRunRef, IdentityJobScopeMarkerRef,
-        IdentityMaintenanceTargetRef, IdentityOutboxPayloadMarkerRef, IdentityOutboxRecordRef,
-        IdentityOutboxSubjectRef, IdentityProjectionRef, IdentityReadSurfaceKind,
-        IdentityRedactionMarkerRef, IdentityRequestDigestValue, IdentitySourceEventRef,
-        IdentityStoredResultRef, IdentityTimestamp, IdentityTraceContextRef,
-        IdentityTraceRecordRef, IdentityTruthCursor, ProjectionFreshnessMarkerRef,
-        ReconciliationReportRef, TopicKeyRef, VisibilityContextRef, VisibilityResultRef,
+        GlobalMemberId, GlobalMemberRef, HandoffReceiptRef, IdentityApiRequestMarkerRef,
+        IdentityAuditSubjectRef, IdentityCanonicalRequestMarkerRef, IdentityConsumerBindingRef,
+        IdentityConsumerReceiptRef, IdentityDegradedMarkerRef, IdentityJobCursorRef,
+        IdentityJobReportRef, IdentityJobRunMetadataRef, IdentityJobRunRef,
+        IdentityJobScopeMarkerRef, IdentityMaintenanceTargetRef, IdentityOutboxPayloadMarkerRef,
+        IdentityOutboxRecordRef, IdentityOutboxSubjectRef, IdentityProjectionRef,
+        IdentityReadSurfaceKind, IdentityRedactionMarkerRef, IdentityRequestDigestValue,
+        IdentitySourceEventRef, IdentityStoredResultRef, IdentityTimestamp,
+        IdentityTraceContextRef, IdentityTraceRecordRef, IdentityTruthCursor,
+        ProjectionFreshnessMarkerRef, ReconciliationReportRef, TopicKeyRef, VisibilityContextRef,
+        VisibilityResultRef,
     };
 
     fn roundtrip<T>(value: &T)
@@ -71,6 +72,12 @@ mod tests {
 
     fn sample_actor_ref() -> ActorRef {
         ActorRef::new("actor-1", ActorKind::Human)
+    }
+
+    fn sample_member_ref() -> GlobalMemberRef {
+        GlobalMemberRef::from_id(
+            GlobalMemberId::new("member-1".to_owned()).expect("sample member id should be valid"),
+        )
     }
 
     fn sample_command_metadata() -> IdentityCommandMetadata {
@@ -254,7 +261,7 @@ mod tests {
             report: IdentityJobReportSurface {
                 job_run_ref: IdentityJobRunRef::new("job-run-1"),
                 result_kind: IdentityJobResultKind::Partial,
-                affected_member_refs: vec![GlobalMemberRef::new("member-1")],
+                affected_member_refs: vec![sample_member_ref()],
                 affected_projection_refs: vec![IdentityProjectionRef::new("projection-1")],
                 rebuilt_projection_refs: vec![],
                 failed_projection_refs: vec![],
