@@ -8,3 +8,7 @@ rust-version.workspace = true
 [lib]
 name = "identity_domain"
 path = "src/lib.rs"
+
+[dependencies]
+core-contracts.workspace = true
+identity-contracts = { path = "../contracts" }
