@@ -1,0 +1,10 @@
+[package]
+name = "identity-application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "identity_application"
+path = "src/lib.rs"
