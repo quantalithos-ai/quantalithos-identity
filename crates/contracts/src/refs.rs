@@ -1958,6 +1958,14 @@ string_newtype!(
     IdentityTruthCursor,
     "Committed identity truth cursor marker."
 );
+string_newtype!(
+    ReconciliationFindingIntentRef,
+    "Reconciliation finding intent marker."
+);
+string_newtype!(
+    ReconciliationFindingRef,
+    "Reconciliation finding reference."
+);
 string_newtype!(ReconciliationReportRef, "Reconciliation report reference.");
 string_newtype!(TopicKeyRef, "Topic binding key marker.");
 string_newtype!(VisibilityContextRef, "Visibility context marker.");
@@ -1968,6 +1976,8 @@ string_newtype!(
     "Public visibility decision reference."
 );
 string_newtype!(HandoffReceiptRef, "Formal handoff receipt reference.");
+
+pub use crate::receipts::{MaintenanceIssueRef, TraceHandoffIntentRef};
 
 /// Identity-side timestamp captured from the configured clock source.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
