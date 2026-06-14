@@ -18,6 +18,12 @@ version = "0.1.0"
 [[package]]
 name = "identity-application"
 version = "0.1.0"
+dependencies = [
+ "core-contracts",
+ "identity-contracts",
+ "identity-domain",
+ "serde",
+]
 
 [[package]]
 name = "identity-contracts"
