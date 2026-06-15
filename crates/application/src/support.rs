@@ -2,6 +2,7 @@
 
 use core_contracts::actor::ActorRef;
 use core_contracts::metadata::IdempotencyKey;
+use identity_contracts::events::IdentityConsumerReceipt;
 use identity_contracts::jobs::IdentityJobResultKind;
 use identity_contracts::metadata::IdentityDegradedKind;
 use identity_contracts::protocol::{
@@ -581,6 +582,24 @@ impl IdentityIdempotencyRecord {
     }
 }
 
+/// Result of attempting to reserve an idempotency key inside a write transaction.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum IdempotencyReserveOutcome {
+    /// A fresh reservation was created for the current operation.
+    Reserved(Versioned<IdentityIdempotencyRecord>),
+    /// A completed same-digest record may replay a stored result.
+    ReplayAvailable {
+        /// Existing versioned idempotency record.
+        record: Versioned<IdentityIdempotencyRecord>,
+        /// Stored replay surface referenced by the record.
+        stored_result_ref: IdentityStoredResultRef,
+    },
+    /// The same key is already bound to a different request digest.
+    Conflict(Versioned<IdentityIdempotencyRecord>),
+    /// The same key and digest are still reserved but not yet replayable.
+    InFlight(Versioned<IdentityIdempotencyRecord>),
+}
+
 /// Stable stored replay result classification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -705,6 +724,59 @@ impl StoredIdentityOperationResult {
             operation_context_ref,
             result_kind,
             surface_marker_ref,
+            recorded_at,
+        }
+    }
+}
+
+/// Typed stored receipt envelope used as the duplicate replay source.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityConsumerReceiptEnvelope {
+    /// Stable stored result identity.
+    pub stored_result_ref: IdentityStoredResultRef,
+    /// Operation context that produced the replayable receipt.
+    pub operation_context_ref: IdentityOperationContextRef,
+    /// Replayable stored result kind.
+    pub result_kind: IdentityStoredResultKind,
+    /// Body-free stored surface marker.
+    pub surface_marker_ref: IdentityStoredSurfaceMarkerRef,
+    /// Full public receipt shell returned during duplicate replay.
+    pub receipt: IdentityConsumerReceipt,
+    /// Timestamp when the receipt envelope was recorded.
+    pub recorded_at: IdentityTimestamp,
+}
+
+impl IdentityConsumerReceiptEnvelope {
+    /// Creates a stored consumer receipt envelope.
+    pub fn consumer_receipt(
+        operation_context_ref: IdentityOperationContextRef,
+        surface_marker_ref: IdentityStoredSurfaceMarkerRef,
+        receipt: IdentityConsumerReceipt,
+        recorded_at: IdentityTimestamp,
+    ) -> Self {
+        Self {
+            stored_result_ref: receipt.stored_result_ref.clone(),
+            operation_context_ref,
+            result_kind: IdentityStoredResultKind::ConsumerReceipt,
+            surface_marker_ref,
+            receipt,
+            recorded_at,
+        }
+    }
+
+    /// Creates a stored handoff callback receipt envelope.
+    pub fn handoff_callback_receipt(
+        operation_context_ref: IdentityOperationContextRef,
+        surface_marker_ref: IdentityStoredSurfaceMarkerRef,
+        receipt: IdentityConsumerReceipt,
+        recorded_at: IdentityTimestamp,
+    ) -> Self {
+        Self {
+            stored_result_ref: receipt.stored_result_ref.clone(),
+            operation_context_ref,
+            result_kind: IdentityStoredResultKind::HandoffCallbackReceipt,
+            surface_marker_ref,
+            receipt,
             recorded_at,
         }
     }

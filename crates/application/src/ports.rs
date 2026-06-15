@@ -31,6 +31,7 @@ use identity_domain::handoff::TraceHandoffIntent;
 use identity_domain::lifecycle::GlobalLifecycleState;
 use identity_domain::member_identity::{GlobalMember, IdentityAnchorState};
 use identity_domain::memory_reference::MemoryReference;
+use identity_domain::outbox::IdentityOutboxRecord;
 use identity_domain::projection_state::ProjectionState;
 use identity_domain::reconciliation::{ReconciliationReport, ReconciliationReportStateKind};
 use identity_domain::reference_state::ReferenceResolutionState;
@@ -41,8 +42,9 @@ use identity_domain::trace::IdentityTraceRecord;
 
 use crate::errors::ApplicationError;
 use crate::support::{
-    AuditTrailId, IdentityAcceptedSubjectRefs, IdentityAdapterAvailability, IdentityAdapterModeRef,
-    IdentityAdapterRef, IdentityApiEntryRef, IdentityApiRouteRef, IdentityCommandEffectSummaryRef,
+    AuditTrailId, IdempotencyReserveOutcome, IdentityAcceptedSubjectRefs,
+    IdentityAdapterAvailability, IdentityAdapterModeRef, IdentityAdapterRef, IdentityApiEntryRef,
+    IdentityApiRouteRef, IdentityCommandEffectSummaryRef, IdentityConsumerReceiptEnvelope,
     IdentityDispatchTargetRef, IdentityEntryDispatchRef, IdentityEntrySurfaceKind,
     IdentityIdempotencyKey, IdentityIdempotencyRecordRef, IdentityJobDispatchRef,
     IdentityJobEntryRef, IdentityOperationContext, IdentityOperationContextRef,
@@ -50,7 +52,7 @@ use crate::support::{
     IdentityRequestMetadataRef, IdentityRuntimeAssemblyRef, IdentityStoredSurfaceMarkerRef,
     IdentityTraceRecordId, IdentityTransactionRef, IdentityVersion, IdentityVersionedRef,
     IdentityWorkerDispatchRef, IdentityWorkerEntryRef, MemberSummaryViewId, Page,
-    ReconciliationReportId, Versioned,
+    ReconciliationReportId, StoredIdentityOperationResult, Versioned,
 };
 
 /// Shared unit-of-work handle used by all write-side application flows.
@@ -1152,6 +1154,267 @@ pub trait IdentityReconciliationReportRepository {
         expected_version: Option<IdentityVersion>,
         uow: &dyn IdentityUnitOfWork,
     ) -> Result<IdentityVersionedRef<ReconciliationReportRef>, ApplicationError>;
+}
+
+/// Repository for accepted outbox records and publish state transitions.
+pub trait IdentityOutboxRepository {
+    /// Loads an outbox record and version.
+    fn get_outbox_record_with_version(
+        &self,
+        outbox_ref: IdentityOutboxRecordRef,
+    ) -> Result<Option<Versioned<IdentityOutboxRecord>>, ApplicationError>;
+
+    /// Lists pending outbox records, optionally filtered by topic.
+    fn list_pending_outbox_records(
+        &self,
+        topic_key_ref: Option<TopicKeyRef>,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<IdentityOutboxRecordRef>>, ApplicationError>;
+
+    /// Lists retryable outbox records, optionally filtered by topic.
+    fn list_retryable_outbox_records(
+        &self,
+        topic_key_ref: Option<TopicKeyRef>,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<IdentityOutboxRecordRef>>, ApplicationError>;
+
+    /// Lists outbox records by formal outbox subject.
+    fn list_outbox_records_by_subject(
+        &self,
+        subject_ref: IdentityOutboxSubjectRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<IdentityOutboxRecordRef>>, ApplicationError>;
+
+    /// Lists outbox records related to a trace record.
+    fn find_outbox_records_by_trace(
+        &self,
+        trace_record_ref: IdentityTraceRecordRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<IdentityOutboxRecordRef>>, ApplicationError>;
+
+    /// Saves an outbox record using an optional expected version.
+    fn save_outbox_record(
+        &self,
+        record: IdentityOutboxRecord,
+        expected_version: Option<IdentityVersion>,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<IdentityOutboxRecordRef>, ApplicationError>;
+
+    /// Updates the publish state of a loaded outbox record.
+    fn update_outbox_state(
+        &self,
+        record: IdentityOutboxRecord,
+        expected_version: IdentityVersion,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<IdentityOutboxRecordRef>, ApplicationError>;
+}
+
+/// Repository for operation idempotency reserve, conflict, completion, and replay lookup.
+pub trait IdentityIdempotencyRepository {
+    /// Loads an idempotency record by operation namespace and key.
+    fn get_by_key(
+        &self,
+        operation_name: IdentityOperationName,
+        channel: identity_contracts::refs::IdentityOperationChannel,
+        idempotency_key: IdentityIdempotencyKey,
+    ) -> Result<Option<Versioned<crate::support::IdentityIdempotencyRecord>>, ApplicationError>;
+
+    /// Reserves a new idempotency record or returns the existing same-key outcome.
+    fn reserve(
+        &self,
+        context: IdentityOperationContext,
+        record_ref: IdentityIdempotencyRecordRef,
+        reserved_at: identity_contracts::refs::IdentityTimestamp,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdempotencyReserveOutcome, ApplicationError>;
+
+    /// Completes a loaded record with a replayable accepted stored result.
+    fn complete_with_stored_result(
+        &self,
+        record: crate::support::IdentityIdempotencyRecord,
+        stored_result_ref: IdentityStoredResultRef,
+        completed_at: identity_contracts::refs::IdentityTimestamp,
+        expected_version: IdentityVersion,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<IdentityIdempotencyRecordRef>, ApplicationError>;
+
+    /// Completes a loaded record with a replayable rejected stored result.
+    fn complete_rejected_with_stored_result(
+        &self,
+        record: crate::support::IdentityIdempotencyRecord,
+        stored_result_ref: IdentityStoredResultRef,
+        completed_at: identity_contracts::refs::IdentityTimestamp,
+        expected_version: IdentityVersion,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<IdentityIdempotencyRecordRef>, ApplicationError>;
+
+    /// Marks a loaded record conflicting for same-key different-digest input.
+    fn mark_conflict(
+        &self,
+        record: crate::support::IdentityIdempotencyRecord,
+        conflicted_at: identity_contracts::refs::IdentityTimestamp,
+        expected_version: IdentityVersion,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<IdentityIdempotencyRecordRef>, ApplicationError>;
+}
+
+/// Repository for replayable stored result shells and typed receipt envelopes.
+pub trait IdentityStoredResultRepository {
+    /// Loads a generic stored result shell by stored result ref.
+    fn get_stored_result(
+        &self,
+        stored_result_ref: IdentityStoredResultRef,
+    ) -> Result<Option<StoredIdentityOperationResult>, ApplicationError>;
+
+    /// Finds a generic stored result shell by operation context ref.
+    fn find_by_operation_context(
+        &self,
+        context_ref: IdentityOperationContextRef,
+    ) -> Result<Option<StoredIdentityOperationResult>, ApplicationError>;
+
+    /// Saves a stored accepted command result shell.
+    fn save_command_accepted_result(
+        &self,
+        result: StoredIdentityOperationResult,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityStoredResultRef, ApplicationError>;
+
+    /// Saves a stored rejected command result shell.
+    fn save_command_rejected_result(
+        &self,
+        result: StoredIdentityOperationResult,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityStoredResultRef, ApplicationError>;
+
+    /// Saves a generic stored consumer receipt result shell.
+    fn save_consumer_receipt_result(
+        &self,
+        result: StoredIdentityOperationResult,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityStoredResultRef, ApplicationError>;
+
+    /// Loads a typed consumer receipt envelope by stored result ref.
+    fn get_consumer_receipt(
+        &self,
+        stored_result_ref: IdentityStoredResultRef,
+    ) -> Result<Option<IdentityConsumerReceiptEnvelope>, ApplicationError>;
+
+    /// Saves a typed consumer receipt envelope.
+    fn save_consumer_receipt(
+        &self,
+        envelope: IdentityConsumerReceiptEnvelope,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityStoredResultRef, ApplicationError>;
+
+    /// Saves a stored job report result shell.
+    fn save_job_report_result(
+        &self,
+        result: StoredIdentityOperationResult,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityStoredResultRef, ApplicationError>;
+
+    /// Saves a generic stored handoff callback receipt result shell.
+    fn save_handoff_callback_receipt_result(
+        &self,
+        result: StoredIdentityOperationResult,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityStoredResultRef, ApplicationError>;
+
+    /// Loads a typed handoff callback receipt envelope by stored result ref.
+    fn get_handoff_callback_receipt(
+        &self,
+        stored_result_ref: IdentityStoredResultRef,
+    ) -> Result<Option<IdentityConsumerReceiptEnvelope>, ApplicationError>;
+
+    /// Saves a typed handoff callback receipt envelope.
+    fn save_handoff_callback_receipt(
+        &self,
+        envelope: IdentityConsumerReceiptEnvelope,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityStoredResultRef, ApplicationError>;
+}
+
+/// Repository for accepted command effect summaries.
+pub trait IdentityCommandEffectSummaryRepository {
+    /// Loads an effect summary by stable ref.
+    fn get_effect_summary(
+        &self,
+        effect_summary_ref: IdentityCommandEffectSummaryRef,
+    ) -> Result<Option<crate::support::IdentityCommandEffectSummary>, ApplicationError>;
+
+    /// Lists effect summaries by operation context.
+    fn list_effects_by_operation_context(
+        &self,
+        context_ref: IdentityOperationContextRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityCommandEffectSummaryRef>, ApplicationError>;
+
+    /// Lists effect summaries by typed accepted truth ref.
+    fn list_effects_by_truth_ref(
+        &self,
+        truth_ref: crate::support::IdentityTruthRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityCommandEffectSummaryRef>, ApplicationError>;
+
+    /// Lists effect summaries after a truth cursor.
+    fn list_effects_after_cursor(
+        &self,
+        after_cursor: Option<IdentityTruthCursor>,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityCommandEffectSummaryRef>, ApplicationError>;
+
+    /// Saves an immutable accepted command effect summary.
+    fn save_effect_summary(
+        &self,
+        summary: crate::support::IdentityCommandEffectSummary,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityCommandEffectSummaryRef, ApplicationError>;
+}
+
+/// Repository for job run reports and duplicate replay lookups.
+pub trait IdentityJobReportRepository {
+    /// Loads a job report and version.
+    fn get_job_report_with_version(
+        &self,
+        report_ref: identity_contracts::refs::IdentityJobReportRef,
+    ) -> Result<Option<Versioned<crate::support::IdentityJobRunReport>>, ApplicationError>;
+
+    /// Finds a job report by formal job run ref.
+    fn find_job_report_by_run(
+        &self,
+        job_run_ref: IdentityJobRunRef,
+    ) -> Result<Option<Versioned<crate::support::IdentityJobRunReport>>, ApplicationError>;
+
+    /// Lists job reports by formal job name.
+    fn list_job_reports_by_name(
+        &self,
+        job_name: IdentityJobName,
+        page: IdentityRepositoryPage,
+    ) -> Result<
+        Page<IdentityVersionedRef<identity_contracts::refs::IdentityJobReportRef>>,
+        ApplicationError,
+    >;
+
+    /// Lists job reports by result kind.
+    fn list_job_reports_by_result(
+        &self,
+        result_kind: identity_contracts::jobs::IdentityJobResultKind,
+        page: IdentityRepositoryPage,
+    ) -> Result<
+        Page<IdentityVersionedRef<identity_contracts::refs::IdentityJobReportRef>>,
+        ApplicationError,
+    >;
+
+    /// Saves a job report using an optional expected version.
+    fn save_job_report(
+        &self,
+        report: crate::support::IdentityJobRunReport,
+        expected_version: Option<IdentityVersion>,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<
+        IdentityVersionedRef<identity_contracts::refs::IdentityJobReportRef>,
+        ApplicationError,
+    >;
 }
 
 /// Body-free role capability source resolution result.
