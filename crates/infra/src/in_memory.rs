@@ -3010,16 +3010,25 @@ fn identity_source_ref(owner: IdentitySourceOwner, token: &str) -> IdentitySourc
 #[cfg(test)]
 mod tests {
     use core_contracts::actor::{ActorKind, ActorRef};
+    use identity_contracts::events::{IdentityConsumerOutcome, IdentityConsumerReceipt};
+    use identity_contracts::protocol::{
+        IdentityDigestAlgorithmMarkerRef, IdentityInboundConsumerName, IdentityJobName,
+        IdentityProtocolSchemaVersionRef,
+    };
     use identity_contracts::receipts::MaintenanceIssueRef;
     use identity_contracts::refs::{
         ExternalReferenceSafeSummaryRef, ExternalSourceVersionRef, HandoffAttemptRef,
-        IdentityTimestamp,
+        IdentityCanonicalRequestMarkerRef, IdentityChangeKind, IdentityConsumerReceiptRef,
+        IdentityJobReportRef, IdentityJobRunRef, IdentityJobScopeMarkerRef,
+        IdentityOperationChannel, IdentityOutboxPayloadMarkerRef, IdentityRequestDigestValue,
+        IdentityStoredResultRef, IdentityTimestamp, TopicKeyRef,
     };
     use identity_contracts::views::{
         IdentityReadMaterialKind, IdentityReadMaterialMarker, MemberSummarySliceKind,
         MemberSummarySliceRef,
     };
     use identity_domain::handoff::HandoffState;
+    use identity_domain::outbox::{IdentityOutboxRecord, OutboxState};
 
     use super::*;
 
@@ -3154,6 +3163,139 @@ mod tests {
             IdentityAdapterModeRef::new("fake"),
             timestamp(1),
         )
+    }
+
+    fn request_digest(token: &str) -> identity_application::support::IdentityRequestDigest {
+        identity_application::support::IdentityRequestDigest::from_canonical_marker(
+            IdentityCanonicalRequestMarkerRef::new(format!("canonical-{token}")),
+            IdentityRequestDigestValue::new(format!("digest-{token}")),
+            IdentityProtocolSchemaVersionRef::new("identity.command.v1"),
+            IdentityDigestAlgorithmMarkerRef::new("sha256-v1"),
+        )
+    }
+
+    fn command_context(
+        operation_name: &str,
+        idempotency_key: &str,
+        digest_token: &str,
+    ) -> IdentityOperationContext {
+        IdentityOperationContext::from_command(
+            IdentityOperationContextRef::new(format!("context-{operation_name}-{idempotency_key}")),
+            IdentityOperationName::new(operation_name),
+            ActorRef::new("actor-1", ActorKind::Human),
+            identity_application::support::IdentityRequestMetadataRef::new(format!(
+                "metadata-{operation_name}"
+            )),
+            Some(IdentityIdempotencyKey::new(idempotency_key.to_owned())),
+            request_digest(digest_token),
+            None,
+            timestamp(1),
+        )
+    }
+
+    fn job_context(
+        operation_name: &str,
+        idempotency_key: &str,
+        digest_token: &str,
+        job_run_ref: &str,
+    ) -> IdentityOperationContext {
+        IdentityOperationContext::from_job(
+            IdentityOperationContextRef::new(format!("context-{operation_name}-{idempotency_key}")),
+            IdentityOperationName::new(operation_name),
+            ActorRef::system("job-system"),
+            identity_application::support::IdentityRequestMetadataRef::new(format!(
+                "metadata-{operation_name}"
+            )),
+            IdentityIdempotencyKey::new(idempotency_key.to_owned()),
+            request_digest(digest_token),
+            None,
+            IdentityJobRunRef::new(job_run_ref),
+            timestamp(1),
+        )
+    }
+
+    fn stored_result_ref(token: &str) -> IdentityStoredResultRef {
+        IdentityStoredResultRef::new(format!("stored-result-{token}"))
+    }
+
+    fn command_stored_result(
+        token: &str,
+        context_ref: &IdentityOperationContextRef,
+    ) -> StoredIdentityOperationResult {
+        StoredIdentityOperationResult::command_accepted(
+            stored_result_ref(token),
+            context_ref.clone(),
+            identity_application::support::IdentityStoredSurfaceMarkerRef::new(format!(
+                "surface-{token}"
+            )),
+            timestamp(2),
+        )
+    }
+
+    fn consumer_receipt_envelope(
+        token: &str,
+        context_ref: &IdentityOperationContextRef,
+    ) -> IdentityConsumerReceiptEnvelope {
+        IdentityConsumerReceiptEnvelope::consumer_receipt(
+            context_ref.clone(),
+            identity_application::support::IdentityStoredSurfaceMarkerRef::new(format!(
+                "surface-{token}"
+            )),
+            IdentityConsumerReceipt {
+                receipt_ref: IdentityConsumerReceiptRef::new(format!("receipt-{token}")),
+                consumer_name: IdentityInboundConsumerName::new(
+                    "HandleRoleCapabilitySourceChanged",
+                ),
+                outcome: IdentityConsumerOutcome::Accepted,
+                stored_result_ref: stored_result_ref(token),
+                trace_refs: vec![IdentityTraceRecordRef::new(format!("trace-{token}"))],
+                outbox_refs: vec![IdentityOutboxRecordRef::new(format!("outbox-{token}"))],
+                issue_refs: Vec::new(),
+            },
+            timestamp(2),
+        )
+    }
+
+    fn job_report(
+        token: &str,
+        stored_result_ref: Option<IdentityStoredResultRef>,
+    ) -> IdentityJobRunReport {
+        IdentityJobRunReport::start(
+            IdentityJobReportRef::new(format!("job-report-{token}")),
+            IdentityJobRunRef::new(format!("job-run-{token}")),
+            IdentityJobName::new("RunIdentityReconciliation"),
+            IdentityJobScopeMarkerRef::new(format!("job-scope-{token}")),
+            Some(identity_contracts::refs::IdentityJobCursorRef::new(
+                format!("job-input-cursor-{token}"),
+            )),
+            timestamp(1),
+        )
+        .partial(
+            vec![MaintenanceIssueRef::new(format!("issue-{token}"))],
+            Some(identity_contracts::refs::IdentityJobCursorRef::new(
+                format!("job-output-cursor-{token}"),
+            )),
+            stored_result_ref,
+            timestamp(2),
+        )
+    }
+
+    fn outbox_record(token: &str, state: OutboxState) -> IdentityOutboxRecord {
+        IdentityOutboxRecord {
+            outbox_record_ref: IdentityOutboxRecordRef::new(format!("outbox-{token}")),
+            member_ref: member_ref("member-1"),
+            subject_ref: IdentityOutboxSubjectRef::new(format!("subject-{token}")),
+            change_kind_ref: identity_contracts::refs::IdentityChangeKindRef::new(
+                IdentityChangeKind::DerivedMarkerChanged,
+                None,
+            ),
+            payload_marker_ref: IdentityOutboxPayloadMarkerRef::new(format!("payload-{token}")),
+            topic_key_ref: TopicKeyRef::new(format!("topic-{token}")),
+            trace_record_ref: IdentityTraceRecordRef::new(format!("trace-{token}")),
+            outbox_state: state,
+            created_at: timestamp(1),
+            updated_at: timestamp(1),
+        }
     }
 
     #[test]
@@ -3310,6 +3452,470 @@ mod tests {
             .expect("state");
         assert_eq!(persisted.version, IdentityVersion::new(1));
         assert_eq!(persisted.value.state_kind, ProjectionStateKind::Stale);
+    }
+
+    #[test]
+    fn idempotency_namespace_isolated_by_operation_and_channel() {
+        let command_context = command_context("establish_member", "idem-shared", "same");
+        let consumer_context = IdentityOperationContext::from_inbound_event(
+            IdentityOperationContextRef::new("context-consumer"),
+            IdentityOperationName::new("handle_role_source_changed"),
+            ActorRef::system("worker"),
+            identity_application::support::IdentityRequestMetadataRef::new("metadata-consumer"),
+            IdentityIdempotencyKey::new("idem-shared"),
+            request_digest("same"),
+            None,
+            identity_contracts::refs::IdentitySourceEventRef::new("source-event-1"),
+            timestamp(1),
+        );
+        let job_context = job_context("refresh_reference", "idem-shared", "same", "job-run-1");
+
+        let runtime = IdentityInMemoryRuntime::builder().build();
+
+        let command_uow = runtime.begin().expect("command uow");
+        let command_result = runtime
+            .reserve(
+                command_context.clone(),
+                IdentityIdempotencyRecordRef::new("idem-record-command"),
+                timestamp(1),
+                command_uow.as_ref(),
+            )
+            .expect("reserve command");
+        runtime.commit(command_uow).expect("commit command");
+        assert!(matches!(
+            command_result,
+            IdempotencyReserveOutcome::Reserved(_)
+        ));
+
+        let consumer_uow = runtime.begin().expect("consumer uow");
+        let consumer_result = runtime
+            .reserve(
+                consumer_context.clone(),
+                IdentityIdempotencyRecordRef::new("idem-record-consumer"),
+                timestamp(1),
+                consumer_uow.as_ref(),
+            )
+            .expect("reserve consumer");
+        runtime.commit(consumer_uow).expect("commit consumer");
+        assert!(matches!(
+            consumer_result,
+            IdempotencyReserveOutcome::Reserved(_)
+        ));
+
+        let job_uow = runtime.begin().expect("job uow");
+        let job_result = runtime
+            .reserve(
+                job_context.clone(),
+                IdentityIdempotencyRecordRef::new("idem-record-job"),
+                timestamp(1),
+                job_uow.as_ref(),
+            )
+            .expect("reserve job");
+        runtime.commit(job_uow).expect("commit job");
+        assert!(matches!(job_result, IdempotencyReserveOutcome::Reserved(_)));
+
+        assert!(
+            runtime
+                .get_by_key(
+                    command_context.operation_name,
+                    IdentityOperationChannel::Command,
+                    IdentityIdempotencyKey::new("idem-shared"),
+                )
+                .expect("load command")
+                .is_some()
+        );
+        assert!(
+            runtime
+                .get_by_key(
+                    consumer_context.operation_name,
+                    IdentityOperationChannel::Consumer,
+                    IdentityIdempotencyKey::new("idem-shared"),
+                )
+                .expect("load consumer")
+                .is_some()
+        );
+        assert!(
+            runtime
+                .get_by_key(
+                    job_context.operation_name,
+                    IdentityOperationChannel::Job,
+                    IdentityIdempotencyKey::new("idem-shared"),
+                )
+                .expect("load job")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn duplicate_missing_stored_result_does_not_recompute() {
+        let context = command_context("establish_member", "idem-1", "same");
+        let record = IdentityIdempotencyRecord {
+            record_ref: IdentityIdempotencyRecordRef::new("idem-record-1"),
+            operation_name: context.operation_name.clone(),
+            channel: IdentityOperationChannel::Command,
+            idempotency_key: IdentityIdempotencyKey::new("idem-1"),
+            request_digest: context.request_digest.clone(),
+            state: identity_application::support::IdentityIdempotencyStateKind::Completed,
+            stored_result_ref: Some(stored_result_ref("missing")),
+            reserved_at: timestamp(1),
+            completed_at: Some(timestamp(2)),
+        };
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_idempotency_record(record, IdentityVersion::new(2))
+            .build();
+
+        let uow = runtime.begin().expect("uow");
+        let outcome = runtime
+            .reserve(
+                context,
+                IdentityIdempotencyRecordRef::new("idem-record-new"),
+                timestamp(3),
+                uow.as_ref(),
+            )
+            .expect("reserve");
+        match outcome {
+            IdempotencyReserveOutcome::ReplayAvailable {
+                record,
+                stored_result_ref,
+            } => {
+                assert_eq!(record.version, IdentityVersion::new(2));
+                assert_eq!(
+                    stored_result_ref,
+                    IdentityStoredResultRef::new("stored-result-missing")
+                );
+            }
+            other => panic!("unexpected reserve outcome: {other:?}"),
+        }
+        assert!(
+            runtime
+                .get_stored_result(IdentityStoredResultRef::new("stored-result-missing"))
+                .expect("lookup")
+                .is_none()
+        );
+        runtime.rollback(uow).expect("rollback");
+    }
+
+    #[test]
+    fn consumer_duplicate_replays_typed_receipt() {
+        let context = IdentityOperationContext::from_inbound_event(
+            IdentityOperationContextRef::new("context-consumer-1"),
+            IdentityOperationName::new("handle_role_source_changed"),
+            ActorRef::system("worker"),
+            identity_application::support::IdentityRequestMetadataRef::new("metadata-consumer"),
+            IdentityIdempotencyKey::new("idem-consumer-1"),
+            request_digest("consumer"),
+            None,
+            identity_contracts::refs::IdentitySourceEventRef::new("source-event-1"),
+            timestamp(1),
+        );
+        let record = IdentityIdempotencyRecord {
+            record_ref: IdentityIdempotencyRecordRef::new("idem-record-consumer"),
+            operation_name: context.operation_name.clone(),
+            channel: IdentityOperationChannel::Consumer,
+            idempotency_key: IdentityIdempotencyKey::new("idem-consumer-1"),
+            request_digest: context.request_digest.clone(),
+            state: identity_application::support::IdentityIdempotencyStateKind::Completed,
+            stored_result_ref: Some(stored_result_ref("consumer-1")),
+            reserved_at: timestamp(1),
+            completed_at: Some(timestamp(2)),
+        };
+        let stored = StoredIdentityOperationResult::consumer_receipt(
+            stored_result_ref("consumer-1"),
+            context.context_ref.clone(),
+            identity_application::support::IdentityStoredSurfaceMarkerRef::new(
+                "surface-consumer-1",
+            ),
+            timestamp(2),
+        );
+        let envelope = consumer_receipt_envelope("consumer-1", &context.context_ref);
+
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_idempotency_record(record, IdentityVersion::new(2))
+            .seed_stored_result(stored)
+            .seed_consumer_receipt(envelope.clone())
+            .build();
+
+        let uow = runtime.begin().expect("uow");
+        let outcome = runtime
+            .reserve(
+                context,
+                IdentityIdempotencyRecordRef::new("idem-record-consumer-new"),
+                timestamp(3),
+                uow.as_ref(),
+            )
+            .expect("reserve");
+        let replay_ref = match outcome {
+            IdempotencyReserveOutcome::ReplayAvailable {
+                stored_result_ref, ..
+            } => stored_result_ref,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        let replay = runtime
+            .get_consumer_receipt(replay_ref)
+            .expect("load receipt")
+            .expect("receipt");
+        assert_eq!(replay, envelope);
+        runtime.rollback(uow).expect("rollback");
+    }
+
+    #[test]
+    fn job_duplicate_replays_stored_report() {
+        let context = job_context("run_reconciliation", "idem-job-1", "job", "job-run-job-1");
+        let stored = StoredIdentityOperationResult::job_report(
+            stored_result_ref("job-1"),
+            context.context_ref.clone(),
+            identity_application::support::IdentityStoredSurfaceMarkerRef::new("surface-job-1"),
+            timestamp(2),
+        );
+        let report = job_report("job-1", Some(stored_result_ref("job-1")));
+        let record = IdentityIdempotencyRecord {
+            record_ref: IdentityIdempotencyRecordRef::new("idem-record-job-1"),
+            operation_name: context.operation_name.clone(),
+            channel: IdentityOperationChannel::Job,
+            idempotency_key: IdentityIdempotencyKey::new("idem-job-1"),
+            request_digest: context.request_digest.clone(),
+            state: identity_application::support::IdentityIdempotencyStateKind::Completed,
+            stored_result_ref: Some(stored_result_ref("job-1")),
+            reserved_at: timestamp(1),
+            completed_at: Some(timestamp(2)),
+        };
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_idempotency_record(record, IdentityVersion::new(2))
+            .seed_stored_result(stored)
+            .seed_job_report(report.clone(), IdentityVersion::new(1))
+            .build();
+
+        let outcome = runtime
+            .reserve(
+                context,
+                IdentityIdempotencyRecordRef::new("idem-record-job-1-new"),
+                timestamp(3),
+                runtime.begin().expect("uow").as_ref(),
+            )
+            .expect("reserve");
+        let replay_ref = match outcome {
+            IdempotencyReserveOutcome::ReplayAvailable {
+                stored_result_ref, ..
+            } => stored_result_ref,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        let stored = runtime
+            .get_stored_result(replay_ref)
+            .expect("load stored")
+            .expect("stored");
+        assert_eq!(stored.result_kind, IdentityStoredResultKind::JobReport);
+        let persisted = runtime
+            .find_job_report_by_run(IdentityJobRunRef::new("job-run-job-1"))
+            .expect("lookup")
+            .expect("report");
+        assert_eq!(persisted.value, report);
+    }
+
+    #[test]
+    fn same_key_different_digest_conflicts() {
+        let context = command_context("establish_member", "idem-conflict", "same");
+        let existing = IdentityIdempotencyRecord {
+            record_ref: IdentityIdempotencyRecordRef::new("idem-record-conflict"),
+            operation_name: context.operation_name.clone(),
+            channel: IdentityOperationChannel::Command,
+            idempotency_key: IdentityIdempotencyKey::new("idem-conflict"),
+            request_digest: request_digest("original"),
+            state: identity_application::support::IdentityIdempotencyStateKind::Reserved,
+            stored_result_ref: None,
+            reserved_at: timestamp(1),
+            completed_at: None,
+        };
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_idempotency_record(existing, IdentityVersion::new(1))
+            .build();
+
+        let uow = runtime.begin().expect("uow");
+        let outcome = runtime
+            .reserve(
+                context,
+                IdentityIdempotencyRecordRef::new("idem-record-conflict-new"),
+                timestamp(2),
+                uow.as_ref(),
+            )
+            .expect("reserve");
+        assert!(matches!(outcome, IdempotencyReserveOutcome::Conflict(_)));
+        runtime.rollback(uow).expect("rollback");
+    }
+
+    #[test]
+    fn same_key_same_digest_in_flight_visible() {
+        let context = command_context("establish_member", "idem-flight", "flight");
+        let existing = IdentityIdempotencyRecord {
+            record_ref: IdentityIdempotencyRecordRef::new("idem-record-flight"),
+            operation_name: context.operation_name.clone(),
+            channel: IdentityOperationChannel::Command,
+            idempotency_key: IdentityIdempotencyKey::new("idem-flight"),
+            request_digest: context.request_digest.clone(),
+            state: identity_application::support::IdentityIdempotencyStateKind::Reserved,
+            stored_result_ref: None,
+            reserved_at: timestamp(1),
+            completed_at: None,
+        };
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_idempotency_record(existing, IdentityVersion::new(1))
+            .build();
+
+        let uow = runtime.begin().expect("uow");
+        let outcome = runtime
+            .reserve(
+                context,
+                IdentityIdempotencyRecordRef::new("idem-record-flight-new"),
+                timestamp(2),
+                uow.as_ref(),
+            )
+            .expect("reserve");
+        assert!(matches!(outcome, IdempotencyReserveOutcome::InFlight(_)));
+        runtime.rollback(uow).expect("rollback");
+    }
+
+    #[test]
+    fn stored_result_saved_before_idempotency_complete() {
+        let context = command_context("establish_member", "idem-complete", "complete");
+        let runtime = IdentityInMemoryRuntime::builder()
+            .inject_fault(FaultCase::CompleteIdempotencyFails)
+            .build();
+
+        let reserve_uow = runtime.begin().expect("reserve uow");
+        let reserved = runtime
+            .reserve(
+                context.clone(),
+                IdentityIdempotencyRecordRef::new("idem-record-complete"),
+                timestamp(1),
+                reserve_uow.as_ref(),
+            )
+            .expect("reserve");
+        runtime.commit(reserve_uow).expect("commit reserve");
+
+        let reserved_record = match reserved {
+            IdempotencyReserveOutcome::Reserved(record) => record,
+            other => panic!("unexpected reserve outcome: {other:?}"),
+        };
+
+        let complete_uow = runtime.begin().expect("complete uow");
+        let stored = command_stored_result("complete", &context.context_ref);
+        runtime
+            .save_command_accepted_result(stored.clone(), complete_uow.as_ref())
+            .expect("save stored");
+        runtime
+            .complete_with_stored_result(
+                reserved_record.value,
+                stored.stored_result_ref.clone(),
+                timestamp(2),
+                reserved_record.version,
+                complete_uow.as_ref(),
+            )
+            .expect("stage complete");
+        let error = runtime
+            .commit(complete_uow)
+            .expect_err("complete failure must abort");
+        assert_eq!(error.kind, ApplicationErrorKind::DependencyUnavailable);
+
+        let persisted_record = runtime
+            .get_by_key(
+                context.operation_name.clone(),
+                IdentityOperationChannel::Command,
+                IdentityIdempotencyKey::new("idem-complete"),
+            )
+            .expect("load")
+            .expect("record");
+        assert_eq!(
+            persisted_record.value.state,
+            identity_application::support::IdentityIdempotencyStateKind::Reserved
+        );
+        assert!(
+            runtime
+                .find_by_operation_context(context.context_ref)
+                .expect("lookup stored")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn outbox_state_lists_and_updates_are_formal() {
+        let pending = outbox_record("pending", OutboxState::pending(timestamp(1)));
+        let retryable = outbox_record(
+            "retryable",
+            OutboxState::retryable_failed(
+                identity_contracts::refs::OutboxDeliveryIssueRef::new(identity_source_ref(
+                    IdentitySourceOwner::Identity,
+                    "outbox-issue-1",
+                )),
+                timestamp(2),
+            ),
+        );
+        let published = outbox_record(
+            "published",
+            OutboxState::published(
+                identity_contracts::refs::OutboxDeliveryAttemptRef::new(identity_source_ref(
+                    IdentitySourceOwner::Identity,
+                    "outbox-attempt-1",
+                )),
+                timestamp(3),
+            ),
+        );
+
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_outbox_record(pending.clone(), IdentityVersion::new(1))
+            .seed_outbox_record(retryable.clone(), IdentityVersion::new(1))
+            .seed_outbox_record(published.clone(), IdentityVersion::new(1))
+            .build();
+
+        let pending_page = runtime
+            .list_pending_outbox_records(None, IdentityRepositoryPage::new(None, 10))
+            .expect("list pending");
+        assert_eq!(pending_page.items.len(), 1);
+        assert_eq!(
+            pending_page.items[0].value_ref,
+            IdentityOutboxRecordRef::new("outbox-pending")
+        );
+
+        let retryable_page = runtime
+            .list_retryable_outbox_records(None, IdentityRepositoryPage::new(None, 10))
+            .expect("list retryable");
+        assert_eq!(retryable_page.items.len(), 1);
+        assert_eq!(
+            retryable_page.items[0].value_ref,
+            IdentityOutboxRecordRef::new("outbox-retryable")
+        );
+
+        let by_trace = runtime
+            .find_outbox_records_by_trace(
+                IdentityTraceRecordRef::new("trace-pending"),
+                IdentityRepositoryPage::new(None, 10),
+            )
+            .expect("list by trace");
+        assert_eq!(by_trace.items.len(), 1);
+
+        let mut updated = pending.clone();
+        updated
+            .mark_published(OutboxState::published(
+                identity_contracts::refs::OutboxDeliveryAttemptRef::new(identity_source_ref(
+                    IdentitySourceOwner::Identity,
+                    "outbox-attempt-2",
+                )),
+                timestamp(4),
+            ))
+            .expect("mark published");
+        let uow = runtime.begin().expect("uow");
+        runtime
+            .update_outbox_state(updated, IdentityVersion::new(1), uow.as_ref())
+            .expect("stage update");
+        runtime.commit(uow).expect("commit");
+
+        let persisted = runtime
+            .get_outbox_record_with_version(IdentityOutboxRecordRef::new("outbox-pending"))
+            .expect("load")
+            .expect("record");
+        assert_eq!(persisted.version, IdentityVersion::new(2));
+        assert_eq!(
+            persisted.value.outbox_state.state_kind,
+            OutboxStateKind::Published
+        );
     }
 
     #[test]
