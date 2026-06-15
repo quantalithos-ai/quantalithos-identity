@@ -5,16 +5,26 @@ use std::sync::{Arc, Mutex};
 use identity_application::errors::{ApplicationError, ApplicationErrorKind};
 use identity_application::ports::{
     ExternalReferenceTypedSidecarRefs, HandoffDeliveryOutcome, HandoffReceiptResolution,
-    HandoffTargetResolution, IdentityAdapterAvailabilityPort, IdentityCursorAssignerPort,
-    IdentityHandoffDeliveryPort, IdentityHandoffTargetPort, IdentityProjectionRepository,
-    IdentityReadVisibilityRepository, IdentityReferenceStateRepository, IdentityUnitOfWork,
-    IdentityUnitOfWorkManagerPort, TraceHandoffIntentRepository,
+    HandoffTargetResolution, IdentityAdapterAvailabilityPort,
+    IdentityCommandEffectSummaryRepository, IdentityCursorAssignerPort,
+    IdentityHandoffDeliveryPort, IdentityHandoffTargetPort, IdentityIdempotencyRepository,
+    IdentityJobReportRepository, IdentityOutboxRepository, IdentityProjectionRepository,
+    IdentityReadVisibilityRepository, IdentityReferenceStateRepository,
+    IdentityStoredResultRepository, IdentityUnitOfWork, IdentityUnitOfWorkManagerPort,
+    TraceHandoffIntentRepository,
 };
 use identity_application::support::{
-    IdentityAdapterAvailability, IdentityAdapterModeRef, IdentityAdapterRef,
-    IdentityProjectionRefSet, IdentityRepositoryCursor, IdentityRepositoryPage,
-    IdentityTransactionRef, IdentityVersion, IdentityVersionedRef, Page, Versioned,
+    IdempotencyReserveOutcome, IdentityAdapterAvailability, IdentityAdapterModeRef,
+    IdentityAdapterRef, IdentityCommandEffectSummary, IdentityCommandEffectSummaryRef,
+    IdentityConsumerReceiptEnvelope, IdentityIdempotencyKey, IdentityIdempotencyRecord,
+    IdentityIdempotencyRecordRef, IdentityJobRunReport, IdentityOperationContext,
+    IdentityOperationContextRef, IdentityOperationName, IdentityProjectionRefSet,
+    IdentityRepositoryCursor, IdentityRepositoryPage, IdentityStoredResultKind,
+    IdentityTransactionRef, IdentityTruthRef, IdentityVersion, IdentityVersionedRef, Page,
+    StoredIdentityOperationResult, Versioned,
 };
+use identity_contracts::jobs::IdentityJobResultKind;
+use identity_contracts::protocol::IdentityJobName;
 use identity_contracts::receipts::TraceHandoffIntentRef;
 use identity_contracts::refs::{
     AuditScopeRef, AuditTrailRef, ConsumerRef, ExternalReferenceKind, ExternalReferenceRef,
@@ -28,12 +38,19 @@ use identity_contracts::refs::{
 };
 use identity_contracts::views::{IdentityVisibilityAccessSummary, MemberSummaryView};
 use identity_domain::handoff::{HandoffStateKind, TraceHandoffIntent};
+use identity_domain::outbox::{IdentityOutboxRecord, OutboxStateKind};
 use identity_domain::projection_state::{ProjectionState, ProjectionStateKind};
 use identity_domain::reference_state::{ReferenceResolutionState, ReferenceResolutionStateKind};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FaultCase {
     RollbackFails,
+    CommitUnknown,
+    SaveOutboxRecordFails,
+    SaveStoredResultFails,
+    SaveReceiptEnvelopeFails,
+    SaveJobReportFails,
+    CompleteIdempotencyFails,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -101,6 +118,116 @@ impl IdentityInMemoryRuntimeBuilder {
             intent.handoff_intent_ref.as_str().to_owned(),
             StoredHandoffIntent { intent, version },
         );
+        self
+    }
+
+    pub fn seed_outbox_record(
+        mut self,
+        record: IdentityOutboxRecord,
+        version: IdentityVersion,
+    ) -> Self {
+        let key = record.outbox_record_ref.as_str().to_owned();
+        self.store.outbox_subject_index.insert(
+            outbox_subject_key(&record.subject_ref, &record.outbox_record_ref),
+            key.clone(),
+        );
+        self.store.outbox_trace_index.insert(
+            outbox_trace_key(&record.trace_record_ref, &record.outbox_record_ref),
+            key.clone(),
+        );
+        self.store
+            .outbox_records
+            .insert(key, StoredOutboxRecord { record, version });
+        self
+    }
+
+    pub fn seed_idempotency_record(
+        mut self,
+        record: IdentityIdempotencyRecord,
+        version: IdentityVersion,
+    ) -> Self {
+        let key = record.record_ref.as_str().to_owned();
+        self.store.idempotency_key_index.insert(
+            idempotency_key_key(
+                &record.operation_name,
+                record.channel,
+                &record.idempotency_key,
+            ),
+            key.clone(),
+        );
+        self.store
+            .idempotency_records
+            .insert(key, StoredIdempotencyRecord { record, version });
+        self
+    }
+
+    pub fn seed_stored_result(mut self, result: StoredIdentityOperationResult) -> Self {
+        let key = result.stored_result_ref.as_str().to_owned();
+        self.store.stored_result_by_context.insert(
+            result.operation_context_ref.as_str().to_owned(),
+            key.clone(),
+        );
+        self.store.stored_results.insert(key, result);
+        self
+    }
+
+    pub fn seed_consumer_receipt(mut self, envelope: IdentityConsumerReceiptEnvelope) -> Self {
+        self.store
+            .consumer_receipts
+            .insert(envelope.stored_result_ref.as_str().to_owned(), envelope);
+        self
+    }
+
+    pub fn seed_handoff_callback_receipt(
+        mut self,
+        envelope: IdentityConsumerReceiptEnvelope,
+    ) -> Self {
+        self.store
+            .handoff_callback_receipts
+            .insert(envelope.stored_result_ref.as_str().to_owned(), envelope);
+        self
+    }
+
+    pub fn seed_effect_summary(mut self, summary: IdentityCommandEffectSummary) -> Self {
+        let summary_ref = summary.effect_summary_ref.as_str().to_owned();
+        self.store.effects_by_context.insert(
+            effect_context_key(&summary.operation_context_ref, &summary.effect_summary_ref),
+            summary_ref.clone(),
+        );
+        self.store.effects_by_truth_ref.insert(
+            effect_truth_key(&summary.primary_truth_ref, &summary.effect_summary_ref),
+            summary_ref.clone(),
+        );
+        self.store.effects_after_cursor.insert(
+            effect_cursor_key(&summary.accepted_cursor_ref, &summary.effect_summary_ref),
+            summary_ref.clone(),
+        );
+        self.store
+            .command_effect_summaries
+            .insert(summary_ref, summary);
+        self
+    }
+
+    pub fn seed_job_report(
+        mut self,
+        report: IdentityJobRunReport,
+        version: IdentityVersion,
+    ) -> Self {
+        let report_ref = report.report_ref.as_str().to_owned();
+        self.store
+            .job_report_by_run
+            .insert(report.job_run_ref.as_str().to_owned(), report_ref.clone());
+        self.store.job_report_by_name.insert(
+            job_report_name_key(&report.job_name, &report.report_ref),
+            report_ref.clone(),
+        );
+        self.store.job_report_by_result.insert(
+            job_report_result_key(report.result_kind, &report.report_ref),
+            report_ref.clone(),
+        );
+        self.store
+            .job_reports
+            .insert(report_ref, StoredJobReport { report, version });
         self
     }
 
@@ -265,6 +392,42 @@ impl IdentityInMemoryRuntime {
                 .unwrap_or(1),
         ))
     }
+
+    fn predicted_outbox_version(
+        &self,
+        outbox_ref: &IdentityOutboxRecordRef,
+    ) -> Result<IdentityVersion, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(IdentityVersion::new(
+            store
+                .outbox_records
+                .get(outbox_ref.as_str())
+                .map(|stored| stored.version.get() + 1)
+                .unwrap_or(1),
+        ))
+    }
+
+    fn predicted_job_report_version(
+        &self,
+        report_ref: &identity_contracts::refs::IdentityJobReportRef,
+    ) -> Result<IdentityVersion, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(IdentityVersion::new(
+            store
+                .job_reports
+                .get(report_ref.as_str())
+                .map(|stored| stored.version.get() + 1)
+                .unwrap_or(1),
+        ))
+    }
 }
 
 struct SharedRuntime {
@@ -282,6 +445,23 @@ struct RuntimeStore {
     projection_states: HashMap<String, StoredProjectionState>,
     reference_states: HashMap<String, StoredReferenceState>,
     handoff_intents: HashMap<String, StoredHandoffIntent>,
+    outbox_records: HashMap<String, StoredOutboxRecord>,
+    outbox_subject_index: HashMap<String, String>,
+    outbox_trace_index: HashMap<String, String>,
+    idempotency_records: HashMap<String, StoredIdempotencyRecord>,
+    idempotency_key_index: HashMap<String, String>,
+    stored_results: HashMap<String, StoredIdentityOperationResult>,
+    stored_result_by_context: HashMap<String, String>,
+    consumer_receipts: HashMap<String, IdentityConsumerReceiptEnvelope>,
+    handoff_callback_receipts: HashMap<String, IdentityConsumerReceiptEnvelope>,
+    command_effect_summaries: HashMap<String, IdentityCommandEffectSummary>,
+    effects_by_context: HashMap<String, String>,
+    effects_by_truth_ref: HashMap<String, String>,
+    effects_after_cursor: HashMap<String, String>,
+    job_reports: HashMap<String, StoredJobReport>,
+    job_report_by_run: HashMap<String, String>,
+    job_report_by_name: HashMap<String, String>,
+    job_report_by_result: HashMap<String, String>,
     adapter_availability: HashMap<String, IdentityAdapterAvailability>,
     member_summary_access: HashMap<String, IdentityVisibilityAccessSummary>,
     faults: HashSet<FaultCase>,
@@ -313,6 +493,24 @@ struct StoredHandoffIntent {
 }
 
 #[derive(Clone, Debug)]
+struct StoredOutboxRecord {
+    record: IdentityOutboxRecord,
+    version: IdentityVersion,
+}
+
+#[derive(Clone, Debug)]
+struct StoredIdempotencyRecord {
+    record: IdentityIdempotencyRecord,
+    version: IdentityVersion,
+}
+
+#[derive(Clone, Debug)]
+struct StoredJobReport {
+    report: IdentityJobRunReport,
+    version: IdentityVersion,
+}
+
+#[derive(Clone, Debug)]
 enum StagedOp {
     SaveMemberSummaryView {
         view: MemberSummaryView,
@@ -333,6 +531,33 @@ enum StagedOp {
     },
     SaveHandoffIntent {
         intent: TraceHandoffIntent,
+        expected_version: Option<IdentityVersion>,
+    },
+    SaveOutboxRecord {
+        record: IdentityOutboxRecord,
+        expected_version: Option<IdentityVersion>,
+    },
+    SaveIdempotencyReservation {
+        record: IdentityIdempotencyRecord,
+    },
+    SaveIdempotencyTerminal {
+        record: IdentityIdempotencyRecord,
+        expected_version: IdentityVersion,
+    },
+    SaveStoredResult {
+        result: StoredIdentityOperationResult,
+    },
+    SaveConsumerReceiptEnvelope {
+        envelope: IdentityConsumerReceiptEnvelope,
+    },
+    SaveHandoffCallbackReceiptEnvelope {
+        envelope: IdentityConsumerReceiptEnvelope,
+    },
+    SaveEffectSummary {
+        summary: IdentityCommandEffectSummary,
+    },
+    SaveJobReport {
+        report: IdentityJobRunReport,
         expected_version: Option<IdentityVersion>,
     },
 }
@@ -422,6 +647,13 @@ impl IdentityUnitOfWorkManagerPort for IdentityInMemoryRuntime {
                 *store = current;
                 return Err(error);
             }
+        }
+
+        if store.faults.contains(&FaultCase::CommitUnknown) {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::CommitStatusUnknown,
+                "commit status unknown; check stored replay surface before retry",
+            ));
         }
 
         Ok(())
@@ -1189,6 +1421,649 @@ impl IdentityReadVisibilityRepository for IdentityInMemoryRuntime {
     }
 }
 
+impl IdentityOutboxRepository for IdentityInMemoryRuntime {
+    fn get_outbox_record_with_version(
+        &self,
+        outbox_ref: IdentityOutboxRecordRef,
+    ) -> Result<Option<Versioned<IdentityOutboxRecord>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .outbox_records
+            .get(outbox_ref.as_str())
+            .map(|stored| Versioned {
+                value: stored.record.clone(),
+                version: stored.version,
+            }))
+    }
+
+    fn list_pending_outbox_records(
+        &self,
+        topic_key_ref: Option<TopicKeyRef>,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<IdentityOutboxRecordRef>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(project_outbox_page(
+            store.outbox_records.values().collect(),
+            page,
+            |stored| {
+                stored.record.outbox_state.state_kind == OutboxStateKind::PendingPublish
+                    && topic_key_ref
+                        .as_ref()
+                        .map(|topic| &stored.record.topic_key_ref == topic)
+                        .unwrap_or(true)
+            },
+        ))
+    }
+
+    fn list_retryable_outbox_records(
+        &self,
+        topic_key_ref: Option<TopicKeyRef>,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<IdentityOutboxRecordRef>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(project_outbox_page(
+            store.outbox_records.values().collect(),
+            page,
+            |stored| {
+                stored.record.is_retryable()
+                    && topic_key_ref
+                        .as_ref()
+                        .map(|topic| &stored.record.topic_key_ref == topic)
+                        .unwrap_or(true)
+            },
+        ))
+    }
+
+    fn list_outbox_records_by_subject(
+        &self,
+        subject_ref: IdentityOutboxSubjectRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<IdentityOutboxRecordRef>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(project_outbox_page(
+            store.outbox_records.values().collect(),
+            page,
+            |stored| stored.record.matches_subject(&subject_ref),
+        ))
+    }
+
+    fn find_outbox_records_by_trace(
+        &self,
+        trace_record_ref: IdentityTraceRecordRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<IdentityOutboxRecordRef>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(project_outbox_page(
+            store.outbox_records.values().collect(),
+            page,
+            |stored| stored.record.trace_record_ref == trace_record_ref,
+        ))
+    }
+
+    fn save_outbox_record(
+        &self,
+        record: IdentityOutboxRecord,
+        expected_version: Option<IdentityVersion>,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<IdentityOutboxRecordRef>, ApplicationError> {
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveOutboxRecord {
+                record: record.clone(),
+                expected_version,
+            },
+        )?;
+        Ok(IdentityVersionedRef {
+            value_ref: record.outbox_record_ref.clone(),
+            version: self.predicted_outbox_version(&record.outbox_record_ref)?,
+        })
+    }
+
+    fn update_outbox_state(
+        &self,
+        record: IdentityOutboxRecord,
+        expected_version: IdentityVersion,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<IdentityOutboxRecordRef>, ApplicationError> {
+        self.save_outbox_record(record, Some(expected_version), uow)
+    }
+}
+
+impl IdentityIdempotencyRepository for IdentityInMemoryRuntime {
+    fn get_by_key(
+        &self,
+        operation_name: IdentityOperationName,
+        channel: identity_contracts::refs::IdentityOperationChannel,
+        idempotency_key: IdentityIdempotencyKey,
+    ) -> Result<Option<Versioned<IdentityIdempotencyRecord>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let Some(record_ref) = store.idempotency_key_index.get(&idempotency_key_key(
+            &operation_name,
+            channel,
+            &idempotency_key,
+        )) else {
+            return Ok(None);
+        };
+        Ok(store
+            .idempotency_records
+            .get(record_ref)
+            .map(|stored| Versioned {
+                value: stored.record.clone(),
+                version: stored.version,
+            }))
+    }
+
+    fn reserve(
+        &self,
+        context: IdentityOperationContext,
+        record_ref: IdentityIdempotencyRecordRef,
+        reserved_at: identity_contracts::refs::IdentityTimestamp,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdempotencyReserveOutcome, ApplicationError> {
+        let idempotency_key = context
+            .idempotency_key
+            .clone()
+            .ok_or_else(|| ApplicationError::invalid_request("idempotency key is required"))?;
+        if let Some(existing) = self.get_by_key(
+            context.operation_name.clone(),
+            context.channel,
+            idempotency_key,
+        )? {
+            let record = existing.value.clone();
+            if record.can_replay(&context.request_digest) {
+                let stored_result_ref = record.stored_result_ref.clone().ok_or_else(|| {
+                    ApplicationError::new(
+                        ApplicationErrorKind::DuplicateReplayConsistencyDefect,
+                        "completed idempotency record missing stored result",
+                    )
+                })?;
+                return Ok(IdempotencyReserveOutcome::ReplayAvailable {
+                    record: existing,
+                    stored_result_ref,
+                });
+            }
+            if record
+                .request_digest
+                .conflicts_with(&context.request_digest)
+            {
+                return Ok(IdempotencyReserveOutcome::Conflict(existing));
+            }
+            return Ok(IdempotencyReserveOutcome::InFlight(existing));
+        }
+
+        let record = IdentityIdempotencyRecord::reserve(record_ref, &context, reserved_at)
+            .ok_or_else(|| ApplicationError::invalid_request("idempotency key is required"))?;
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveIdempotencyReservation {
+                record: record.clone(),
+            },
+        )?;
+        Ok(IdempotencyReserveOutcome::Reserved(Versioned {
+            value: record,
+            version: IdentityVersion::new(1),
+        }))
+    }
+
+    fn complete_with_stored_result(
+        &self,
+        record: IdentityIdempotencyRecord,
+        stored_result_ref: identity_contracts::refs::IdentityStoredResultRef,
+        completed_at: identity_contracts::refs::IdentityTimestamp,
+        expected_version: IdentityVersion,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<IdentityIdempotencyRecordRef>, ApplicationError> {
+        let next = record.complete(stored_result_ref, completed_at);
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveIdempotencyTerminal {
+                record: next.clone(),
+                expected_version,
+            },
+        )?;
+        Ok(IdentityVersionedRef {
+            value_ref: next.record_ref,
+            version: IdentityVersion::new(expected_version.get() + 1),
+        })
+    }
+
+    fn complete_rejected_with_stored_result(
+        &self,
+        record: IdentityIdempotencyRecord,
+        stored_result_ref: identity_contracts::refs::IdentityStoredResultRef,
+        completed_at: identity_contracts::refs::IdentityTimestamp,
+        expected_version: IdentityVersion,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<IdentityIdempotencyRecordRef>, ApplicationError> {
+        let next = record.complete_rejected(stored_result_ref, completed_at);
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveIdempotencyTerminal {
+                record: next.clone(),
+                expected_version,
+            },
+        )?;
+        Ok(IdentityVersionedRef {
+            value_ref: next.record_ref,
+            version: IdentityVersion::new(expected_version.get() + 1),
+        })
+    }
+
+    fn mark_conflict(
+        &self,
+        record: IdentityIdempotencyRecord,
+        _conflicted_at: identity_contracts::refs::IdentityTimestamp,
+        expected_version: IdentityVersion,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<IdentityIdempotencyRecordRef>, ApplicationError> {
+        let next = record.mark_conflict();
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveIdempotencyTerminal {
+                record: next.clone(),
+                expected_version,
+            },
+        )?;
+        Ok(IdentityVersionedRef {
+            value_ref: next.record_ref,
+            version: IdentityVersion::new(expected_version.get() + 1),
+        })
+    }
+}
+
+impl IdentityStoredResultRepository for IdentityInMemoryRuntime {
+    fn get_stored_result(
+        &self,
+        stored_result_ref: identity_contracts::refs::IdentityStoredResultRef,
+    ) -> Result<Option<StoredIdentityOperationResult>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .stored_results
+            .get(stored_result_ref.as_str())
+            .cloned())
+    }
+
+    fn find_by_operation_context(
+        &self,
+        context_ref: IdentityOperationContextRef,
+    ) -> Result<Option<StoredIdentityOperationResult>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let Some(result_ref) = store.stored_result_by_context.get(context_ref.as_str()) else {
+            return Ok(None);
+        };
+        Ok(store.stored_results.get(result_ref).cloned())
+    }
+
+    fn save_command_accepted_result(
+        &self,
+        result: StoredIdentityOperationResult,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<identity_contracts::refs::IdentityStoredResultRef, ApplicationError> {
+        validate_stored_result_kind(&result, IdentityStoredResultKind::CommandAccepted)?;
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveStoredResult {
+                result: result.clone(),
+            },
+        )?;
+        Ok(result.stored_result_ref)
+    }
+
+    fn save_command_rejected_result(
+        &self,
+        result: StoredIdentityOperationResult,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<identity_contracts::refs::IdentityStoredResultRef, ApplicationError> {
+        validate_stored_result_kind(&result, IdentityStoredResultKind::CommandRejected)?;
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveStoredResult {
+                result: result.clone(),
+            },
+        )?;
+        Ok(result.stored_result_ref)
+    }
+
+    fn save_consumer_receipt_result(
+        &self,
+        result: StoredIdentityOperationResult,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<identity_contracts::refs::IdentityStoredResultRef, ApplicationError> {
+        validate_stored_result_kind(&result, IdentityStoredResultKind::ConsumerReceipt)?;
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveStoredResult {
+                result: result.clone(),
+            },
+        )?;
+        Ok(result.stored_result_ref)
+    }
+
+    fn get_consumer_receipt(
+        &self,
+        stored_result_ref: identity_contracts::refs::IdentityStoredResultRef,
+    ) -> Result<Option<IdentityConsumerReceiptEnvelope>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .consumer_receipts
+            .get(stored_result_ref.as_str())
+            .cloned())
+    }
+
+    fn save_consumer_receipt(
+        &self,
+        envelope: IdentityConsumerReceiptEnvelope,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<identity_contracts::refs::IdentityStoredResultRef, ApplicationError> {
+        validate_receipt_envelope_kind(&envelope, IdentityStoredResultKind::ConsumerReceipt)?;
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveConsumerReceiptEnvelope {
+                envelope: envelope.clone(),
+            },
+        )?;
+        Ok(envelope.stored_result_ref)
+    }
+
+    fn save_job_report_result(
+        &self,
+        result: StoredIdentityOperationResult,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<identity_contracts::refs::IdentityStoredResultRef, ApplicationError> {
+        validate_stored_result_kind(&result, IdentityStoredResultKind::JobReport)?;
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveStoredResult {
+                result: result.clone(),
+            },
+        )?;
+        Ok(result.stored_result_ref)
+    }
+
+    fn save_handoff_callback_receipt_result(
+        &self,
+        result: StoredIdentityOperationResult,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<identity_contracts::refs::IdentityStoredResultRef, ApplicationError> {
+        validate_stored_result_kind(&result, IdentityStoredResultKind::HandoffCallbackReceipt)?;
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveStoredResult {
+                result: result.clone(),
+            },
+        )?;
+        Ok(result.stored_result_ref)
+    }
+
+    fn get_handoff_callback_receipt(
+        &self,
+        stored_result_ref: identity_contracts::refs::IdentityStoredResultRef,
+    ) -> Result<Option<IdentityConsumerReceiptEnvelope>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .handoff_callback_receipts
+            .get(stored_result_ref.as_str())
+            .cloned())
+    }
+
+    fn save_handoff_callback_receipt(
+        &self,
+        envelope: IdentityConsumerReceiptEnvelope,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<identity_contracts::refs::IdentityStoredResultRef, ApplicationError> {
+        validate_receipt_envelope_kind(
+            &envelope,
+            IdentityStoredResultKind::HandoffCallbackReceipt,
+        )?;
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveHandoffCallbackReceiptEnvelope {
+                envelope: envelope.clone(),
+            },
+        )?;
+        Ok(envelope.stored_result_ref)
+    }
+}
+
+impl IdentityCommandEffectSummaryRepository for IdentityInMemoryRuntime {
+    fn get_effect_summary(
+        &self,
+        effect_summary_ref: IdentityCommandEffectSummaryRef,
+    ) -> Result<Option<IdentityCommandEffectSummary>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .command_effect_summaries
+            .get(effect_summary_ref.as_str())
+            .cloned())
+    }
+
+    fn list_effects_by_operation_context(
+        &self,
+        context_ref: IdentityOperationContextRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityCommandEffectSummaryRef>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let mut items: Vec<_> = store
+            .command_effect_summaries
+            .values()
+            .filter(|summary| summary.operation_context_ref == context_ref)
+            .map(|summary| summary.effect_summary_ref.clone())
+            .collect();
+        items.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        let (items, next_cursor) = paged(items, page, "effect-context");
+        Ok(Page { items, next_cursor })
+    }
+
+    fn list_effects_by_truth_ref(
+        &self,
+        truth_ref: IdentityTruthRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityCommandEffectSummaryRef>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let mut items: Vec<_> = store
+            .command_effect_summaries
+            .values()
+            .filter(|summary| summary.primary_truth_ref == truth_ref)
+            .map(|summary| summary.effect_summary_ref.clone())
+            .collect();
+        items.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        let (items, next_cursor) = paged(items, page, "effect-truth");
+        Ok(Page { items, next_cursor })
+    }
+
+    fn list_effects_after_cursor(
+        &self,
+        after_cursor: Option<IdentityTruthCursor>,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityCommandEffectSummaryRef>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let mut items: Vec<_> = store
+            .command_effect_summaries
+            .values()
+            .filter(|summary| {
+                after_cursor
+                    .as_ref()
+                    .map(|cursor| summary.accepted_cursor_ref.as_str() > cursor.as_str())
+                    .unwrap_or(true)
+            })
+            .map(|summary| summary.effect_summary_ref.clone())
+            .collect();
+        items.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        let (items, next_cursor) = paged(items, page, "effect-cursor");
+        Ok(Page { items, next_cursor })
+    }
+
+    fn save_effect_summary(
+        &self,
+        summary: IdentityCommandEffectSummary,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityCommandEffectSummaryRef, ApplicationError> {
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveEffectSummary {
+                summary: summary.clone(),
+            },
+        )?;
+        Ok(summary.effect_summary_ref)
+    }
+}
+
+impl IdentityJobReportRepository for IdentityInMemoryRuntime {
+    fn get_job_report_with_version(
+        &self,
+        report_ref: identity_contracts::refs::IdentityJobReportRef,
+    ) -> Result<Option<Versioned<IdentityJobRunReport>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .job_reports
+            .get(report_ref.as_str())
+            .map(|stored| Versioned {
+                value: stored.report.clone(),
+                version: stored.version,
+            }))
+    }
+
+    fn find_job_report_by_run(
+        &self,
+        job_run_ref: identity_contracts::refs::IdentityJobRunRef,
+    ) -> Result<Option<Versioned<IdentityJobRunReport>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let Some(report_ref) = store.job_report_by_run.get(job_run_ref.as_str()) else {
+            return Ok(None);
+        };
+        Ok(store.job_reports.get(report_ref).map(|stored| Versioned {
+            value: stored.report.clone(),
+            version: stored.version,
+        }))
+    }
+
+    fn list_job_reports_by_name(
+        &self,
+        job_name: IdentityJobName,
+        page: IdentityRepositoryPage,
+    ) -> Result<
+        Page<IdentityVersionedRef<identity_contracts::refs::IdentityJobReportRef>>,
+        ApplicationError,
+    > {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(project_job_report_page(
+            store.job_reports.values().collect(),
+            page,
+            |stored| stored.report.job_name == job_name,
+        ))
+    }
+
+    fn list_job_reports_by_result(
+        &self,
+        result_kind: IdentityJobResultKind,
+        page: IdentityRepositoryPage,
+    ) -> Result<
+        Page<IdentityVersionedRef<identity_contracts::refs::IdentityJobReportRef>>,
+        ApplicationError,
+    > {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(project_job_report_page(
+            store.job_reports.values().collect(),
+            page,
+            |stored| stored.report.result_kind == result_kind,
+        ))
+    }
+
+    fn save_job_report(
+        &self,
+        report: IdentityJobRunReport,
+        expected_version: Option<IdentityVersion>,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<
+        IdentityVersionedRef<identity_contracts::refs::IdentityJobReportRef>,
+        ApplicationError,
+    > {
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveJobReport {
+                report: report.clone(),
+                expected_version,
+            },
+        )?;
+        Ok(IdentityVersionedRef {
+            value_ref: report.report_ref.clone(),
+            version: self.predicted_job_report_version(&report.report_ref)?,
+        })
+    }
+}
+
 fn apply_op(
     store: &mut RuntimeStore,
     baseline: &RuntimeStore,
@@ -1216,6 +2091,29 @@ fn apply_op(
             intent,
             expected_version,
         } => apply_save_handoff_intent(store, intent, expected_version),
+        StagedOp::SaveOutboxRecord {
+            record,
+            expected_version,
+        } => apply_save_outbox_record(store, record, expected_version),
+        StagedOp::SaveIdempotencyReservation { record } => {
+            apply_save_idempotency_reservation(store, record)
+        }
+        StagedOp::SaveIdempotencyTerminal {
+            record,
+            expected_version,
+        } => apply_save_idempotency_terminal(store, record, expected_version),
+        StagedOp::SaveStoredResult { result } => apply_save_stored_result(store, result),
+        StagedOp::SaveConsumerReceiptEnvelope { envelope } => {
+            apply_save_consumer_receipt(store, envelope)
+        }
+        StagedOp::SaveHandoffCallbackReceiptEnvelope { envelope } => {
+            apply_save_handoff_callback_receipt(store, envelope)
+        }
+        StagedOp::SaveEffectSummary { summary } => apply_save_effect_summary(store, summary),
+        StagedOp::SaveJobReport {
+            report,
+            expected_version,
+        } => apply_save_job_report(store, report, expected_version),
     }
 }
 
@@ -1438,6 +2336,326 @@ fn apply_save_handoff_intent(
     }
 }
 
+fn apply_save_outbox_record(
+    store: &mut RuntimeStore,
+    record: IdentityOutboxRecord,
+    expected_version: Option<IdentityVersion>,
+) -> Result<(), ApplicationError> {
+    if store.faults.contains(&FaultCase::SaveOutboxRecordFails) {
+        return Err(ApplicationError::dependency_unavailable(
+            "outbox record persistence unavailable",
+        ));
+    }
+
+    match (
+        store.outbox_records.get(record.outbox_record_ref.as_str()),
+        expected_version,
+    ) {
+        (None, None) => {
+            if store
+                .outbox_records
+                .contains_key(record.outbox_record_ref.as_str())
+            {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::FormalUniqueConflict,
+                    "outbox record already exists",
+                ));
+            }
+            let key = record.outbox_record_ref.as_str().to_owned();
+            store.outbox_subject_index.insert(
+                outbox_subject_key(&record.subject_ref, &record.outbox_record_ref),
+                key.clone(),
+            );
+            store.outbox_trace_index.insert(
+                outbox_trace_key(&record.trace_record_ref, &record.outbox_record_ref),
+                key.clone(),
+            );
+            store.outbox_records.insert(
+                key,
+                StoredOutboxRecord {
+                    record,
+                    version: IdentityVersion::new(1),
+                },
+            );
+            Ok(())
+        }
+        (Some(existing), Some(expected)) if existing.version == expected => {
+            let key = record.outbox_record_ref.as_str().to_owned();
+            store.outbox_subject_index.retain(|_, value| value != &key);
+            store.outbox_trace_index.retain(|_, value| value != &key);
+            store.outbox_subject_index.insert(
+                outbox_subject_key(&record.subject_ref, &record.outbox_record_ref),
+                key.clone(),
+            );
+            store.outbox_trace_index.insert(
+                outbox_trace_key(&record.trace_record_ref, &record.outbox_record_ref),
+                key.clone(),
+            );
+            store.outbox_records.insert(
+                key,
+                StoredOutboxRecord {
+                    record,
+                    version: IdentityVersion::new(expected.get() + 1),
+                },
+            );
+            Ok(())
+        }
+        (None, Some(_)) => Err(ApplicationError::not_found(
+            "outbox record not found for update",
+        )),
+        _ => Err(ApplicationError::optimistic_version_conflict(
+            "outbox record version mismatch",
+        )),
+    }
+}
+
+fn apply_save_idempotency_reservation(
+    store: &mut RuntimeStore,
+    record: IdentityIdempotencyRecord,
+) -> Result<(), ApplicationError> {
+    let namespace_key = idempotency_key_key(
+        &record.operation_name,
+        record.channel,
+        &record.idempotency_key,
+    );
+    if store.idempotency_key_index.contains_key(&namespace_key) {
+        return Err(ApplicationError::new(
+            ApplicationErrorKind::FormalUniqueConflict,
+            "idempotency namespace already reserved",
+        ));
+    }
+
+    let key = record.record_ref.as_str().to_owned();
+    store
+        .idempotency_key_index
+        .insert(namespace_key, key.clone());
+    store.idempotency_records.insert(
+        key,
+        StoredIdempotencyRecord {
+            record,
+            version: IdentityVersion::new(1),
+        },
+    );
+    Ok(())
+}
+
+fn apply_save_idempotency_terminal(
+    store: &mut RuntimeStore,
+    record: IdentityIdempotencyRecord,
+    expected_version: IdentityVersion,
+) -> Result<(), ApplicationError> {
+    if store.faults.contains(&FaultCase::CompleteIdempotencyFails) {
+        return Err(ApplicationError::dependency_unavailable(
+            "idempotency completion unavailable",
+        ));
+    }
+
+    let key = record.record_ref.as_str().to_owned();
+    let Some(existing) = store.idempotency_records.get(&key) else {
+        return Err(ApplicationError::not_found(
+            "idempotency record not found for update",
+        ));
+    };
+    if existing.version != expected_version {
+        return Err(ApplicationError::optimistic_version_conflict(
+            "idempotency record version mismatch",
+        ));
+    }
+    store.idempotency_records.insert(
+        key,
+        StoredIdempotencyRecord {
+            record,
+            version: IdentityVersion::new(expected_version.get() + 1),
+        },
+    );
+    Ok(())
+}
+
+fn apply_save_stored_result(
+    store: &mut RuntimeStore,
+    result: StoredIdentityOperationResult,
+) -> Result<(), ApplicationError> {
+    if store.faults.contains(&FaultCase::SaveStoredResultFails) {
+        return Err(ApplicationError::dependency_unavailable(
+            "stored result persistence unavailable",
+        ));
+    }
+    let stored_result_ref = result.stored_result_ref.as_str().to_owned();
+    if store.stored_results.contains_key(&stored_result_ref) {
+        return Err(ApplicationError::new(
+            ApplicationErrorKind::FormalUniqueConflict,
+            "stored result already exists",
+        ));
+    }
+    if let Some(existing_ref) = store
+        .stored_result_by_context
+        .get(result.operation_context_ref.as_str())
+    {
+        if existing_ref != &stored_result_ref {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::FormalUniqueConflict,
+                "operation context already has a stored result",
+            ));
+        }
+    }
+    store.stored_result_by_context.insert(
+        result.operation_context_ref.as_str().to_owned(),
+        stored_result_ref.clone(),
+    );
+    store.stored_results.insert(stored_result_ref, result);
+    Ok(())
+}
+
+fn apply_save_consumer_receipt(
+    store: &mut RuntimeStore,
+    envelope: IdentityConsumerReceiptEnvelope,
+) -> Result<(), ApplicationError> {
+    if store.faults.contains(&FaultCase::SaveReceiptEnvelopeFails) {
+        return Err(ApplicationError::dependency_unavailable(
+            "consumer receipt persistence unavailable",
+        ));
+    }
+    let stored_result_ref = envelope.stored_result_ref.as_str().to_owned();
+    if store.consumer_receipts.contains_key(&stored_result_ref) {
+        return Err(ApplicationError::new(
+            ApplicationErrorKind::FormalUniqueConflict,
+            "consumer receipt envelope already exists",
+        ));
+    }
+    store.consumer_receipts.insert(stored_result_ref, envelope);
+    Ok(())
+}
+
+fn apply_save_handoff_callback_receipt(
+    store: &mut RuntimeStore,
+    envelope: IdentityConsumerReceiptEnvelope,
+) -> Result<(), ApplicationError> {
+    if store.faults.contains(&FaultCase::SaveReceiptEnvelopeFails) {
+        return Err(ApplicationError::dependency_unavailable(
+            "handoff callback receipt persistence unavailable",
+        ));
+    }
+    let stored_result_ref = envelope.stored_result_ref.as_str().to_owned();
+    if store
+        .handoff_callback_receipts
+        .contains_key(&stored_result_ref)
+    {
+        return Err(ApplicationError::new(
+            ApplicationErrorKind::FormalUniqueConflict,
+            "handoff callback receipt envelope already exists",
+        ));
+    }
+    store
+        .handoff_callback_receipts
+        .insert(stored_result_ref, envelope);
+    Ok(())
+}
+
+fn apply_save_effect_summary(
+    store: &mut RuntimeStore,
+    summary: IdentityCommandEffectSummary,
+) -> Result<(), ApplicationError> {
+    let key = summary.effect_summary_ref.as_str().to_owned();
+    if store.command_effect_summaries.contains_key(&key) {
+        return Err(ApplicationError::new(
+            ApplicationErrorKind::FormalUniqueConflict,
+            "command effect summary already exists",
+        ));
+    }
+    store.effects_by_context.insert(
+        effect_context_key(&summary.operation_context_ref, &summary.effect_summary_ref),
+        key.clone(),
+    );
+    store.effects_by_truth_ref.insert(
+        effect_truth_key(&summary.primary_truth_ref, &summary.effect_summary_ref),
+        key.clone(),
+    );
+    store.effects_after_cursor.insert(
+        effect_cursor_key(&summary.accepted_cursor_ref, &summary.effect_summary_ref),
+        key.clone(),
+    );
+    store.command_effect_summaries.insert(key, summary);
+    Ok(())
+}
+
+fn apply_save_job_report(
+    store: &mut RuntimeStore,
+    report: IdentityJobRunReport,
+    expected_version: Option<IdentityVersion>,
+) -> Result<(), ApplicationError> {
+    if store.faults.contains(&FaultCase::SaveJobReportFails) {
+        return Err(ApplicationError::dependency_unavailable(
+            "job report persistence unavailable",
+        ));
+    }
+
+    match (
+        store.job_reports.get(report.report_ref.as_str()),
+        expected_version,
+    ) {
+        (None, None) => {
+            if let Some(existing) = store.job_report_by_run.get(report.job_run_ref.as_str()) {
+                if existing != report.report_ref.as_str() {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::FormalUniqueConflict,
+                        "job run already has a report",
+                    ));
+                }
+            }
+            let key = report.report_ref.as_str().to_owned();
+            store
+                .job_report_by_run
+                .insert(report.job_run_ref.as_str().to_owned(), key.clone());
+            store.job_report_by_name.insert(
+                job_report_name_key(&report.job_name, &report.report_ref),
+                key.clone(),
+            );
+            store.job_report_by_result.insert(
+                job_report_result_key(report.result_kind, &report.report_ref),
+                key.clone(),
+            );
+            store.job_reports.insert(
+                key,
+                StoredJobReport {
+                    report,
+                    version: IdentityVersion::new(1),
+                },
+            );
+            Ok(())
+        }
+        (Some(existing), Some(expected)) if existing.version == expected => {
+            let key = report.report_ref.as_str().to_owned();
+            store.job_report_by_name.retain(|_, value| value != &key);
+            store.job_report_by_result.retain(|_, value| value != &key);
+            store
+                .job_report_by_run
+                .insert(report.job_run_ref.as_str().to_owned(), key.clone());
+            store.job_report_by_name.insert(
+                job_report_name_key(&report.job_name, &report.report_ref),
+                key.clone(),
+            );
+            store.job_report_by_result.insert(
+                job_report_result_key(report.result_kind, &report.report_ref),
+                key.clone(),
+            );
+            store.job_reports.insert(
+                key,
+                StoredJobReport {
+                    report,
+                    version: IdentityVersion::new(expected.get() + 1),
+                },
+            );
+            Ok(())
+        }
+        (None, Some(_)) => Err(ApplicationError::not_found(
+            "job report not found for update",
+        )),
+        _ => Err(ApplicationError::optimistic_version_conflict(
+            "job report version mismatch",
+        )),
+    }
+}
+
 fn project_projection_page<F>(
     entries: Vec<&StoredProjectionState>,
     page: IdentityRepositoryPage,
@@ -1463,6 +2681,72 @@ where
     let next_cursor = if start + items.len() < filtered.len() {
         Some(IdentityRepositoryCursor::new(format!(
             "projection:{}",
+            start + items.len()
+        )))
+    } else {
+        None
+    };
+    Page { items, next_cursor }
+}
+
+fn project_outbox_page<F>(
+    entries: Vec<&StoredOutboxRecord>,
+    page: IdentityRepositoryPage,
+    predicate: F,
+) -> Page<IdentityVersionedRef<IdentityOutboxRecordRef>>
+where
+    F: Fn(&StoredOutboxRecord) -> bool,
+{
+    let filtered: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| predicate(entry))
+        .collect();
+    let start = parse_page_cursor(page.cursor.as_ref(), "outbox");
+    let items: Vec<_> = filtered
+        .iter()
+        .skip(start)
+        .take(page.limit as usize)
+        .map(|entry| IdentityVersionedRef {
+            value_ref: entry.record.outbox_record_ref.clone(),
+            version: entry.version,
+        })
+        .collect();
+    let next_cursor = if start + items.len() < filtered.len() {
+        Some(IdentityRepositoryCursor::new(format!(
+            "outbox:{}",
+            start + items.len()
+        )))
+    } else {
+        None
+    };
+    Page { items, next_cursor }
+}
+
+fn project_job_report_page<F>(
+    entries: Vec<&StoredJobReport>,
+    page: IdentityRepositoryPage,
+    predicate: F,
+) -> Page<IdentityVersionedRef<identity_contracts::refs::IdentityJobReportRef>>
+where
+    F: Fn(&StoredJobReport) -> bool,
+{
+    let filtered: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| predicate(entry))
+        .collect();
+    let start = parse_page_cursor(page.cursor.as_ref(), "job-report");
+    let items: Vec<_> = filtered
+        .iter()
+        .skip(start)
+        .take(page.limit as usize)
+        .map(|entry| IdentityVersionedRef {
+            value_ref: entry.report.report_ref.clone(),
+            version: entry.version,
+        })
+        .collect();
+    let next_cursor = if start + items.len() < filtered.len() {
+        Some(IdentityRepositoryCursor::new(format!(
+            "job-report:{}",
             start + items.len()
         )))
     } else {
@@ -1582,6 +2866,20 @@ fn member_scope_key(member_ref: &GlobalMemberRef, scope_ref: &VisibilityScopeRef
     format!("{}::{}", member_ref.id().as_str(), scope_ref.as_str())
 }
 
+fn outbox_subject_key(
+    subject_ref: &IdentityOutboxSubjectRef,
+    outbox_ref: &IdentityOutboxRecordRef,
+) -> String {
+    format!("{}::{}", subject_ref.as_str(), outbox_ref.as_str())
+}
+
+fn outbox_trace_key(
+    trace_ref: &IdentityTraceRecordRef,
+    outbox_ref: &IdentityOutboxRecordRef,
+) -> String {
+    format!("{}::{}", trace_ref.as_str(), outbox_ref.as_str())
+}
+
 fn projection_key(projection_ref: &IdentityProjectionRef) -> String {
     projection_ref.as_str().to_owned()
 }
@@ -1593,6 +2891,101 @@ fn external_reference_key(reference_ref: &ExternalReferenceRef) -> String {
         reference_ref.source_ref.owner() as u8,
         reference_ref.source_ref.external_ref.as_str()
     )
+}
+
+fn idempotency_key_key(
+    operation_name: &IdentityOperationName,
+    channel: identity_contracts::refs::IdentityOperationChannel,
+    idempotency_key: &IdentityIdempotencyKey,
+) -> String {
+    format!(
+        "{}::{channel:?}::{}",
+        operation_name.as_str(),
+        idempotency_key.as_public().as_str()
+    )
+}
+
+fn effect_context_key(
+    context_ref: &IdentityOperationContextRef,
+    effect_ref: &IdentityCommandEffectSummaryRef,
+) -> String {
+    format!("{}::{}", context_ref.as_str(), effect_ref.as_str())
+}
+
+fn effect_truth_key(
+    truth_ref: &IdentityTruthRef,
+    effect_ref: &IdentityCommandEffectSummaryRef,
+) -> String {
+    format!("{}::{}", truth_ref_key(truth_ref), effect_ref.as_str())
+}
+
+fn effect_cursor_key(
+    cursor_ref: &IdentityTruthCursor,
+    effect_ref: &IdentityCommandEffectSummaryRef,
+) -> String {
+    format!("{}::{}", cursor_ref.as_str(), effect_ref.as_str())
+}
+
+fn truth_ref_key(truth_ref: &IdentityTruthRef) -> String {
+    match truth_ref {
+        IdentityTruthRef::GlobalMember(value) => format!("global_member:{}", value.id().as_str()),
+        IdentityTruthRef::RoleCapabilitySummary(value) => {
+            format!("role_capability_summary:{}", value.summary_id.as_str())
+        }
+        IdentityTruthRef::RoleCapabilitySourceSnapshot(value) => {
+            format!(
+                "role_capability_source_snapshot:{}",
+                value.snapshot_id.as_str()
+            )
+        }
+        IdentityTruthRef::CareerRecord(value) => {
+            format!("career_record:{}", value.record_id.as_str())
+        }
+        IdentityTruthRef::MemoryReference(value) => {
+            format!("memory_reference:{}", value.reference_id.as_str())
+        }
+        IdentityTruthRef::TraceHandoffIntent(value) => {
+            format!("trace_handoff_intent:{}", value.as_str())
+        }
+    }
+}
+
+fn job_report_name_key(
+    job_name: &IdentityJobName,
+    report_ref: &identity_contracts::refs::IdentityJobReportRef,
+) -> String {
+    format!("{}::{}", job_name.as_str(), report_ref.as_str())
+}
+
+fn job_report_result_key(
+    result_kind: IdentityJobResultKind,
+    report_ref: &identity_contracts::refs::IdentityJobReportRef,
+) -> String {
+    format!("{result_kind:?}::{}", report_ref.as_str())
+}
+
+fn validate_stored_result_kind(
+    result: &StoredIdentityOperationResult,
+    expected: IdentityStoredResultKind,
+) -> Result<(), ApplicationError> {
+    if result.result_kind != expected {
+        return Err(ApplicationError::invalid_request(format!(
+            "stored result kind mismatch: expected {expected:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_receipt_envelope_kind(
+    envelope: &IdentityConsumerReceiptEnvelope,
+    expected: IdentityStoredResultKind,
+) -> Result<(), ApplicationError> {
+    if envelope.result_kind != expected {
+        return Err(ApplicationError::invalid_request(format!(
+            "receipt envelope kind mismatch: expected {expected:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn empty_sidecars() -> ExternalReferenceTypedSidecarRefs {
