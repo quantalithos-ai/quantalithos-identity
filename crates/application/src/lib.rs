@@ -2,11 +2,15 @@
 //!
 //! This crate defines application-local helper objects and port contracts.
 
+pub mod command;
 pub mod errors;
 pub mod mapper;
 pub mod ports;
 pub mod support;
 
+pub use crate::command::{
+    IdentityApplicationFacade, IdentityCommandService, IdentityCommandServiceDeps,
+};
 pub use crate::errors::{ApplicationError, ApplicationErrorKind};
 pub use crate::mapper::{
     DefaultIdentityDispatchTargetCatalog, DefaultIdentityMaintenanceIssueMapper,

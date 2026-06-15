@@ -20,12 +20,15 @@ mod tests {
     use serde::de::DeserializeOwned;
 
     use crate::commands::{
+        EstablishGlobalMemberRequest, GlobalLifecycleCommandResult, GlobalMemberCommandResult,
         IdentityCommandEffectPublicSummary, IdentityCommandOutcome, IdentityCommandRequest,
-        IdentityCommandResponse,
+        IdentityCommandResponse, UpdateGlobalLifecycleStateRequest,
     };
     use crate::events::{
-        IdentityConsumerOutcome, IdentityConsumerReceipt, IdentityInboundEventEnvelope,
-        IdentityOutboundEventEnvelope, IdentityOutboundEventRef,
+        GlobalLifecycleChangedPayload, GlobalMemberAvailabilityChangedPayload,
+        GlobalMemberEstablishedPayload, IdentityAnchorChangedPayload, IdentityConsumerOutcome,
+        IdentityConsumerReceipt, IdentityInboundEventEnvelope, IdentityOutboundEventEnvelope,
+        IdentityOutboundEventRef,
     };
     use crate::jobs::{
         IdentityJobReportSurface, IdentityJobRequest, IdentityJobResponse, IdentityJobResultKind,
@@ -55,9 +58,9 @@ mod tests {
         IdentityOutboxRecordRef, IdentityOutboxSubjectRef, IdentityProjectionRef,
         IdentityReadSurfaceKind, IdentityRedactionMarkerRef, IdentityRequestDigestValue,
         IdentitySourceEventRef, IdentityStoredResultRef, IdentityTimestamp,
-        IdentityTraceContextRef, IdentityTraceRecordRef, IdentityTruthCursor,
-        ProjectionFreshnessMarkerRef, ReconciliationReportRef, TopicKeyRef, VisibilityContextRef,
-        VisibilityResultRef,
+        IdentityTraceContextRef, IdentityTraceRecordRef, IdentityTruthCursor, LifecycleReasonKind,
+        LifecycleReasonRef, ProjectionFreshnessMarkerRef, ReconciliationReportRef, TopicKeyRef,
+        VisibilityContextRef, VisibilityResultRef,
     };
 
     fn roundtrip<T>(value: &T)
@@ -89,12 +92,29 @@ mod tests {
         }
     }
 
+    fn sample_identity_source_ref() -> crate::refs::IdentitySourceRef {
+        crate::refs::IdentitySourceRef::new(
+            crate::refs::IdentitySourceOwner::Identity,
+            crate::refs::ExternalSourceRef::new("source-1".to_owned())
+                .expect("sample external source ref should be valid"),
+        )
+        .expect("sample source ref should be valid")
+    }
+
+    fn sample_lifecycle_reason_ref() -> LifecycleReasonRef {
+        LifecycleReasonRef::new(
+            LifecycleReasonKind::InitialProvisioned,
+            sample_identity_source_ref(),
+        )
+        .expect("sample lifecycle reason should be valid")
+    }
+
     fn sample_query_surface() -> IdentityQuerySurface {
         IdentityQuerySurface {
             disposition: IdentityQueryDisposition::Degraded,
             visibility: IdentityVisibilityMarker {
                 visibility_result_ref: VisibilityResultRef::new("visibility-result-1"),
-                read_surface_kind: IdentityReadSurfaceKind::Summary,
+                read_surface_kind: IdentityReadSurfaceKind::Found,
                 redaction_marker_ref: Some(IdentityRedactionMarkerRef::new("redaction-1")),
             },
             degraded: Some(IdentityDegradedMarker {
@@ -140,6 +160,49 @@ mod tests {
         roundtrip(&request);
         roundtrip(&response);
         roundtrip(&IdentityCommandOutcome::Accepted(response));
+    }
+
+    #[test]
+    fn command_member_lifecycle_dtos_roundtrip() {
+        let establish_request = EstablishGlobalMemberRequest {
+            requested_member_ref: Some(sample_member_ref()),
+            source_ref: sample_identity_source_ref(),
+            anchor_reason_ref: None,
+            initial_lifecycle_reason_ref: sample_lifecycle_reason_ref(),
+        };
+        let establish_result = GlobalMemberCommandResult {
+            member_ref: sample_member_ref(),
+            anchor_state_kind: crate::refs::IdentityAnchorStateKind::Established,
+            lifecycle_state_kind: crate::refs::GlobalLifecycleStateKind::Available,
+            source_ref: sample_identity_source_ref(),
+        };
+        let lifecycle_request = UpdateGlobalLifecycleStateRequest {
+            member_ref: sample_member_ref(),
+            target_state: crate::refs::GlobalLifecycleStateKind::Paused,
+            reason_ref: LifecycleReasonRef::new(
+                LifecycleReasonKind::ManualPause,
+                sample_identity_source_ref(),
+            )
+            .expect("pause reason should be valid"),
+            basis_ref: None,
+            action_risk_ref: None,
+        };
+        let lifecycle_result = GlobalLifecycleCommandResult {
+            member_ref: sample_member_ref(),
+            lifecycle_state_kind: crate::refs::GlobalLifecycleStateKind::Paused,
+            reason_ref: LifecycleReasonRef::new(
+                LifecycleReasonKind::ManualPause,
+                sample_identity_source_ref(),
+            )
+            .expect("pause reason should be valid"),
+            basis_ref: None,
+            anchor_state_kind: None,
+        };
+
+        roundtrip(&establish_request);
+        roundtrip(&establish_result);
+        roundtrip(&lifecycle_request);
+        roundtrip(&lifecycle_result);
     }
 
     #[test]
@@ -237,6 +300,63 @@ mod tests {
         roundtrip(&inbound);
         roundtrip(&receipt);
         roundtrip(&outbound);
+    }
+
+    #[test]
+    fn member_lifecycle_outbound_payloads_roundtrip() {
+        let established = GlobalMemberEstablishedPayload {
+            member_ref: sample_member_ref(),
+            source_ref: sample_identity_source_ref(),
+            anchor_state_kind: crate::refs::IdentityAnchorStateKind::Established,
+            lifecycle_state_kind: crate::refs::GlobalLifecycleStateKind::Available,
+            created_by_ref: sample_actor_ref(),
+            established_at: IdentityTimestamp::from_clock(1).expect("valid timestamp"),
+            accepted_cursor_ref: IdentityTruthCursor::new("truth-cursor-1"),
+        };
+        let anchor_changed = IdentityAnchorChangedPayload {
+            member_ref: sample_member_ref(),
+            anchor_state_kind: crate::refs::IdentityAnchorStateKind::RetiredHeld,
+            anchor_reason_ref: Some(
+                crate::refs::IdentityAnchorReasonRef::new(
+                    crate::refs::IdentityAnchorReasonKind::Retired,
+                    sample_identity_source_ref(),
+                )
+                .expect("anchor reason should be valid"),
+            ),
+            changed_at: IdentityTimestamp::from_clock(2).expect("valid timestamp"),
+            accepted_cursor_ref: IdentityTruthCursor::new("truth-cursor-2"),
+        };
+        let lifecycle_changed = GlobalLifecycleChangedPayload {
+            member_ref: sample_member_ref(),
+            lifecycle_state_kind: crate::refs::GlobalLifecycleStateKind::Retired,
+            reason_ref: LifecycleReasonRef::new(
+                LifecycleReasonKind::Retirement,
+                sample_identity_source_ref(),
+            )
+            .expect("retirement reason should be valid"),
+            basis_ref: None,
+            changed_by_ref: sample_actor_ref(),
+            changed_at: IdentityTimestamp::from_clock(3).expect("valid timestamp"),
+            anchor_state_kind: Some(crate::refs::IdentityAnchorStateKind::RetiredHeld),
+            accepted_cursor_ref: IdentityTruthCursor::new("truth-cursor-3"),
+        };
+        let availability_changed = GlobalMemberAvailabilityChangedPayload {
+            member_ref: sample_member_ref(),
+            lifecycle_state_kind: crate::refs::GlobalLifecycleStateKind::Paused,
+            is_available: false,
+            reason_ref: LifecycleReasonRef::new(
+                LifecycleReasonKind::ManualPause,
+                sample_identity_source_ref(),
+            )
+            .expect("pause reason should be valid"),
+            changed_at: IdentityTimestamp::from_clock(4).expect("valid timestamp"),
+            accepted_cursor_ref: IdentityTruthCursor::new("truth-cursor-4"),
+        };
+
+        roundtrip(&established);
+        roundtrip(&anchor_changed);
+        roundtrip(&lifecycle_changed);
+        roundtrip(&availability_changed);
     }
 
     #[test]

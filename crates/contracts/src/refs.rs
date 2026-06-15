@@ -352,6 +352,18 @@ pub enum IdentityAnchorReasonKind {
     GovernanceHold,
 }
 
+/// Public identity member anchor state kind.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityAnchorStateKind {
+    /// Member anchor has been established and may be referenced by identity truth.
+    Established,
+    /// Member anchor remains permanently occupied after retirement.
+    RetiredHeld,
+    /// Member anchor remains permanently occupied after tombstoning.
+    TombstoneHeld,
+}
+
 /// Body-free reason reference for an identity lifecycle transition.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct LifecycleReasonRef {
@@ -407,6 +419,20 @@ pub enum LifecycleReasonKind {
     GovernanceBasis,
     /// Lifecycle changed because an external source became invalid or unavailable.
     SourceInvalidated,
+}
+
+/// Public platform-wide lifecycle state kind for a global member.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GlobalLifecycleStateKind {
+    /// Member is available across the platform.
+    Available,
+    /// Member is explicitly paused and not currently available.
+    Paused,
+    /// Member has been retired and is no longer a normal available candidate.
+    Retired,
+    /// Member has been tombstoned and is terminal.
+    Tombstoned,
 }
 
 /// Body-free risk classification reference for a lifecycle action.

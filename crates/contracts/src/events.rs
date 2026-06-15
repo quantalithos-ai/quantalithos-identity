@@ -7,10 +7,12 @@ use crate::protocol::{
     IdentityInboundConsumerName, IdentityOutboundEventName, IdentityProtocolSchemaVersionRef,
 };
 use crate::refs::{
-    IdentityConsumerBindingRef, IdentityConsumerReceiptRef, IdentityEventEnvelopeMarkerRef,
-    IdentityOutboxPayloadMarkerRef, IdentityOutboxRecordRef, IdentityOutboxSubjectRef,
-    IdentitySourceEventRef, IdentityStoredResultRef, IdentityTimestamp, IdentityTraceContextRef,
-    IdentityTraceRecordRef, TopicKeyRef,
+    GlobalLifecycleStateKind, GlobalMemberRef, GovernanceBasisRef, IdentityAnchorReasonRef,
+    IdentityAnchorStateKind, IdentityConsumerBindingRef, IdentityConsumerReceiptRef,
+    IdentityEventEnvelopeMarkerRef, IdentityOutboxPayloadMarkerRef, IdentityOutboxRecordRef,
+    IdentityOutboxSubjectRef, IdentitySourceEventRef, IdentitySourceRef, IdentityStoredResultRef,
+    IdentityTimestamp, IdentityTraceContextRef, IdentityTraceRecordRef, IdentityTruthCursor,
+    LifecycleReasonRef, TopicKeyRef,
 };
 
 /// Public inbound event or callback envelope.
@@ -110,4 +112,76 @@ impl IdentityOutboundEventRef {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
+}
+
+/// Body-free outbound payload emitted when a global member is established.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GlobalMemberEstablishedPayload {
+    /// Established member ref.
+    pub member_ref: GlobalMemberRef,
+    /// Body-free source marker used for establishment.
+    pub source_ref: IdentitySourceRef,
+    /// Anchor state created by the establish flow.
+    pub anchor_state_kind: IdentityAnchorStateKind,
+    /// Initial lifecycle state created by the establish flow.
+    pub lifecycle_state_kind: GlobalLifecycleStateKind,
+    /// Actor that established the member.
+    pub created_by_ref: core_contracts::actor::ActorRef,
+    /// Timestamp when the member was established.
+    pub established_at: IdentityTimestamp,
+    /// Accepted truth cursor for the change.
+    pub accepted_cursor_ref: IdentityTruthCursor,
+}
+
+/// Body-free outbound payload emitted when a member anchor state changes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityAnchorChangedPayload {
+    /// Member whose anchor changed.
+    pub member_ref: GlobalMemberRef,
+    /// Anchor state after the accepted change.
+    pub anchor_state_kind: IdentityAnchorStateKind,
+    /// Optional anchor hold reason marker.
+    pub anchor_reason_ref: Option<IdentityAnchorReasonRef>,
+    /// Timestamp when the anchor changed.
+    pub changed_at: IdentityTimestamp,
+    /// Accepted truth cursor for the change.
+    pub accepted_cursor_ref: IdentityTruthCursor,
+}
+
+/// Body-free outbound payload emitted when lifecycle truth changes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GlobalLifecycleChangedPayload {
+    /// Member whose lifecycle changed.
+    pub member_ref: GlobalMemberRef,
+    /// Lifecycle state after the accepted change.
+    pub lifecycle_state_kind: GlobalLifecycleStateKind,
+    /// Body-free lifecycle reason marker.
+    pub reason_ref: LifecycleReasonRef,
+    /// Optional governance basis marker persisted for the change.
+    pub basis_ref: Option<GovernanceBasisRef>,
+    /// Actor that changed the lifecycle state.
+    pub changed_by_ref: core_contracts::actor::ActorRef,
+    /// Timestamp when the lifecycle changed.
+    pub changed_at: IdentityTimestamp,
+    /// Optional anchor state side effect for terminal transitions.
+    pub anchor_state_kind: Option<IdentityAnchorStateKind>,
+    /// Accepted truth cursor for the change.
+    pub accepted_cursor_ref: IdentityTruthCursor,
+}
+
+/// Body-free outbound payload emitted when member availability changes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GlobalMemberAvailabilityChangedPayload {
+    /// Member whose availability changed.
+    pub member_ref: GlobalMemberRef,
+    /// Lifecycle state that determined the availability.
+    pub lifecycle_state_kind: GlobalLifecycleStateKind,
+    /// Availability derived from the lifecycle state matrix.
+    pub is_available: bool,
+    /// Body-free lifecycle reason marker.
+    pub reason_ref: LifecycleReasonRef,
+    /// Timestamp when the availability changed.
+    pub changed_at: IdentityTimestamp,
+    /// Accepted truth cursor for the change.
+    pub accepted_cursor_ref: IdentityTruthCursor,
 }

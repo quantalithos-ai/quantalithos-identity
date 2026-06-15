@@ -496,6 +496,10 @@ mod tests {
                 IdentityApiRouteRef::new("api.command.member.establish"),
                 IdentityDispatchTargetRef::new("application.command.establish_global_member"),
             )
+            .with_api_command_target(
+                IdentityApiRouteRef::new("api.command.lifecycle.update"),
+                IdentityDispatchTargetRef::new("application.command.update_global_lifecycle_state"),
+            )
             .with_api_query_target(
                 IdentityApiRouteRef::new("api.query.member.summary"),
                 IdentityDispatchTargetRef::new("application.query.read_member_summary"),
@@ -524,6 +528,13 @@ mod tests {
         );
         assert_eq!(
             catalog
+                .api_command_target(IdentityApiRouteRef::new("api.command.lifecycle.update"))
+                .expect("lifecycle command target")
+                .as_str(),
+            "application.command.update_global_lifecycle_state"
+        );
+        assert_eq!(
+            catalog
                 .job_target(IdentityJobName::new("RunIdentityReconciliation"))
                 .expect("job target")
                 .as_str(),
@@ -534,6 +545,16 @@ mod tests {
                 .assert_application_target(
                     crate::support::IdentityEntrySurfaceKind::ApiCommand,
                     IdentityDispatchTargetRef::new("application.command.establish_global_member"),
+                )
+                .is_ok()
+        );
+        assert!(
+            catalog
+                .assert_application_target(
+                    crate::support::IdentityEntrySurfaceKind::ApiCommand,
+                    IdentityDispatchTargetRef::new(
+                        "application.command.update_global_lifecycle_state",
+                    ),
                 )
                 .is_ok()
         );
