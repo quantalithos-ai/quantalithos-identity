@@ -45,6 +45,12 @@ dependencies = [
 [[package]]
 name = "identity-infra"
 version = "0.1.0"
+dependencies = [
+ "core-contracts",
+ "identity-application",
+ "identity-contracts",
+ "identity-domain",
+]
 
 [[package]]
 name = "identity-jobs"

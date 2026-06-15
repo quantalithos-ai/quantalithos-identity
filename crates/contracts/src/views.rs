@@ -175,6 +175,8 @@ pub struct MemberSummaryView {
     pub view_ref: MemberSummaryViewRef,
     /// Member represented by this summary.
     pub member_ref: GlobalMemberRef,
+    /// Visibility scope for which this view was materialized.
+    pub visibility_scope_ref: VisibilityScopeRef,
     /// Anchor safe summary slice.
     pub anchor_slice_ref: MemberSummarySliceRef,
     /// Lifecycle safe summary slice.
@@ -201,6 +203,7 @@ impl MemberSummaryView {
     pub fn from_projection(
         view_ref: MemberSummaryViewRef,
         member_ref: GlobalMemberRef,
+        visibility_scope_ref: VisibilityScopeRef,
         anchor_slice_ref: MemberSummarySliceRef,
         lifecycle_slice_ref: MemberSummarySliceRef,
         role_capability_slice_refs: Vec<MemberSummarySliceRef>,
@@ -221,6 +224,7 @@ impl MemberSummaryView {
         Ok(Self {
             view_ref,
             member_ref,
+            visibility_scope_ref,
             anchor_slice_ref,
             lifecycle_slice_ref,
             role_capability_slice_refs,
@@ -236,6 +240,11 @@ impl MemberSummaryView {
     /// Returns whether the view belongs to the provided member.
     pub fn belongs_to(&self, member_ref: &GlobalMemberRef) -> bool {
         &self.member_ref == member_ref
+    }
+
+    /// Returns whether the view was materialized for the provided visibility scope.
+    pub fn matches_visibility_scope(&self, visibility_scope_ref: &VisibilityScopeRef) -> bool {
+        &self.visibility_scope_ref == visibility_scope_ref
     }
 
     /// Returns whether the required anchor and lifecycle slices are present.
