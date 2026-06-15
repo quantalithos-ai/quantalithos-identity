@@ -25,7 +25,8 @@ mod tests {
         IdentityCommandEffectPublicSummary, IdentityCommandOutcome, IdentityCommandRequest,
         IdentityCommandResponse, MaintainMemoryReferenceRequest,
         MaintainRoleCapabilitySummaryRequest, MemoryReferenceCommandResult,
-        RoleCapabilityCommandResult, UpdateGlobalLifecycleStateRequest,
+        PrepareTraceHandoffRequest, RoleCapabilityCommandResult, TraceHandoffCommandResult,
+        UpdateGlobalLifecycleStateRequest,
     };
     use crate::events::{
         GlobalLifecycleChangedPayload, GlobalMemberAvailabilityChangedPayload,
@@ -52,32 +53,34 @@ mod tests {
         IdentityPageResponse, IdentityPublicPageCursor, IdentityPublicPageInfo,
         IdentityPublicPageRequest, IdentityQueryRequest, IdentityQueryResponse,
     };
+    use crate::receipts::TraceHandoffIntentRef;
     use crate::refs::{
         ArchiveHandoffRef, ArchiveRef, CapabilityEvidenceKind, CapabilityEvidenceRef,
         CapabilitySourceRef, CareerAppendMaterialKind, CareerAppendMaterialMarker,
         CareerAppendReasonKind, CareerAppendReasonRef, CareerRecordChangeIntent, CareerRecordId,
         CareerRecordRef, CareerRecordStateKind, CareerSafeSummaryRef, ExternalSourceRef,
-        GlobalMemberId, GlobalMemberRef, HandoffReceiptRef, IdentityApiRequestMarkerRef,
-        IdentityAuditSubjectRef, IdentityCanonicalRequestMarkerRef, IdentityConsumerBindingRef,
-        IdentityConsumerReceiptRef, IdentityDegradedMarkerRef, IdentityJobCursorRef,
-        IdentityJobReportRef, IdentityJobRunMetadataRef, IdentityJobRunRef,
-        IdentityJobScopeMarkerRef, IdentityMaintenanceTargetRef, IdentityOutboxPayloadMarkerRef,
-        IdentityOutboxRecordRef, IdentityOutboxSubjectRef, IdentityProjectionRef,
-        IdentityReadSurfaceKind, IdentityRedactionMarkerRef, IdentityRequestDigestValue,
-        IdentitySourceEventRef, IdentitySourceOwner, IdentityStoredResultRef, IdentityTimestamp,
-        IdentityTraceContextRef, IdentityTraceRecordRef, IdentityTruthCursor, LifecycleReasonKind,
-        LifecycleReasonRef, MemoryRef, MemoryReferenceChangeIntent,
-        MemoryReferenceChangeMaterialKind, MemoryReferenceChangeMaterialMarker, MemoryReferenceId,
-        MemoryReferenceReasonKind, MemoryReferenceReasonRef, MemoryReferenceRef,
-        MemoryReferenceSourceKind, MemoryReferenceSourceRef, MemoryReferenceStateKind,
-        MemorySafeSummaryRef, ProjectParticipationRef, ProjectionFreshnessMarkerRef,
-        ReconciliationReportRef, RoleCapabilityChangeMaterialKind,
-        RoleCapabilityChangeMaterialMarker, RoleCapabilityChangeReasonKind,
-        RoleCapabilityChangeReasonRef, RoleCapabilitySafeSummaryRef, RoleCapabilitySourceKind,
-        RoleCapabilitySourceRef, RoleCapabilitySourceSnapshotId, RoleCapabilitySourceSnapshotRef,
+        GlobalMemberId, GlobalMemberRef, HandoffReasonRef, HandoffReceiptRef, HandoffScopeRef,
+        HandoffStateKind, HandoffTargetRef, IdentityApiRequestMarkerRef, IdentityAuditSubjectRef,
+        IdentityCanonicalRequestMarkerRef, IdentityConsumerBindingRef, IdentityConsumerReceiptRef,
+        IdentityDegradedMarkerRef, IdentityJobCursorRef, IdentityJobReportRef,
+        IdentityJobRunMetadataRef, IdentityJobRunRef, IdentityJobScopeMarkerRef,
+        IdentityMaintenanceTargetRef, IdentityOutboxPayloadMarkerRef, IdentityOutboxRecordRef,
+        IdentityOutboxSubjectRef, IdentityProjectionRef, IdentityReadSurfaceKind,
+        IdentityRedactionMarkerRef, IdentityRequestDigestValue, IdentitySourceEventRef,
+        IdentitySourceOwner, IdentityStoredResultRef, IdentityTimestamp, IdentityTraceContextRef,
+        IdentityTraceRecordRef, IdentityTruthCursor, LifecycleReasonKind, LifecycleReasonRef,
+        MemoryRef, MemoryReferenceChangeIntent, MemoryReferenceChangeMaterialKind,
+        MemoryReferenceChangeMaterialMarker, MemoryReferenceId, MemoryReferenceReasonKind,
+        MemoryReferenceReasonRef, MemoryReferenceRef, MemoryReferenceSourceKind,
+        MemoryReferenceSourceRef, MemoryReferenceStateKind, MemorySafeSummaryRef,
+        ProjectParticipationRef, ProjectionFreshnessMarkerRef, ReconciliationReportRef,
+        RoleCapabilityChangeMaterialKind, RoleCapabilityChangeMaterialMarker,
+        RoleCapabilityChangeReasonKind, RoleCapabilityChangeReasonRef,
+        RoleCapabilitySafeSummaryRef, RoleCapabilitySourceKind, RoleCapabilitySourceRef,
+        RoleCapabilitySourceSnapshotId, RoleCapabilitySourceSnapshotRef,
         RoleCapabilitySourceStateKind, RoleCapabilitySummaryId, RoleCapabilitySummaryRef,
-        RoleCapabilitySummaryStateKind, RoleSourceRef, TopicKeyRef, VisibilityContextRef,
-        VisibilityResultRef, WorkSourceKind, WorkSourceRef,
+        RoleCapabilitySummaryStateKind, RoleSourceRef, TopicKeyRef, TraceHandoffSafeMaterialRef,
+        VisibilityContextRef, VisibilityResultRef, WorkSourceKind, WorkSourceRef,
     };
 
     fn roundtrip<T>(value: &T)
@@ -433,6 +436,41 @@ mod tests {
         roundtrip(&career_result);
         roundtrip(&memory_request);
         roundtrip(&memory_result);
+    }
+
+    #[test]
+    fn command_trace_handoff_dtos_roundtrip() {
+        let request = PrepareTraceHandoffRequest {
+            member_ref: sample_member_ref(),
+            requested_handoff_intent_ref: Some(TraceHandoffIntentRef::new("handoff-intent-1")),
+            trace_record_refs: vec![
+                IdentityTraceRecordRef::new("trace-1"),
+                IdentityTraceRecordRef::new("trace-2"),
+            ],
+            audit_trail_ref: Some(crate::refs::AuditTrailRef::new("audit-1")),
+            handoff_target_ref: HandoffTargetRef::new("target-1"),
+            handoff_scope_ref: HandoffScopeRef::new("scope-1"),
+            safe_material_ref: TraceHandoffSafeMaterialRef::new("material-1"),
+            visibility_context_ref: VisibilityContextRef::new("visibility-context-1"),
+            handoff_reason_ref: HandoffReasonRef::new(sample_identity_source_ref())
+                .expect("handoff reason"),
+        };
+        let result = TraceHandoffCommandResult {
+            member_ref: sample_member_ref(),
+            handoff_intent_ref: TraceHandoffIntentRef::new("handoff-intent-1"),
+            handoff_state_kind: HandoffStateKind::PendingHandoff,
+            handoff_target_ref: HandoffTargetRef::new("target-1"),
+            handoff_scope_ref: HandoffScopeRef::new("scope-1"),
+            trace_record_refs: vec![
+                IdentityTraceRecordRef::new("trace-1"),
+                IdentityTraceRecordRef::new("trace-2"),
+            ],
+            audit_trail_ref: Some(crate::refs::AuditTrailRef::new("audit-1")),
+            safe_material_ref: TraceHandoffSafeMaterialRef::new("material-1"),
+        };
+
+        roundtrip(&request);
+        roundtrip(&result);
     }
 
     #[test]

@@ -435,6 +435,41 @@ pub enum GlobalLifecycleStateKind {
     Tombstoned,
 }
 
+/// Body-free reason reference for preparing a trace handoff.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct HandoffReasonRef {
+    /// Opaque reason source reference.
+    pub source_ref: IdentitySourceRef,
+}
+
+impl HandoffReasonRef {
+    /// Creates a new handoff reason ref.
+    pub fn new(source_ref: IdentitySourceRef) -> Result<Self, ContractError> {
+        Ok(Self { source_ref })
+    }
+
+    /// Returns whether both reasons are the same.
+    pub fn same_reason(&self, other: &HandoffReasonRef) -> bool {
+        self.source_ref.same_source(&other.source_ref)
+    }
+}
+
+/// Public handoff lifecycle state kind for a trace handoff intent.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffStateKind {
+    /// Handoff exists and is waiting for delivery.
+    PendingHandoff,
+    /// Formal delivery receipt was accepted.
+    Delivered,
+    /// Delivery failed but may be retried.
+    RetryableFailed,
+    /// Delivery failed terminally.
+    Failed,
+    /// Delivery was cancelled before completion.
+    Cancelled,
+}
+
 /// Public role capability summary state kind.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

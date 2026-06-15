@@ -7,11 +7,13 @@ use crate::metadata::{
     IdentityCommandMetadata, IdentityProtocolRejection, IdentityRequestDigestMarker,
 };
 use crate::protocol::IdentityCommandName;
+use crate::receipts::TraceHandoffIntentRef;
 use crate::refs::{
-    ArchiveHandoffRef, ArchiveRef, CapabilityEvidenceRef, CapabilitySourceRef,
+    ArchiveHandoffRef, ArchiveRef, AuditTrailRef, CapabilityEvidenceRef, CapabilitySourceRef,
     CareerAppendMaterialMarker, CareerAppendReasonRef, CareerRecordChangeIntent, CareerRecordRef,
     CareerRecordStateKind, CareerSafeSummaryRef, GlobalLifecycleStateKind, GlobalMemberRef,
-    GovernanceBasisRef, IdentityAnchorReasonRef, IdentityAnchorStateKind, IdentityAuditSubjectRef,
+    GovernanceBasisRef, HandoffReasonRef, HandoffScopeRef, HandoffStateKind, HandoffTargetRef,
+    IdentityAnchorReasonRef, IdentityAnchorStateKind, IdentityAuditSubjectRef,
     IdentityOutboxRecordRef, IdentityProjectionRef, IdentitySourceRef, IdentityStoredResultRef,
     IdentityTraceRecordRef, IdentityTruthCursor, LifecycleReasonRef, LifecycleRiskRef, MemoryRef,
     MemoryReferenceChangeIntent, MemoryReferenceChangeMaterialMarker, MemoryReferenceReasonRef,
@@ -19,7 +21,7 @@ use crate::refs::{
     ProjectParticipationRef, RoleCapabilityChangeMaterialMarker, RoleCapabilityChangeReasonRef,
     RoleCapabilitySafeSummaryRef, RoleCapabilitySourceRef, RoleCapabilitySourceSnapshotRef,
     RoleCapabilitySourceStateKind, RoleCapabilitySummaryRef, RoleCapabilitySummaryStateKind,
-    RoleSourceRef, WorkSourceRef,
+    RoleSourceRef, TraceHandoffSafeMaterialRef, VisibilityContextRef, WorkSourceRef,
 };
 
 /// Public command request envelope.
@@ -270,4 +272,48 @@ pub struct MemoryReferenceCommandResult {
     pub safe_summary_ref: Option<MemorySafeSummaryRef>,
     /// Body-free reason marker.
     pub reason_ref: MemoryReferenceReasonRef,
+}
+
+/// Request body for preparing a pending trace handoff intent.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PrepareTraceHandoffRequest {
+    /// Member whose trace/audit material is being prepared for handoff.
+    pub member_ref: GlobalMemberRef,
+    /// Optional caller-known handoff intent ref. When absent, application generates one.
+    pub requested_handoff_intent_ref: Option<TraceHandoffIntentRef>,
+    /// Trace records selected for handoff. Must be non-empty.
+    pub trace_record_refs: Vec<IdentityTraceRecordRef>,
+    /// Optional audit trail selected for handoff.
+    pub audit_trail_ref: Option<AuditTrailRef>,
+    /// Body-free handoff target marker.
+    pub handoff_target_ref: HandoffTargetRef,
+    /// Body-free handoff scope marker.
+    pub handoff_scope_ref: HandoffScopeRef,
+    /// Safe handoff material marker; never trace body or archive package.
+    pub safe_material_ref: TraceHandoffSafeMaterialRef,
+    /// Handoff visibility context marker.
+    pub visibility_context_ref: VisibilityContextRef,
+    /// Body-free reason marker for preparing this handoff.
+    pub handoff_reason_ref: HandoffReasonRef,
+}
+
+/// Accepted command result for `PrepareTraceHandoff`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TraceHandoffCommandResult {
+    /// Member whose trace/audit material was prepared.
+    pub member_ref: GlobalMemberRef,
+    /// Created or reused handoff intent ref.
+    pub handoff_intent_ref: TraceHandoffIntentRef,
+    /// Handoff state after preparation.
+    pub handoff_state_kind: HandoffStateKind,
+    /// Target marker retained by the intent.
+    pub handoff_target_ref: HandoffTargetRef,
+    /// Scope marker retained by the intent.
+    pub handoff_scope_ref: HandoffScopeRef,
+    /// Trace refs retained by the intent.
+    pub trace_record_refs: Vec<IdentityTraceRecordRef>,
+    /// Optional audit trail retained by the intent.
+    pub audit_trail_ref: Option<AuditTrailRef>,
+    /// Safe material marker retained by the intent.
+    pub safe_material_ref: TraceHandoffSafeMaterialRef,
 }

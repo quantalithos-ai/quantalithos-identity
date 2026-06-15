@@ -5815,7 +5815,8 @@ mod tests {
     use identity_contracts::commands::{
         AppendCareerRecordRequest, EstablishGlobalMemberRequest, IdentityCommandOutcome,
         IdentityCommandRequest, MaintainMemoryReferenceRequest,
-        MaintainRoleCapabilitySummaryRequest, UpdateGlobalLifecycleStateRequest,
+        MaintainRoleCapabilitySummaryRequest, PrepareTraceHandoffRequest,
+        UpdateGlobalLifecycleStateRequest,
     };
     use identity_contracts::events::{IdentityConsumerOutcome, IdentityConsumerReceipt};
     use identity_contracts::metadata::{IdentityCommandMetadata, IdentityRequestDigestMarker};
@@ -5830,19 +5831,21 @@ mod tests {
         CareerAppendReasonKind, CareerAppendReasonRef, CareerRecordChangeIntent,
         CareerRecordStateKind as PublicCareerRecordStateKind, ExternalReferenceSafeSummaryRef,
         ExternalSourceVersionRef, GlobalLifecycleStateKind as PublicLifecycleStateKind,
-        HandoffAttemptRef, IdentityApiRequestMarkerRef, IdentityCanonicalRequestMarkerRef,
-        IdentityChangeKind, IdentityConsumerReceiptRef, IdentityJobReportRef, IdentityJobRunRef,
-        IdentityJobScopeMarkerRef, IdentityOperationChannel, IdentityOutboxPayloadMarkerRef,
-        IdentityRequestDigestValue, IdentityStoredResultRef, IdentityTimestamp,
-        LifecycleReasonKind, LifecycleReasonRef, MemoryRef, MemoryReferenceChangeIntent,
-        MemoryReferenceChangeMaterialKind, MemoryReferenceChangeMaterialMarker,
-        MemoryReferenceReasonKind, MemoryReferenceReasonRef, MemoryReferenceSourceKind,
-        MemoryReferenceSourceRef, MemoryReferenceStateKind as PublicMemoryReferenceStateKind,
-        ProjectParticipationRef, RoleCapabilityChangeMaterialKind,
-        RoleCapabilityChangeMaterialMarker, RoleCapabilityChangeReasonKind,
-        RoleCapabilityChangeReasonRef, RoleCapabilitySourceKind,
+        HandoffAttemptRef, HandoffReasonRef, HandoffScopeRef,
+        HandoffStateKind as PublicHandoffStateKind, HandoffTargetRef, IdentityApiRequestMarkerRef,
+        IdentityCanonicalRequestMarkerRef, IdentityChangeKind, IdentityConsumerReceiptRef,
+        IdentityJobReportRef, IdentityJobRunRef, IdentityJobScopeMarkerRef,
+        IdentityOperationChannel, IdentityOutboxPayloadMarkerRef, IdentityRequestDigestValue,
+        IdentityStoredResultRef, IdentityTimestamp, LifecycleReasonKind, LifecycleReasonRef,
+        MemoryRef, MemoryReferenceChangeIntent, MemoryReferenceChangeMaterialKind,
+        MemoryReferenceChangeMaterialMarker, MemoryReferenceReasonKind, MemoryReferenceReasonRef,
+        MemoryReferenceSourceKind, MemoryReferenceSourceRef,
+        MemoryReferenceStateKind as PublicMemoryReferenceStateKind, ProjectParticipationRef,
+        RoleCapabilityChangeMaterialKind, RoleCapabilityChangeMaterialMarker,
+        RoleCapabilityChangeReasonKind, RoleCapabilityChangeReasonRef, RoleCapabilitySourceKind,
         RoleCapabilitySummaryStateKind as PublicRoleCapabilitySummaryStateKind, RoleSourceRef,
-        TopicKeyRef, WorkSourceKind, WorkSourceRef,
+        TopicKeyRef, TraceHandoffSafeMaterialRef, VisibilityContextRef, WorkSourceKind,
+        WorkSourceRef,
     };
     use identity_contracts::views::{
         IdentityReadMaterialKind, IdentityReadMaterialMarker, MemberSummarySliceKind,
@@ -6035,6 +6038,8 @@ mod tests {
             audit_trail_repository: runtime,
             outbox_repository: runtime,
             projection_repository: runtime,
+            handoff_intent_repository: runtime,
+            handoff_target_port: runtime,
             external_source_resolver: runtime,
         })
     }
@@ -6255,6 +6260,123 @@ mod tests {
             )),
             timestamp(2),
         )
+    }
+
+    fn trace_record(token: &str, member_ref: GlobalMemberRef) -> IdentityTraceRecord {
+        IdentityTraceRecord::from_accepted_change(
+            IdentityTraceRecordRef::new(format!("trace-{token}")),
+            member_ref,
+            identity_contracts::refs::IdentityTraceSubjectRef::new(format!(
+                "trace-subject-{token}"
+            )),
+            identity_contracts::refs::IdentityAuditSubjectRef::new(format!(
+                "audit-subject-{token}"
+            )),
+            IdentityChangeKindRef::new(
+                IdentityChangeKind::DerivedMarkerChanged,
+                Some(identity_source_ref(
+                    IdentitySourceOwner::Identity,
+                    "trace-change-source-1",
+                )),
+            ),
+            IdentityTruthCursor::new(format!("cursor-{token}")),
+            Some(identity_contracts::refs::IdentityChangeReasonRef::new(
+                identity_source_ref(IdentitySourceOwner::Identity, "trace-reason-1"),
+            )),
+            Some(identity_source_ref(
+                IdentitySourceOwner::Identity,
+                "trace-source-1",
+            )),
+            None,
+            Some(ActorRef::new("actor-1", ActorKind::Human)),
+            IdentityReadMaterialMarker::new(IdentityReadMaterialKind::TraceRefsOnly, None),
+            timestamp(1),
+        )
+        .expect("trace record")
+    }
+
+    fn audit_trail(token: &str, member_ref: Option<GlobalMemberRef>) -> AuditTrail {
+        AuditTrail::from_accepted_write(
+            AuditTrailRef::new(format!("audit-{token}")),
+            identity_contracts::refs::IdentityAuditSubjectRef::new(format!(
+                "audit-subject-{token}"
+            )),
+            member_ref,
+            identity_contracts::refs::AuditScopeRef::new(format!("audit-scope-{token}")),
+            AuditTrailEntry {
+                trace_record_ref: IdentityTraceRecordRef::new(format!("trace-{token}")),
+                change_kind_ref: IdentityChangeKindRef::new(
+                    IdentityChangeKind::DerivedMarkerChanged,
+                    Some(identity_source_ref(
+                        IdentitySourceOwner::Identity,
+                        "audit-change-source-1",
+                    )),
+                ),
+                visibility_result_ref: VisibilityResultRef::new(format!(
+                    "audit-visibility-{token}"
+                )),
+                occurred_at: timestamp(1),
+            },
+            VisibilityResultRef::new(format!("audit-trail-visibility-{token}")),
+            timestamp(1),
+        )
+        .expect("audit trail")
+    }
+
+    fn handoff_reason(token: &str) -> HandoffReasonRef {
+        HandoffReasonRef::new(identity_source_ref(IdentitySourceOwner::Identity, token))
+            .expect("handoff reason")
+    }
+
+    fn prepare_handoff_request(
+        token: &str,
+        member_ref: GlobalMemberRef,
+        trace_refs: Vec<IdentityTraceRecordRef>,
+        audit_trail_ref: Option<AuditTrailRef>,
+        requested_handoff_intent_ref: Option<TraceHandoffIntentRef>,
+    ) -> IdentityCommandRequest<PrepareTraceHandoffRequest> {
+        prepare_handoff_request_with_digest(
+            token,
+            token,
+            member_ref,
+            trace_refs,
+            audit_trail_ref,
+            requested_handoff_intent_ref,
+        )
+    }
+
+    fn prepare_handoff_request_with_digest(
+        token: &str,
+        digest_token: &str,
+        member_ref: GlobalMemberRef,
+        trace_refs: Vec<IdentityTraceRecordRef>,
+        audit_trail_ref: Option<AuditTrailRef>,
+        requested_handoff_intent_ref: Option<TraceHandoffIntentRef>,
+    ) -> IdentityCommandRequest<PrepareTraceHandoffRequest> {
+        IdentityCommandRequest {
+            actor_ref: ActorRef::new("actor-1", ActorKind::Human),
+            command_name: IdentityCommandName::new("PrepareTraceHandoff"),
+            metadata: IdentityCommandMetadata {
+                idempotency_key: format!("idem-handoff-{token}").into(),
+                request_marker_ref: IdentityApiRequestMarkerRef::new(format!(
+                    "request-handoff-{token}"
+                )),
+                schema_version_ref: IdentityProtocolSchemaVersionRef::new("identity.command.v1"),
+                trace_context_ref: None,
+            },
+            digest: request_digest_marker(&format!("handoff-{digest_token}")),
+            body: PrepareTraceHandoffRequest {
+                member_ref,
+                requested_handoff_intent_ref,
+                trace_record_refs: trace_refs,
+                audit_trail_ref,
+                handoff_target_ref: HandoffTargetRef::new("target-1"),
+                handoff_scope_ref: HandoffScopeRef::new("scope-1"),
+                safe_material_ref: TraceHandoffSafeMaterialRef::new("material-1"),
+                visibility_context_ref: VisibilityContextRef::new("visibility-context-1"),
+                handoff_reason_ref: handoff_reason("handoff-reason-1"),
+            },
+        }
     }
 
     fn maintain_role_request(
@@ -7640,5 +7762,403 @@ mod tests {
             other => panic!("unexpected memory replay outcome: {other:?}"),
         };
         assert_eq!(replay_response.result_ref, archived_response.result_ref);
+    }
+
+    #[test]
+    fn prepare_trace_handoff_accepts_pending_intent_without_delivery() {
+        let member = GlobalMember::establish(
+            member_ref("member-handoff-1"),
+            identity_source_ref(IdentitySourceOwner::Identity, "member-source-handoff-1"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let trace = trace_record("handoff-1", member_ref("member-handoff-1"));
+        let audit = audit_trail("handoff-1", Some(member_ref("member-handoff-1")));
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member, IdentityVersion::new(1))
+            .seed_trace_record(trace, IdentityVersion::new(1))
+            .seed_audit_trail(audit, IdentityVersion::new(1))
+            .seed_adapter_availability(adapter_availability())
+            .build();
+        let service = command_service(&runtime);
+
+        let accepted = service
+            .prepare_trace_handoff(
+                prepare_handoff_request(
+                    "accept-1",
+                    member_ref("member-handoff-1"),
+                    vec![IdentityTraceRecordRef::new("trace-handoff-1")],
+                    Some(AuditTrailRef::new("audit-handoff-1")),
+                    None,
+                ),
+                command_context(
+                    "PrepareTraceHandoff",
+                    "idem-handoff-accept-1",
+                    "handoff-accept-1",
+                ),
+            )
+            .expect("accepted");
+        let response = match accepted {
+            IdentityCommandOutcome::Accepted(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(
+            response.result.handoff_state_kind,
+            PublicHandoffStateKind::PendingHandoff
+        );
+        assert!(response.effect.outbox_refs.is_empty());
+
+        let persisted = runtime
+            .get_handoff_intent_with_version(response.result.handoff_intent_ref.clone())
+            .expect("load intent")
+            .expect("intent");
+        assert_eq!(
+            persisted.value.handoff_state.state_kind,
+            HandoffStateKind::PendingHandoff
+        );
+        assert_eq!(persisted.value.trace_record_refs.len(), 1);
+    }
+
+    #[test]
+    fn prepare_trace_handoff_rejects_empty_trace_refs() {
+        let member = GlobalMember::establish(
+            member_ref("member-handoff-2"),
+            identity_source_ref(IdentitySourceOwner::Identity, "member-source-handoff-2"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member, IdentityVersion::new(1))
+            .seed_adapter_availability(adapter_availability())
+            .build();
+        let service = command_service(&runtime);
+
+        let outcome = service
+            .prepare_trace_handoff(
+                prepare_handoff_request(
+                    "reject-1",
+                    member_ref("member-handoff-2"),
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                command_context(
+                    "PrepareTraceHandoff",
+                    "idem-handoff-reject-1",
+                    "handoff-reject-1",
+                ),
+            )
+            .expect("rejected");
+
+        match outcome {
+            IdentityCommandOutcome::Rejected(rejection) => {
+                assert_eq!(
+                    rejection.rejection_kind,
+                    identity_contracts::metadata::IdentityProtocolRejectionKind::PolicyDenied
+                );
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prepare_trace_handoff_duplicate_replays_stored_envelope() {
+        let member = GlobalMember::establish(
+            member_ref("member-handoff-3"),
+            identity_source_ref(IdentitySourceOwner::Identity, "member-source-handoff-3"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let trace = trace_record("handoff-3", member_ref("member-handoff-3"));
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member, IdentityVersion::new(1))
+            .seed_trace_record(trace, IdentityVersion::new(1))
+            .seed_adapter_availability(adapter_availability())
+            .build();
+        let service = command_service(&runtime);
+
+        let first = service
+            .prepare_trace_handoff(
+                prepare_handoff_request(
+                    "dup-1",
+                    member_ref("member-handoff-3"),
+                    vec![IdentityTraceRecordRef::new("trace-handoff-3")],
+                    None,
+                    None,
+                ),
+                command_context("PrepareTraceHandoff", "idem-handoff-dup-1", "handoff-dup-1"),
+            )
+            .expect("accepted");
+        let first_response = match first {
+            IdentityCommandOutcome::Accepted(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+
+        let replay = service
+            .prepare_trace_handoff(
+                prepare_handoff_request(
+                    "dup-1",
+                    member_ref("member-handoff-3"),
+                    vec![IdentityTraceRecordRef::new("trace-handoff-3")],
+                    None,
+                    None,
+                ),
+                command_context("PrepareTraceHandoff", "idem-handoff-dup-1", "handoff-dup-1"),
+            )
+            .expect("replay");
+        let replay_response = match replay {
+            IdentityCommandOutcome::Accepted(response) => response,
+            other => panic!("unexpected replay outcome: {other:?}"),
+        };
+        assert_eq!(replay_response.result_ref, first_response.result_ref);
+        assert_eq!(replay_response.effect, first_response.effect);
+    }
+
+    #[test]
+    fn prepare_trace_handoff_different_digest_returns_duplicate_conflict() {
+        let member = GlobalMember::establish(
+            member_ref("member-handoff-5"),
+            identity_source_ref(IdentitySourceOwner::Identity, "member-source-handoff-5"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let trace = trace_record("handoff-5", member_ref("member-handoff-5"));
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member, IdentityVersion::new(1))
+            .seed_trace_record(trace, IdentityVersion::new(1))
+            .seed_adapter_availability(adapter_availability())
+            .build();
+        let service = command_service(&runtime);
+
+        let accepted = service
+            .prepare_trace_handoff(
+                prepare_handoff_request(
+                    "dup-conflict-1",
+                    member_ref("member-handoff-5"),
+                    vec![IdentityTraceRecordRef::new("trace-handoff-5")],
+                    None,
+                    None,
+                ),
+                command_context(
+                    "PrepareTraceHandoff",
+                    "idem-handoff-dup-conflict-1",
+                    "handoff-dup-conflict-1",
+                ),
+            )
+            .expect("accepted");
+        let accepted_response = match accepted {
+            IdentityCommandOutcome::Accepted(response) => response,
+            other => panic!("unexpected accepted outcome: {other:?}"),
+        };
+
+        let conflict = service
+            .prepare_trace_handoff(
+                prepare_handoff_request_with_digest(
+                    "dup-conflict-1",
+                    "dup-conflict-2",
+                    member_ref("member-handoff-5"),
+                    vec![IdentityTraceRecordRef::new("trace-handoff-5")],
+                    None,
+                    None,
+                ),
+                command_context(
+                    "PrepareTraceHandoff",
+                    "idem-handoff-dup-conflict-1",
+                    "handoff-dup-conflict-2",
+                ),
+            )
+            .expect("conflict outcome");
+
+        match conflict {
+            IdentityCommandOutcome::Rejected(rejection) => {
+                assert_eq!(
+                    rejection.rejection_kind,
+                    identity_contracts::metadata::IdentityProtocolRejectionKind::DuplicateConflict
+                );
+            }
+            other => panic!("unexpected conflict outcome: {other:?}"),
+        }
+
+        let idempotency = runtime
+            .get_by_key(
+                IdentityOperationName::new("PrepareTraceHandoff"),
+                IdentityOperationChannel::Command,
+                IdentityIdempotencyKey::new("idem-handoff-dup-conflict-1"),
+            )
+            .expect("load idempotency")
+            .expect("idempotency record");
+        assert_eq!(
+            idempotency.value.state,
+            identity_application::support::IdentityIdempotencyStateKind::Conflict
+        );
+        assert_eq!(
+            idempotency.value.stored_result_ref,
+            Some(accepted_response.result_ref.clone())
+        );
+
+        let replay = runtime
+            .get_command_accepted_result(accepted_response.result_ref.clone())
+            .expect("load accepted envelope")
+            .expect("accepted envelope");
+        assert!(matches!(
+            replay.result,
+            identity_application::support::IdentityCommandTypedResult::TraceHandoff(ref result)
+                if result == &accepted_response.result
+        ));
+    }
+
+    #[test]
+    fn prepare_trace_handoff_rolls_back_when_idempotency_complete_fails() {
+        let member = GlobalMember::establish(
+            member_ref("member-handoff-6"),
+            identity_source_ref(IdentitySourceOwner::Identity, "member-source-handoff-6"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let trace = trace_record("handoff-6", member_ref("member-handoff-6"));
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member, IdentityVersion::new(1))
+            .seed_trace_record(trace, IdentityVersion::new(1))
+            .seed_adapter_availability(adapter_availability())
+            .inject_fault(FaultCase::CompleteIdempotencyFails)
+            .build();
+        let service = command_service(&runtime);
+        let request = prepare_handoff_request(
+            "rollback-1",
+            member_ref("member-handoff-6"),
+            vec![IdentityTraceRecordRef::new("trace-handoff-6")],
+            None,
+            None,
+        );
+        let context = command_context(
+            "PrepareTraceHandoff",
+            "idem-handoff-rollback-1",
+            "handoff-rollback-1",
+        );
+
+        let error = service
+            .prepare_trace_handoff(request, context.clone())
+            .expect_err("idempotency complete failure must abort handoff write");
+        assert_eq!(error.kind, ApplicationErrorKind::DependencyUnavailable);
+
+        assert!(
+            runtime
+                .get_by_key(
+                    IdentityOperationName::new("PrepareTraceHandoff"),
+                    IdentityOperationChannel::Command,
+                    IdentityIdempotencyKey::new("idem-handoff-rollback-1"),
+                )
+                .expect("load idempotency")
+                .is_none()
+        );
+
+        assert!(
+            runtime
+                .find_by_operation_context(context.context_ref.clone())
+                .expect("lookup stored result")
+                .is_none()
+        );
+        assert!(
+            runtime
+                .list_effects_by_operation_context(
+                    context.context_ref,
+                    IdentityRepositoryPage::new(None, 32),
+                )
+                .expect("list effects")
+                .items
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .list_handoff_intents_by_member(
+                    member_ref("member-handoff-6"),
+                    IdentityRepositoryPage::new(None, 32),
+                )
+                .expect("list intents")
+                .items
+                .is_empty()
+        );
+        assert_eq!(
+            runtime
+                .list_trace_records_by_member(
+                    member_ref("member-handoff-6"),
+                    IdentityRepositoryPage::new(None, 32),
+                )
+                .expect("list traces")
+                .items
+                .len(),
+            1
+        );
+        assert!(
+            runtime
+                .find_audit_trail_by_subject(IdentityAuditSubjectRef::new(
+                    "trace-handoff-intent:handoff-1",
+                ))
+                .expect("find audit trail")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn prepare_trace_handoff_conflicts_on_reused_requested_intent_ref() {
+        let member = GlobalMember::establish(
+            member_ref("member-handoff-4"),
+            identity_source_ref(IdentitySourceOwner::Identity, "member-source-handoff-4"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let trace = trace_record("handoff-4", member_ref("member-handoff-4"));
+        let existing_intent = TraceHandoffIntent {
+            handoff_intent_ref: TraceHandoffIntentRef::new("handoff-1"),
+            member_ref: member_ref("member-handoff-4"),
+            trace_record_refs: vec![IdentityTraceRecordRef::new("trace-handoff-4")],
+            audit_trail_ref: None,
+            handoff_target_ref: HandoffTargetRef::new("target-1"),
+            handoff_scope_ref: HandoffScopeRef::new("scope-1"),
+            safe_material_ref: TraceHandoffSafeMaterialRef::new("material-1"),
+            handoff_state: HandoffState::pending(timestamp(1)),
+            created_at: timestamp(1),
+            updated_at: timestamp(1),
+        };
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member, IdentityVersion::new(1))
+            .seed_trace_record(trace, IdentityVersion::new(1))
+            .seed_handoff_intent(existing_intent, IdentityVersion::new(1))
+            .seed_adapter_availability(adapter_availability())
+            .build();
+        let service = command_service(&runtime);
+
+        let outcome = service
+            .prepare_trace_handoff(
+                prepare_handoff_request(
+                    "conflict-1",
+                    member_ref("member-handoff-4"),
+                    vec![IdentityTraceRecordRef::new("trace-handoff-4")],
+                    None,
+                    Some(TraceHandoffIntentRef::new("handoff-1")),
+                ),
+                command_context(
+                    "PrepareTraceHandoff",
+                    "idem-handoff-conflict-1",
+                    "handoff-conflict-1",
+                ),
+            )
+            .expect("conflict outcome");
+
+        match outcome {
+            IdentityCommandOutcome::Rejected(rejection) => {
+                assert_eq!(
+                    rejection.rejection_kind,
+                    identity_contracts::metadata::IdentityProtocolRejectionKind::Conflict
+                );
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
     }
 }

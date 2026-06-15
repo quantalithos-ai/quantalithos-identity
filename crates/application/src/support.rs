@@ -5,6 +5,7 @@ use core_contracts::metadata::IdempotencyKey;
 use identity_contracts::commands::{
     CareerRecordCommandResult, GlobalLifecycleCommandResult, GlobalMemberCommandResult,
     IdentityCommandEffectPublicSummary, MemoryReferenceCommandResult, RoleCapabilityCommandResult,
+    TraceHandoffCommandResult,
 };
 use identity_contracts::events::IdentityConsumerReceipt;
 use identity_contracts::jobs::IdentityJobResultKind;
@@ -813,6 +814,8 @@ pub enum IdentityCommandTypedResult {
     CareerRecord(CareerRecordCommandResult),
     /// `MaintainMemoryReference` accepted result.
     MemoryReference(MemoryReferenceCommandResult),
+    /// `PrepareTraceHandoff` accepted result.
+    TraceHandoff(TraceHandoffCommandResult),
 }
 
 /// Typed stored accepted command envelope used as duplicate replay source.

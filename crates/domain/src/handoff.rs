@@ -4,7 +4,7 @@ use identity_contracts::receipts::TraceHandoffIntentRef;
 use identity_contracts::refs::{
     AuditTrailRef, GlobalMemberRef, HandoffAttemptRef, HandoffIssueRef, HandoffReceiptRef,
     HandoffScopeRef, HandoffTargetRef, IdentityTimestamp, IdentityTraceRecordRef,
-    TraceHandoffSafeMaterialRef,
+    TraceHandoffSafeMaterialRef, VisibilityContextRef,
 };
 
 use crate::errors::IdentityDomainError;
@@ -22,6 +22,44 @@ pub enum HandoffStateKind {
     Failed,
     /// Delivery was cancelled before completion.
     Cancelled,
+}
+
+/// Constructor arguments for a pending handoff intent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceHandoffIntentPrepareArgs {
+    /// Handoff identity.
+    pub handoff_intent_ref: TraceHandoffIntentRef,
+    /// Member that owns the handoff subject.
+    pub member_ref: GlobalMemberRef,
+    /// Trace refs included in the handoff.
+    pub trace_record_refs: Vec<IdentityTraceRecordRef>,
+    /// Optional audit trail ref included in the handoff.
+    pub audit_trail_ref: Option<AuditTrailRef>,
+    /// Handoff target marker.
+    pub handoff_target_ref: HandoffTargetRef,
+    /// Handoff scope marker.
+    pub handoff_scope_ref: HandoffScopeRef,
+    /// Safe handoff material marker.
+    pub safe_material_ref: TraceHandoffSafeMaterialRef,
+    /// Pending handoff state.
+    pub handoff_state: HandoffState,
+    /// Create timestamp.
+    pub created_at: IdentityTimestamp,
+}
+
+/// Guard arguments for preparing a trace handoff.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HandoffPolicyArgs {
+    /// Handoff target marker.
+    pub handoff_target_ref: HandoffTargetRef,
+    /// Handoff scope marker.
+    pub handoff_scope_ref: HandoffScopeRef,
+    /// Safe handoff material marker.
+    pub safe_material_ref: TraceHandoffSafeMaterialRef,
+    /// Trace refs included in the handoff.
+    pub trace_record_refs: Vec<IdentityTraceRecordRef>,
+    /// Visibility context marker.
+    pub visibility_context_ref: VisibilityContextRef,
 }
 
 /// Handoff delivery state marker.
@@ -147,6 +185,58 @@ pub struct TraceHandoffIntent {
 }
 
 impl TraceHandoffIntent {
+    /// Creates a pending handoff intent.
+    pub fn prepare(args: TraceHandoffIntentPrepareArgs) -> Result<Self, IdentityDomainError> {
+        if args.trace_record_refs.is_empty() {
+            return Err(IdentityDomainError::missing_required_field(
+                "trace_record_refs",
+            ));
+        }
+        if args.handoff_state.state_kind != HandoffStateKind::PendingHandoff {
+            return Err(IdentityDomainError::invalid_input(
+                "handoff_state",
+                "prepare requires a pending handoff state",
+            ));
+        }
+        if args.handoff_state.attempt_ref.is_some()
+            || args.handoff_state.receipt_ref.is_some()
+            || args.handoff_state.issue_ref.is_some()
+        {
+            return Err(IdentityDomainError::invalid_input(
+                "handoff_state",
+                "pending handoff state must not carry attempt, receipt, or issue markers",
+            ));
+        }
+        if args.safe_material_ref.as_str().trim().is_empty() {
+            return Err(IdentityDomainError::missing_required_field(
+                "safe_material_ref",
+            ));
+        }
+        if args.handoff_target_ref.as_str().trim().is_empty() {
+            return Err(IdentityDomainError::missing_required_field(
+                "handoff_target_ref",
+            ));
+        }
+        if args.handoff_scope_ref.as_str().trim().is_empty() {
+            return Err(IdentityDomainError::missing_required_field(
+                "handoff_scope_ref",
+            ));
+        }
+
+        Ok(Self {
+            handoff_intent_ref: args.handoff_intent_ref,
+            member_ref: args.member_ref,
+            trace_record_refs: args.trace_record_refs,
+            audit_trail_ref: args.audit_trail_ref,
+            handoff_target_ref: args.handoff_target_ref,
+            handoff_scope_ref: args.handoff_scope_ref,
+            safe_material_ref: args.safe_material_ref,
+            handoff_state: args.handoff_state,
+            created_at: args.created_at,
+            updated_at: args.created_at,
+        })
+    }
+
     /// Returns whether the intent targets the provided handoff target.
     pub fn targets(&self, target_ref: &HandoffTargetRef) -> bool {
         self.handoff_target_ref == *target_ref
@@ -260,6 +350,114 @@ impl TraceHandoffIntent {
                 "terminal handoff state cannot be cancelled again",
             )),
         }
+    }
+}
+
+/// Guard for trace handoff preparation and delivery result integrity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HandoffPolicy {
+    /// Handoff target marker.
+    pub handoff_target_ref: HandoffTargetRef,
+    /// Handoff scope marker.
+    pub handoff_scope_ref: HandoffScopeRef,
+    /// Safe handoff material marker.
+    pub safe_material_ref: TraceHandoffSafeMaterialRef,
+    /// Trace refs included in the handoff.
+    pub trace_record_refs: Vec<IdentityTraceRecordRef>,
+    /// Visibility context marker.
+    pub visibility_context_ref: VisibilityContextRef,
+}
+
+impl HandoffPolicy {
+    /// Creates a handoff guard from formal request markers.
+    pub fn for_handoff(args: HandoffPolicyArgs) -> Result<Self, IdentityDomainError> {
+        Ok(Self {
+            handoff_target_ref: args.handoff_target_ref,
+            handoff_scope_ref: args.handoff_scope_ref,
+            safe_material_ref: args.safe_material_ref,
+            trace_record_refs: args.trace_record_refs,
+            visibility_context_ref: args.visibility_context_ref,
+        })
+    }
+
+    /// Asserts that target and scope markers are present.
+    pub fn assert_target_allowed(&self) -> Result<(), IdentityDomainError> {
+        if self.handoff_target_ref.as_str().trim().is_empty() {
+            return Err(IdentityDomainError::missing_required_field(
+                "handoff_target_ref",
+            ));
+        }
+        if self.handoff_scope_ref.as_str().trim().is_empty() {
+            return Err(IdentityDomainError::missing_required_field(
+                "handoff_scope_ref",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Asserts that at least one trace ref is present.
+    pub fn assert_trace_refs_present(&self) -> Result<(), IdentityDomainError> {
+        if self.trace_record_refs.is_empty() {
+            return Err(IdentityDomainError::policy_denied(
+                "HandoffPolicy",
+                "handoff requires at least one trace ref",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Asserts that the material marker remains body-free.
+    pub fn assert_safe_material_body_free(&self) -> Result<(), IdentityDomainError> {
+        let marker = self.safe_material_ref.as_str().to_ascii_lowercase();
+        if marker.trim().is_empty() {
+            return Err(IdentityDomainError::missing_required_field(
+                "safe_material_ref",
+            ));
+        }
+        if marker.contains("body")
+            || marker.contains("package")
+            || marker.contains("raw")
+            || marker.contains("receipt")
+        {
+            return Err(IdentityDomainError::policy_denied(
+                "HandoffPolicy",
+                "handoff material marker must remain body-free",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Asserts that the handoff keeps a formal visibility context marker.
+    pub fn assert_visible_for_handoff(&self) -> Result<(), IdentityDomainError> {
+        if self.visibility_context_ref.as_str().trim().is_empty() {
+            return Err(IdentityDomainError::missing_required_field(
+                "visibility_context_ref",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Asserts that a delivered state carries only a formal receipt marker.
+    pub fn assert_receipt_is_marker(
+        receipt_ref: &HandoffReceiptRef,
+    ) -> Result<(), IdentityDomainError> {
+        if receipt_ref.as_str().trim().is_empty() {
+            return Err(IdentityDomainError::missing_required_field("receipt_ref"));
+        }
+        Ok(())
+    }
+
+    /// Asserts that delivered state always carries a formal receipt marker.
+    pub fn assert_delivered_requires_receipt(
+        state: &HandoffState,
+    ) -> Result<(), IdentityDomainError> {
+        if state.state_kind == HandoffStateKind::Delivered && state.receipt_ref.is_none() {
+            return Err(IdentityDomainError::policy_denied(
+                "HandoffPolicy",
+                "delivered handoff requires a formal receipt marker",
+            ));
+        }
+        Ok(())
     }
 }
 

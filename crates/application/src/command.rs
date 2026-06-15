@@ -6,7 +6,8 @@ use identity_contracts::commands::{
     GlobalLifecycleCommandResult, GlobalMemberCommandResult, IdentityCommandEffectPublicSummary,
     IdentityCommandOutcome, IdentityCommandRequest, IdentityCommandResponse,
     MaintainMemoryReferenceRequest, MaintainRoleCapabilitySummaryRequest,
-    MemoryReferenceCommandResult, RoleCapabilityCommandResult, UpdateGlobalLifecycleStateRequest,
+    MemoryReferenceCommandResult, PrepareTraceHandoffRequest, RoleCapabilityCommandResult,
+    TraceHandoffCommandResult, UpdateGlobalLifecycleStateRequest,
 };
 use identity_contracts::metadata::{
     IdentityDegradedKind, IdentityDegradedMarker, IdentityProtocolRejection,
@@ -16,18 +17,22 @@ use identity_contracts::metadata::{
 use identity_contracts::protocol::{IdentityCommandName, IdentityProtocolSurfaceRef};
 use identity_contracts::refs::{
     AuditTrailRef, ExternalSourceRef, GlobalLifecycleStateKind as PublicLifecycleStateKind,
-    GlobalMemberRef, GovernanceBasisRef, IdentityAnchorReasonKind, IdentityAnchorReasonRef,
-    IdentityAnchorStateKind, IdentityAuditSubjectRef, IdentityChangeKind, IdentityChangeKindRef,
-    IdentityChangeReasonRef, IdentityDegradedMarkerRef, IdentityOperationChannel,
-    IdentityOutboxPayloadMarkerRef, IdentityProjectionRef, IdentitySourceOwner, IdentitySourceRef,
-    IdentityStoredResultRef, IdentityTimestamp, IdentityTraceRecordRef, IdentityTruthCursor,
-    MaintenanceScopeRef, MemoryReferenceSourceState,
-    MemoryReferenceStateKind as PublicMemoryReferenceStateKind, RoleCapabilitySourceStateKind,
-    RoleCapabilitySummaryStateKind, TopicKeyRef,
+    GlobalMemberRef, GovernanceBasisRef, HandoffStateKind as PublicHandoffStateKind,
+    IdentityAnchorReasonKind, IdentityAnchorReasonRef, IdentityAnchorStateKind,
+    IdentityAuditSubjectRef, IdentityChangeKind, IdentityChangeKindRef, IdentityChangeReasonRef,
+    IdentityDegradedMarkerRef, IdentityOperationChannel, IdentityOutboxPayloadMarkerRef,
+    IdentityProjectionRef, IdentitySourceOwner, IdentitySourceRef, IdentityStoredResultRef,
+    IdentityTimestamp, IdentityTraceRecordRef, IdentityTruthCursor, MaintenanceScopeRef,
+    MemoryReferenceSourceState, MemoryReferenceStateKind as PublicMemoryReferenceStateKind,
+    RoleCapabilitySourceStateKind, RoleCapabilitySummaryStateKind, TopicKeyRef,
 };
 use identity_contracts::views::{IdentityReadMaterialKind, IdentityReadMaterialMarker};
 use identity_domain::audit::{AuditTrail, AuditTrailEntry};
 use identity_domain::career::{CareerAppendPolicy, CareerRecord, CareerRecordStateKind};
+use identity_domain::handoff::{
+    HandoffPolicy, HandoffPolicyArgs, HandoffState, TraceHandoffIntent,
+    TraceHandoffIntentPrepareArgs,
+};
 use identity_domain::lifecycle::{
     GlobalLifecycleState, GlobalLifecycleStateKind, HighRiskLifecycleGuard,
     LifecycleTransitionPolicy,
@@ -47,11 +52,11 @@ use crate::ports::{
     CareerRecordRepository, GlobalLifecycleRepository, GlobalMemberRepository,
     IdentityAcceptedAuditTrailMarkerMapper, IdentityAuditTrailRepository, IdentityClockPort,
     IdentityCommandEffectSummaryRepository, IdentityCursorAssignerPort,
-    IdentityExternalSourceResolverPort, IdentityIdGeneratorPort, IdentityIdempotencyRepository,
-    IdentityOperationContextFactoryPort, IdentityOutboxRepository, IdentityProjectionRepository,
-    IdentityStoredResultRepository, IdentityTraceRecordRepository,
+    IdentityExternalSourceResolverPort, IdentityHandoffTargetPort, IdentityIdGeneratorPort,
+    IdentityIdempotencyRepository, IdentityOperationContextFactoryPort, IdentityOutboxRepository,
+    IdentityProjectionRepository, IdentityStoredResultRepository, IdentityTraceRecordRepository,
     IdentityTruthChangeSubjectMapper, IdentityUnitOfWork, IdentityUnitOfWorkManagerPort,
-    MemoryReferenceRepository, RoleCapabilityRepository,
+    MemoryReferenceRepository, RoleCapabilityRepository, TraceHandoffIntentRepository,
 };
 use crate::support::{
     IdempotencyReserveOutcome, IdentityAcceptedEffectKind, IdentityAcceptedSubjectRefs,
@@ -100,6 +105,10 @@ pub struct IdentityCommandServiceDeps<'a> {
     pub outbox_repository: &'a dyn IdentityOutboxRepository,
     /// Projection lookup and stale-marker repository.
     pub projection_repository: &'a dyn IdentityProjectionRepository,
+    /// Trace handoff intent repository.
+    pub handoff_intent_repository: &'a dyn TraceHandoffIntentRepository,
+    /// Handoff target resolver port.
+    pub handoff_target_port: &'a dyn IdentityHandoffTargetPort,
     /// External source and governance-basis resolver port.
     pub external_source_resolver: &'a dyn IdentityExternalSourceResolverPort,
 }
@@ -820,6 +829,26 @@ impl<'a> IdentityCommandService<'a> {
             }
             MemoryReferenceStateKind::HandoffFailed => {
                 PublicMemoryReferenceStateKind::HandoffFailed
+            }
+        }
+    }
+
+    fn map_public_handoff_state(
+        state: identity_domain::handoff::HandoffStateKind,
+    ) -> PublicHandoffStateKind {
+        match state {
+            identity_domain::handoff::HandoffStateKind::PendingHandoff => {
+                PublicHandoffStateKind::PendingHandoff
+            }
+            identity_domain::handoff::HandoffStateKind::Delivered => {
+                PublicHandoffStateKind::Delivered
+            }
+            identity_domain::handoff::HandoffStateKind::RetryableFailed => {
+                PublicHandoffStateKind::RetryableFailed
+            }
+            identity_domain::handoff::HandoffStateKind::Failed => PublicHandoffStateKind::Failed,
+            identity_domain::handoff::HandoffStateKind::Cancelled => {
+                PublicHandoffStateKind::Cancelled
             }
         }
     }
@@ -3368,6 +3397,440 @@ impl<'a> IdentityCommandService<'a> {
                             command_name.clone(),
                             surface_marker_ref,
                             IdentityCommandTypedResult::MemoryReference(result.clone()),
+                            effect.clone(),
+                            now,
+                        ),
+                        uow.as_ref(),
+                    )?;
+                self.deps
+                    .idempotency_repository
+                    .complete_with_stored_result(
+                        record.value,
+                        stored_result_ref.clone(),
+                        now,
+                        record.version,
+                        uow.as_ref(),
+                    )?;
+                self.deps.unit_of_work_manager.commit(uow)?;
+                Ok(IdentityCommandOutcome::Accepted(Self::accepted_response(
+                    command_name,
+                    stored_result_ref,
+                    result,
+                    effect,
+                )))
+            }
+        }
+    }
+
+    /// Shared skeleton for the trace handoff command vertical slice.
+    pub fn prepare_trace_handoff(
+        &self,
+        request: IdentityCommandRequest<PrepareTraceHandoffRequest>,
+        context: IdentityOperationContext,
+    ) -> Result<IdentityCommandOutcome<TraceHandoffCommandResult>, ApplicationError> {
+        Self::assert_command_context(&request, &context)?;
+        let command_name = request.command_name.clone();
+        let now = self.deps.clock.now()?;
+        let uow = self.deps.unit_of_work_manager.begin()?;
+        let reserve = match self.reserve_idempotency(&context, now, uow.as_ref()) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.rollback_quietly(uow);
+                return self
+                    .map_runtime_unavailable(&command_name, error)
+                    .map(IdentityCommandOutcome::Rejected);
+            }
+        };
+
+        match reserve {
+            IdempotencyReserveOutcome::ReplayAvailable {
+                stored_result_ref, ..
+            } => {
+                self.rollback_quietly(uow);
+                self.load_replayed_command_outcome(command_name, stored_result_ref, |typed| {
+                    match typed {
+                        IdentityCommandTypedResult::TraceHandoff(result) => Some(result),
+                        _ => None,
+                    }
+                })
+            }
+            IdempotencyReserveOutcome::Conflict(record) => {
+                let rejection = Self::protocol_rejection(
+                    &command_name,
+                    IdentityProtocolRejectionKind::DuplicateConflict,
+                    "same idempotency key is already bound to different canonical material",
+                );
+                self.deps.idempotency_repository.mark_conflict(
+                    record.value,
+                    now,
+                    record.version,
+                    uow.as_ref(),
+                )?;
+                self.deps.unit_of_work_manager.commit(uow)?;
+                Ok(IdentityCommandOutcome::Rejected(rejection))
+            }
+            IdempotencyReserveOutcome::InFlight(_) => {
+                self.rollback_quietly(uow);
+                Ok(IdentityCommandOutcome::Rejected(
+                    Self::adapter_unavailable_rejection(
+                        &command_name,
+                        "same command idempotency key and digest is still in flight",
+                    ),
+                ))
+            }
+            IdempotencyReserveOutcome::Reserved(record) => {
+                let member_exists = self
+                    .deps
+                    .member_repository
+                    .get_member_with_version(request.body.member_ref.clone())?
+                    .is_some();
+                if !member_exists {
+                    let rejection =
+                        self.command_not_found_rejection(&command_name, "member does not exist");
+                    let outcome = self.save_replayable_rejected_outcome(
+                        &command_name,
+                        &request,
+                        &context,
+                        rejection,
+                        record,
+                        now,
+                        uow.as_ref(),
+                    )?;
+                    self.deps.unit_of_work_manager.commit(uow)?;
+                    return Ok(outcome);
+                }
+
+                let policy = HandoffPolicy::for_handoff(HandoffPolicyArgs {
+                    handoff_target_ref: request.body.handoff_target_ref.clone(),
+                    handoff_scope_ref: request.body.handoff_scope_ref.clone(),
+                    safe_material_ref: request.body.safe_material_ref.clone(),
+                    trace_record_refs: request.body.trace_record_refs.clone(),
+                    visibility_context_ref: request.body.visibility_context_ref.clone(),
+                })
+                .map_err(ApplicationError::from)?;
+                if let Err(error) = policy
+                    .assert_target_allowed()
+                    .and_then(|_| policy.assert_trace_refs_present())
+                    .and_then(|_| policy.assert_safe_material_body_free())
+                    .and_then(|_| policy.assert_visible_for_handoff())
+                {
+                    let app_error = ApplicationError::from(error);
+                    let rejection = Self::rejection_from_error(&command_name, &app_error)
+                        .unwrap_or_else(|| {
+                            Self::protocol_rejection(
+                                &command_name,
+                                IdentityProtocolRejectionKind::PolicyDenied,
+                                app_error.message.clone(),
+                            )
+                        });
+                    let outcome = self.save_replayable_rejected_outcome(
+                        &command_name,
+                        &request,
+                        &context,
+                        rejection,
+                        record,
+                        now,
+                        uow.as_ref(),
+                    )?;
+                    self.deps.unit_of_work_manager.commit(uow)?;
+                    return Ok(outcome);
+                }
+
+                for trace_ref in &request.body.trace_record_refs {
+                    let Some(trace_v) = self
+                        .deps
+                        .trace_record_repository
+                        .get_trace_record(trace_ref.clone())?
+                    else {
+                        let rejection = Self::protocol_rejection(
+                            &command_name,
+                            IdentityProtocolRejectionKind::NotFound,
+                            format!("trace {} does not exist", trace_ref.as_str()),
+                        );
+                        let outcome = self.save_replayable_rejected_outcome(
+                            &command_name,
+                            &request,
+                            &context,
+                            rejection,
+                            record,
+                            now,
+                            uow.as_ref(),
+                        )?;
+                        self.deps.unit_of_work_manager.commit(uow)?;
+                        return Ok(outcome);
+                    };
+                    if !trace_v.value.belongs_to(&request.body.member_ref) {
+                        let rejection = Self::protocol_rejection(
+                            &command_name,
+                            IdentityProtocolRejectionKind::PolicyDenied,
+                            "trace does not belong to the requested member",
+                        );
+                        let outcome = self.save_replayable_rejected_outcome(
+                            &command_name,
+                            &request,
+                            &context,
+                            rejection,
+                            record,
+                            now,
+                            uow.as_ref(),
+                        )?;
+                        self.deps.unit_of_work_manager.commit(uow)?;
+                        return Ok(outcome);
+                    }
+                    if let Err(error) = trace_v.value.assert_body_free() {
+                        let rejection = Self::protocol_rejection(
+                            &command_name,
+                            IdentityProtocolRejectionKind::ForbiddenBody,
+                            ApplicationError::from(error).message,
+                        );
+                        let outcome = self.save_replayable_rejected_outcome(
+                            &command_name,
+                            &request,
+                            &context,
+                            rejection,
+                            record,
+                            now,
+                            uow.as_ref(),
+                        )?;
+                        self.deps.unit_of_work_manager.commit(uow)?;
+                        return Ok(outcome);
+                    }
+                }
+
+                if let Some(audit_trail_ref) = request.body.audit_trail_ref.clone() {
+                    let Some(audit_v) = self
+                        .deps
+                        .audit_trail_repository
+                        .get_audit_trail_with_version(audit_trail_ref)?
+                    else {
+                        let rejection = Self::protocol_rejection(
+                            &command_name,
+                            IdentityProtocolRejectionKind::NotFound,
+                            "audit trail does not exist",
+                        );
+                        let outcome = self.save_replayable_rejected_outcome(
+                            &command_name,
+                            &request,
+                            &context,
+                            rejection,
+                            record,
+                            now,
+                            uow.as_ref(),
+                        )?;
+                        self.deps.unit_of_work_manager.commit(uow)?;
+                        return Ok(outcome);
+                    };
+                    if let Some(member_ref) = audit_v.value.member_ref.as_ref() {
+                        if member_ref != &request.body.member_ref {
+                            let rejection = Self::protocol_rejection(
+                                &command_name,
+                                IdentityProtocolRejectionKind::PolicyDenied,
+                                "audit trail does not belong to the requested member",
+                            );
+                            let outcome = self.save_replayable_rejected_outcome(
+                                &command_name,
+                                &request,
+                                &context,
+                                rejection,
+                                record,
+                                now,
+                                uow.as_ref(),
+                            )?;
+                            self.deps.unit_of_work_manager.commit(uow)?;
+                            return Ok(outcome);
+                        }
+                    }
+                }
+
+                let handoff_intent_ref = if let Some(requested_ref) =
+                    request.body.requested_handoff_intent_ref.clone()
+                {
+                    if self
+                        .deps
+                        .handoff_intent_repository
+                        .get_handoff_intent_with_version(requested_ref.clone())?
+                        .is_some()
+                    {
+                        let rejection = Self::protocol_rejection(
+                            &command_name,
+                            IdentityProtocolRejectionKind::Conflict,
+                            "requested handoff intent ref already exists",
+                        );
+                        let outcome = self.save_replayable_rejected_outcome(
+                            &command_name,
+                            &request,
+                            &context,
+                            rejection,
+                            record,
+                            now,
+                            uow.as_ref(),
+                        )?;
+                        self.deps.unit_of_work_manager.commit(uow)?;
+                        return Ok(outcome);
+                    }
+                    requested_ref
+                } else {
+                    self.deps.id_generator.new_trace_handoff_intent_ref()?
+                };
+
+                let target_resolution = match self.deps.handoff_target_port.resolve_handoff_target(
+                    request.body.handoff_target_ref.clone(),
+                    request.body.handoff_scope_ref.clone(),
+                    request.body.safe_material_ref.clone(),
+                ) {
+                    Ok(resolution) => resolution,
+                    Err(error) => {
+                        let rejection = self.map_runtime_unavailable(&command_name, error)?;
+                        let outcome = self.save_replayable_rejected_outcome(
+                            &command_name,
+                            &request,
+                            &context,
+                            rejection,
+                            record,
+                            now,
+                            uow.as_ref(),
+                        )?;
+                        self.deps.unit_of_work_manager.commit(uow)?;
+                        return Ok(outcome);
+                    }
+                };
+                if target_resolution.target_ref != request.body.handoff_target_ref
+                    || target_resolution.scope_ref != request.body.handoff_scope_ref
+                {
+                    let rejection = Self::protocol_rejection(
+                        &command_name,
+                        IdentityProtocolRejectionKind::InvalidRequest,
+                        "resolved handoff target does not match request target or scope",
+                    );
+                    let outcome = self.save_replayable_rejected_outcome(
+                        &command_name,
+                        &request,
+                        &context,
+                        rejection,
+                        record,
+                        now,
+                        uow.as_ref(),
+                    )?;
+                    self.deps.unit_of_work_manager.commit(uow)?;
+                    return Ok(outcome);
+                }
+
+                let intent = TraceHandoffIntent::prepare(TraceHandoffIntentPrepareArgs {
+                    handoff_intent_ref: handoff_intent_ref.clone(),
+                    member_ref: request.body.member_ref.clone(),
+                    trace_record_refs: request.body.trace_record_refs.clone(),
+                    audit_trail_ref: request.body.audit_trail_ref.clone(),
+                    handoff_target_ref: request.body.handoff_target_ref.clone(),
+                    handoff_scope_ref: request.body.handoff_scope_ref.clone(),
+                    safe_material_ref: request.body.safe_material_ref.clone(),
+                    handoff_state: HandoffState::pending(now),
+                    created_at: now,
+                })
+                .map_err(ApplicationError::from)?;
+                self.deps.handoff_intent_repository.save_handoff_intent(
+                    intent.clone(),
+                    None,
+                    uow.as_ref(),
+                )?;
+
+                let accepted_cursor_ref = self
+                    .deps
+                    .cursor_assigner
+                    .assign_truth_change_cursor(uow.as_ref())?;
+                let subjects = self
+                    .deps
+                    .truth_change_subject_mapper
+                    .handoff_intent_subjects(handoff_intent_ref.clone());
+                let change_kind_ref = IdentityChangeKindRef::new(
+                    IdentityChangeKind::DerivedMarkerChanged,
+                    Some(request.body.handoff_reason_ref.source_ref.clone()),
+                );
+                let trace = self.command_trace_record(
+                    request.body.member_ref.clone(),
+                    &subjects,
+                    change_kind_ref.clone(),
+                    accepted_cursor_ref.clone(),
+                    Some(IdentityChangeReasonRef::new(
+                        request.body.handoff_reason_ref.source_ref.clone(),
+                    )),
+                    Some(request.body.handoff_reason_ref.source_ref.clone()),
+                    None,
+                    context.actor_ref.clone(),
+                    now,
+                )?;
+                self.deps
+                    .trace_record_repository
+                    .append_trace_record(trace.clone(), uow.as_ref())?;
+                let audit_trail_ref = self.append_accepted_audit(
+                    &context,
+                    Some(request.body.member_ref.clone()),
+                    &subjects,
+                    &change_kind_ref,
+                    &accepted_cursor_ref,
+                    &trace,
+                    now,
+                    uow.as_ref(),
+                )?;
+                let stale_projection_refs =
+                    self.save_projection_stale_marks(&subjects, now, uow.as_ref())?;
+                let stored_result_ref = self.deps.id_generator.new_identity_stored_result_ref()?;
+                let surface_marker_ref = self
+                    .deps
+                    .id_generator
+                    .new_identity_stored_surface_marker_ref()?;
+                let effect_summary_ref = self
+                    .deps
+                    .id_generator
+                    .new_identity_command_effect_summary_ref()?;
+                let effect_summary = IdentityCommandEffectSummary::from_accepted_change(
+                    effect_summary_ref,
+                    context.context_ref.clone(),
+                    IdentityAcceptedEffectKind::TraceHandoffCommandResult,
+                    IdentityTruthRef::TraceHandoffIntent(handoff_intent_ref.clone()),
+                    accepted_cursor_ref,
+                    vec![trace.trace_record_ref.clone()],
+                    Some(audit_trail_ref),
+                    Vec::new(),
+                    stale_projection_refs,
+                    stored_result_ref.clone(),
+                );
+                let result = TraceHandoffCommandResult {
+                    member_ref: request.body.member_ref.clone(),
+                    handoff_intent_ref: handoff_intent_ref.clone(),
+                    handoff_state_kind: Self::map_public_handoff_state(
+                        intent.handoff_state.state_kind,
+                    ),
+                    handoff_target_ref: intent.handoff_target_ref.clone(),
+                    handoff_scope_ref: intent.handoff_scope_ref.clone(),
+                    trace_record_refs: intent.trace_record_refs.clone(),
+                    audit_trail_ref: intent.audit_trail_ref.clone(),
+                    safe_material_ref: intent.safe_material_ref.clone(),
+                };
+                let effect = Self::public_effect_from_summary(
+                    &effect_summary,
+                    vec![subjects.audit_subject_ref.clone()],
+                );
+                let stored = StoredIdentityOperationResult::command_accepted(
+                    stored_result_ref.clone(),
+                    context.context_ref.clone(),
+                    surface_marker_ref.clone(),
+                    now,
+                );
+                self.deps
+                    .stored_result_repository
+                    .save_command_accepted_result(stored, uow.as_ref())?;
+                self.deps
+                    .effect_summary_repository
+                    .save_effect_summary(effect_summary, uow.as_ref())?;
+                self.deps
+                    .stored_result_repository
+                    .save_command_accepted_envelope(
+                        IdentityCommandAcceptedResultEnvelope::new(
+                            stored_result_ref.clone(),
+                            context.context_ref.clone(),
+                            command_name.clone(),
+                            surface_marker_ref,
+                            IdentityCommandTypedResult::TraceHandoff(result.clone()),
                             effect.clone(),
                             now,
                         ),
