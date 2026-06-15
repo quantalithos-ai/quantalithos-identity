@@ -20,9 +20,12 @@ mod tests {
     use serde::de::DeserializeOwned;
 
     use crate::commands::{
-        EstablishGlobalMemberRequest, GlobalLifecycleCommandResult, GlobalMemberCommandResult,
+        AppendCareerRecordRequest, CareerRecordCommandResult, EstablishGlobalMemberRequest,
+        GlobalLifecycleCommandResult, GlobalMemberCommandResult,
         IdentityCommandEffectPublicSummary, IdentityCommandOutcome, IdentityCommandRequest,
-        IdentityCommandResponse, UpdateGlobalLifecycleStateRequest,
+        IdentityCommandResponse, MaintainMemoryReferenceRequest,
+        MaintainRoleCapabilitySummaryRequest, MemoryReferenceCommandResult,
+        RoleCapabilityCommandResult, UpdateGlobalLifecycleStateRequest,
     };
     use crate::events::{
         GlobalLifecycleChangedPayload, GlobalMemberAvailabilityChangedPayload,
@@ -50,6 +53,10 @@ mod tests {
         IdentityPublicPageRequest, IdentityQueryRequest, IdentityQueryResponse,
     };
     use crate::refs::{
+        ArchiveHandoffRef, ArchiveRef, CapabilityEvidenceKind, CapabilityEvidenceRef,
+        CapabilitySourceRef, CareerAppendMaterialKind, CareerAppendMaterialMarker,
+        CareerAppendReasonKind, CareerAppendReasonRef, CareerRecordChangeIntent, CareerRecordId,
+        CareerRecordRef, CareerRecordStateKind, CareerSafeSummaryRef, ExternalSourceRef,
         GlobalMemberId, GlobalMemberRef, HandoffReceiptRef, IdentityApiRequestMarkerRef,
         IdentityAuditSubjectRef, IdentityCanonicalRequestMarkerRef, IdentityConsumerBindingRef,
         IdentityConsumerReceiptRef, IdentityDegradedMarkerRef, IdentityJobCursorRef,
@@ -57,10 +64,20 @@ mod tests {
         IdentityJobScopeMarkerRef, IdentityMaintenanceTargetRef, IdentityOutboxPayloadMarkerRef,
         IdentityOutboxRecordRef, IdentityOutboxSubjectRef, IdentityProjectionRef,
         IdentityReadSurfaceKind, IdentityRedactionMarkerRef, IdentityRequestDigestValue,
-        IdentitySourceEventRef, IdentityStoredResultRef, IdentityTimestamp,
+        IdentitySourceEventRef, IdentitySourceOwner, IdentityStoredResultRef, IdentityTimestamp,
         IdentityTraceContextRef, IdentityTraceRecordRef, IdentityTruthCursor, LifecycleReasonKind,
-        LifecycleReasonRef, ProjectionFreshnessMarkerRef, ReconciliationReportRef, TopicKeyRef,
-        VisibilityContextRef, VisibilityResultRef,
+        LifecycleReasonRef, MemoryRef, MemoryReferenceChangeIntent,
+        MemoryReferenceChangeMaterialKind, MemoryReferenceChangeMaterialMarker, MemoryReferenceId,
+        MemoryReferenceReasonKind, MemoryReferenceReasonRef, MemoryReferenceRef,
+        MemoryReferenceSourceKind, MemoryReferenceSourceRef, MemoryReferenceStateKind,
+        MemorySafeSummaryRef, ProjectParticipationRef, ProjectionFreshnessMarkerRef,
+        ReconciliationReportRef, RoleCapabilityChangeMaterialKind,
+        RoleCapabilityChangeMaterialMarker, RoleCapabilityChangeReasonKind,
+        RoleCapabilityChangeReasonRef, RoleCapabilitySafeSummaryRef, RoleCapabilitySourceKind,
+        RoleCapabilitySourceRef, RoleCapabilitySourceSnapshotId, RoleCapabilitySourceSnapshotRef,
+        RoleCapabilitySourceStateKind, RoleCapabilitySummaryId, RoleCapabilitySummaryRef,
+        RoleCapabilitySummaryStateKind, RoleSourceRef, TopicKeyRef, VisibilityContextRef,
+        VisibilityResultRef, WorkSourceKind, WorkSourceRef,
     };
 
     fn roundtrip<T>(value: &T)
@@ -99,6 +116,30 @@ mod tests {
                 .expect("sample external source ref should be valid"),
         )
         .expect("sample source ref should be valid")
+    }
+
+    fn sample_method_source_ref(token: &str) -> crate::refs::IdentitySourceRef {
+        crate::refs::IdentitySourceRef::new(
+            IdentitySourceOwner::MethodLibrary,
+            ExternalSourceRef::new(token.to_owned()).expect("sample external source ref"),
+        )
+        .expect("sample method source ref")
+    }
+
+    fn sample_work_source_ref(token: &str) -> crate::refs::IdentitySourceRef {
+        crate::refs::IdentitySourceRef::new(
+            IdentitySourceOwner::Work,
+            ExternalSourceRef::new(token.to_owned()).expect("sample external source ref"),
+        )
+        .expect("sample work source ref")
+    }
+
+    fn sample_memory_source_ref(token: &str) -> crate::refs::IdentitySourceRef {
+        crate::refs::IdentitySourceRef::new(
+            IdentitySourceOwner::MemoryArchive,
+            ExternalSourceRef::new(token.to_owned()).expect("sample external source ref"),
+        )
+        .expect("sample memory source ref")
     }
 
     fn sample_lifecycle_reason_ref() -> LifecycleReasonRef {
@@ -203,6 +244,195 @@ mod tests {
         roundtrip(&establish_result);
         roundtrip(&lifecycle_request);
         roundtrip(&lifecycle_result);
+    }
+
+    #[test]
+    fn command_role_career_memory_dtos_roundtrip() {
+        let role_source = RoleCapabilitySourceRef::new(
+            RoleCapabilitySourceKind::RoleCapabilityBundle,
+            sample_method_source_ref("method-source-1"),
+        )
+        .expect("role source");
+        let capability_source =
+            CapabilitySourceRef::from_source(role_source.clone()).expect("capability source");
+        let role_summary_ref = RoleCapabilitySummaryRef::from_id(
+            RoleCapabilitySummaryId::new("summary-1".to_owned()).expect("summary id"),
+        );
+        let snapshot_ref = RoleCapabilitySourceSnapshotRef::from_id(
+            RoleCapabilitySourceSnapshotId::new("snapshot-1".to_owned()).expect("snapshot id"),
+        );
+        let role_request = MaintainRoleCapabilitySummaryRequest {
+            member_ref: sample_member_ref(),
+            requested_summary_ref: Some(role_summary_ref.clone()),
+            source_ref: role_source.clone(),
+            role_source_ref: Some(
+                RoleSourceRef::from_source(role_source.clone()).expect("role wrapper"),
+            ),
+            capability_source_refs: vec![capability_source.clone()],
+            evidence_refs: vec![
+                CapabilityEvidenceRef::new(
+                    CapabilityEvidenceKind::MethodArtifact,
+                    sample_method_source_ref("method-evidence-1"),
+                )
+                .expect("evidence ref"),
+            ],
+            safe_summary_ref: Some(
+                RoleCapabilitySafeSummaryRef::new(role_source.clone(), "safe-role-summary-1")
+                    .expect("role safe summary"),
+            ),
+            change_reason_ref: RoleCapabilityChangeReasonRef::new(
+                RoleCapabilityChangeReasonKind::ManualSummaryMaintenance,
+                sample_identity_source_ref(),
+            )
+            .expect("role change reason"),
+            change_material_marker: RoleCapabilityChangeMaterialMarker::new(
+                RoleCapabilityChangeMaterialKind::SafeSummaryMarker,
+                None,
+            ),
+        };
+        let role_result = RoleCapabilityCommandResult {
+            member_ref: sample_member_ref(),
+            summary_ref: role_summary_ref,
+            source_snapshot_ref: snapshot_ref,
+            summary_state_kind: RoleCapabilitySummaryStateKind::Active,
+            source_state_kind: RoleCapabilitySourceStateKind::SourceResolved,
+            role_source_ref: Some(
+                RoleSourceRef::from_source(role_source.clone()).expect("role wrapper"),
+            ),
+            capability_source_refs: vec![capability_source],
+            evidence_refs: vec![
+                CapabilityEvidenceRef::new(
+                    CapabilityEvidenceKind::MethodArtifact,
+                    sample_method_source_ref("method-evidence-1"),
+                )
+                .expect("evidence ref"),
+            ],
+            safe_summary_ref: Some(
+                RoleCapabilitySafeSummaryRef::new(role_source, "safe-role-summary-1")
+                    .expect("role safe summary"),
+            ),
+        };
+
+        let work_source = WorkSourceRef::new(
+            WorkSourceKind::ProjectParticipationAccepted,
+            sample_work_source_ref("work-source-1"),
+        )
+        .expect("work source");
+        let project_participation_ref = ProjectParticipationRef::from_work_source(
+            sample_work_source_ref("project-participation-1"),
+        )
+        .expect("project participation");
+        let career_record_ref = CareerRecordRef::from_id(
+            CareerRecordId::new("career-record-1".to_owned()).expect("career record id"),
+        );
+        let career_request = AppendCareerRecordRequest {
+            member_ref: sample_member_ref(),
+            requested_career_record_ref: Some(career_record_ref.clone()),
+            change_intent: CareerRecordChangeIntent::AppendNew,
+            project_participation_ref: project_participation_ref.clone(),
+            work_source_ref: work_source.clone(),
+            source_marker_ref: crate::refs::CareerSourceMarkerRef::new(
+                sample_member_ref(),
+                work_source.clone(),
+                "career-marker-1",
+            )
+            .expect("career source marker"),
+            career_summary_ref: Some(
+                CareerSafeSummaryRef::new(work_source.clone(), "career-safe-summary-1")
+                    .expect("career safe summary"),
+            ),
+            append_reason_ref: CareerAppendReasonRef::new(
+                CareerAppendReasonKind::ManualAppend,
+                sample_identity_source_ref(),
+            )
+            .expect("career append reason"),
+            original_record_ref: None,
+            append_material_marker: CareerAppendMaterialMarker {
+                material_kind: CareerAppendMaterialKind::SafeSummaryMarker,
+                source_ref: None,
+            },
+        };
+        let career_result = CareerRecordCommandResult {
+            member_ref: sample_member_ref(),
+            career_record_ref: career_record_ref.clone(),
+            record_state_kind: CareerRecordStateKind::Appended,
+            project_participation_ref,
+            work_source_ref: work_source.clone(),
+            source_marker_ref: crate::refs::CareerSourceMarkerRef::new(
+                sample_member_ref(),
+                work_source.clone(),
+                "career-marker-1",
+            )
+            .expect("career source marker"),
+            career_summary_ref: Some(
+                CareerSafeSummaryRef::new(work_source, "career-safe-summary-1")
+                    .expect("career safe summary"),
+            ),
+            correction_of_ref: None,
+            superseded_record_ref: None,
+        };
+
+        let memory_source = MemoryReferenceSourceRef::new(
+            MemoryReferenceSourceKind::ManualCommand,
+            sample_identity_source_ref(),
+        )
+        .expect("memory source");
+        let memory_ref =
+            MemoryRef::from_source(sample_memory_source_ref("memory-1")).expect("memory ref");
+        let archive_ref =
+            ArchiveRef::from_source(sample_memory_source_ref("archive-1")).expect("archive ref");
+        let archive_handoff_ref =
+            ArchiveHandoffRef::new(sample_identity_source_ref(), "handoff-1").expect("handoff ref");
+        let memory_reference_ref = MemoryReferenceRef::from_id(
+            MemoryReferenceId::new("memory-reference-1".to_owned()).expect("memory ref id"),
+        );
+        let memory_request = MaintainMemoryReferenceRequest {
+            member_ref: sample_member_ref(),
+            requested_memory_reference_ref: Some(memory_reference_ref.clone()),
+            change_intent: MemoryReferenceChangeIntent::RecordArchiveHandoffResult,
+            memory_ref: Some(memory_ref.clone()),
+            archive_ref: Some(archive_ref.clone()),
+            archive_handoff_ref: Some(archive_handoff_ref.clone()),
+            source_ref: memory_source.clone(),
+            safe_summary_ref: Some(
+                MemorySafeSummaryRef::new(memory_source.clone(), "memory-safe-summary-1")
+                    .expect("memory safe summary"),
+            ),
+            reason_ref: MemoryReferenceReasonRef::new(
+                MemoryReferenceReasonKind::ArchiveHandoffResult,
+                sample_identity_source_ref(),
+            )
+            .expect("memory reason"),
+            change_material_marker: MemoryReferenceChangeMaterialMarker {
+                material_kind: MemoryReferenceChangeMaterialKind::HandoffMarkerOnly,
+                source_ref: None,
+            },
+        };
+        let memory_result = MemoryReferenceCommandResult {
+            member_ref: sample_member_ref(),
+            memory_reference_ref,
+            reference_state_kind: MemoryReferenceStateKind::Archived,
+            memory_ref: Some(memory_ref),
+            archive_ref: Some(archive_ref),
+            archive_handoff_ref: Some(archive_handoff_ref),
+            source_ref: memory_source.clone(),
+            safe_summary_ref: Some(
+                MemorySafeSummaryRef::new(memory_source, "memory-safe-summary-1")
+                    .expect("memory safe summary"),
+            ),
+            reason_ref: MemoryReferenceReasonRef::new(
+                MemoryReferenceReasonKind::ArchiveHandoffResult,
+                sample_identity_source_ref(),
+            )
+            .expect("memory reason"),
+        };
+
+        roundtrip(&role_request);
+        roundtrip(&role_result);
+        roundtrip(&career_request);
+        roundtrip(&career_result);
+        roundtrip(&memory_request);
+        roundtrip(&memory_result);
     }
 
     #[test]

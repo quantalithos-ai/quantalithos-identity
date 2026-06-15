@@ -435,6 +435,74 @@ pub enum GlobalLifecycleStateKind {
     Tombstoned,
 }
 
+/// Public role capability summary state kind.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleCapabilitySummaryStateKind {
+    /// Summary has valid source and evidence and may be used for controlled reads.
+    Active,
+    /// Source version changed or the summary requires refresh.
+    Stale,
+    /// Source is unavailable or unrecognized for current mainline use.
+    Unavailable,
+    /// Summary requires formal reconciliation before trusted use.
+    PendingReconciliation,
+    /// Summary has been replaced by a newer current summary.
+    Superseded,
+}
+
+/// Public role capability source snapshot state kind.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleCapabilitySourceStateKind {
+    /// Source is resolved and usable for active summary writes.
+    SourceResolved,
+    /// Source version changed or the snapshot is stale.
+    SourceStale,
+    /// Source is currently unavailable.
+    SourceUnavailable,
+    /// Source cannot be mapped to a recognized formal ref.
+    SourceUnrecognized,
+    /// Snapshot has been replaced by a newer source version.
+    SourceSuperseded,
+}
+
+/// Public career record state kind.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CareerRecordStateKind {
+    /// Normal appended career record.
+    Appended,
+    /// New record appended as a correction of an existing record.
+    CorrectionAppended,
+    /// Existing record is retained but explained as superseded by a correction.
+    SupersededByCorrection,
+    /// Source requires review before accepted career mainline use.
+    SourcePendingReview,
+}
+
+/// Public memory reference state kind.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryReferenceStateKind {
+    /// Memory ref is linked to the member relation.
+    Linked,
+    /// Relation exists but requires formal verification.
+    PendingVerification,
+    /// External reference may be stale.
+    Stale,
+    /// External carrier is unavailable or unresolved.
+    Unavailable,
+    /// Relation has migrated to new formal markers.
+    Migrated,
+    /// Relation is archived or cold-stored.
+    Archived,
+    /// Archive handoff is pending.
+    HandoffPending,
+    /// Archive handoff failed.
+    HandoffFailed,
+}
+
 /// Body-free risk classification reference for a lifecycle action.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct LifecycleRiskRef {
