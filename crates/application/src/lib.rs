@@ -13,11 +13,13 @@ pub use crate::command::{
 };
 pub use crate::errors::{ApplicationError, ApplicationErrorKind};
 pub use crate::mapper::{
-    DefaultIdentityDispatchTargetCatalog, DefaultIdentityMaintenanceIssueMapper,
-    DefaultIdentityMarkerSubjectMapper, DefaultIdentityTruthChangeSubjectMapper,
+    DefaultIdentityAcceptedAuditTrailMarkerMapper, DefaultIdentityDispatchTargetCatalog,
+    DefaultIdentityMaintenanceIssueMapper, DefaultIdentityMarkerSubjectMapper,
+    DefaultIdentityTruthChangeSubjectMapper,
 };
 pub use crate::ports::{
-    IdentityClockPort, IdentityCommandEffectSummaryRepository, IdentityCursorAssignerPort,
+    IdentityAcceptedAuditTrailMarkerMapper, IdentityClockPort,
+    IdentityCommandEffectSummaryRepository, IdentityCursorAssignerPort,
     IdentityDispatchTargetCatalogPort, IdentityIdGeneratorPort, IdentityIdempotencyRepository,
     IdentityJobReportRepository, IdentityMaintenanceIssueMapper, IdentityMarkerSubjectMapper,
     IdentityOperationContextFactoryPort, IdentityOutboxRepository, IdentityStoredResultRepository,
@@ -25,8 +27,10 @@ pub use crate::ports::{
 };
 pub use crate::support::{
     ExternalReferenceRefSet, GlobalMemberRefSet, IdempotencyReserveOutcome,
-    IdentityAcceptedEffectKind, IdentityAcceptedSubjectRefs, IdentityCommandEffectSummary,
-    IdentityCommandEffectSummaryRef, IdentityConsumerReceiptEnvelope, IdentityDispatchTargetRef,
+    IdentityAcceptedAuditTrailMarkers, IdentityAcceptedEffectKind, IdentityAcceptedSubjectRefs,
+    IdentityCommandAcceptedResultEnvelope, IdentityCommandEffectSummary,
+    IdentityCommandEffectSummaryRef, IdentityCommandRejectedResultEnvelope,
+    IdentityCommandTypedResult, IdentityConsumerReceiptEnvelope, IdentityDispatchTargetRef,
     IdentityEntrySurfaceKind, IdentityIdempotencyKey, IdentityIdempotencyRecord,
     IdentityIdempotencyRecordRef, IdentityIdempotencyStateKind, IdentityJobRunReport,
     IdentityOperationContext, IdentityOperationContextRef, IdentityOperationName,

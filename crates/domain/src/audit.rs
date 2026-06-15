@@ -45,6 +45,28 @@ pub struct AuditTrail {
 }
 
 impl AuditTrail {
+    /// Creates a trail for accepted write materialization with one initial body-free entry.
+    pub fn from_accepted_write(
+        audit_trail_ref: AuditTrailRef,
+        audit_subject_ref: IdentityAuditSubjectRef,
+        member_ref: Option<GlobalMemberRef>,
+        audit_scope_ref: AuditScopeRef,
+        initial_entry: AuditTrailEntry,
+        visibility_result_ref: VisibilityResultRef,
+        assembled_at: IdentityTimestamp,
+    ) -> Result<Self, IdentityDomainError> {
+        Self::assemble(
+            audit_trail_ref,
+            audit_subject_ref,
+            member_ref,
+            audit_scope_ref,
+            vec![initial_entry],
+            visibility_result_ref,
+            None,
+            assembled_at,
+        )
+    }
+
     /// Assembles an audit trail from body-free entries.
     #[allow(clippy::too_many_arguments)]
     pub fn assemble(

@@ -2,15 +2,19 @@
 
 use core_contracts::actor::ActorRef;
 use core_contracts::metadata::IdempotencyKey;
+use identity_contracts::commands::{
+    GlobalLifecycleCommandResult, GlobalMemberCommandResult, IdentityCommandEffectPublicSummary,
+};
 use identity_contracts::events::IdentityConsumerReceipt;
 use identity_contracts::jobs::IdentityJobResultKind;
-use identity_contracts::metadata::IdentityDegradedKind;
+use identity_contracts::metadata::{IdentityDegradedKind, IdentityProtocolRejection};
 use identity_contracts::protocol::{
-    IdentityDigestAlgorithmMarkerRef, IdentityJobName, IdentityProtocolSchemaVersionRef,
+    IdentityCommandName, IdentityDigestAlgorithmMarkerRef, IdentityJobName,
+    IdentityProtocolSchemaVersionRef,
 };
 use identity_contracts::receipts::{MaintenanceIssueRef, TraceHandoffIntentRef};
 use identity_contracts::refs::{
-    AuditTrailRef, ExternalReferenceRef, GlobalMemberRef, HandoffReceiptRef,
+    AuditScopeRef, AuditTrailRef, ExternalReferenceRef, GlobalMemberRef, HandoffReceiptRef,
     IdentityApiRequestMarkerRef, IdentityConsumerBindingRef, IdentityConsumerReceiptRef,
     IdentityDegradedMarkerRef, IdentityEventEnvelopeMarkerRef, IdentityJobCursorRef,
     IdentityJobReportRef, IdentityJobRunMetadataRef, IdentityJobRunRef, IdentityJobScopeMarkerRef,
@@ -230,6 +234,19 @@ pub struct IdentityAcceptedSubjectRefs {
     pub audit_subject_ref: identity_contracts::refs::IdentityAuditSubjectRef,
     /// Outbox subject used by accepted outbox records.
     pub outbox_subject_ref: identity_contracts::refs::IdentityOutboxSubjectRef,
+}
+
+/// Body-free markers required to materialize accepted write audit material.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityAcceptedAuditTrailMarkers {
+    /// Accepted-write audit scope marker.
+    pub audit_scope_ref: AuditScopeRef,
+    /// Trail-level body-free materialized visibility marker.
+    pub trail_visibility_result_ref: VisibilityResultRef,
+    /// Entry-level body-free materialized visibility marker.
+    pub entry_visibility_result_ref: VisibilityResultRef,
+    /// Read surface kind carried by the accepted-write trail materialization.
+    pub read_surface_kind: identity_contracts::refs::IdentityReadSurfaceKind,
 }
 
 /// Application-local entry surface classification.
@@ -777,6 +794,95 @@ impl IdentityConsumerReceiptEnvelope {
             result_kind: IdentityStoredResultKind::HandoffCallbackReceipt,
             surface_marker_ref,
             receipt,
+            recorded_at,
+        }
+    }
+}
+
+/// Typed command accepted result union used by duplicate replay envelopes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum IdentityCommandTypedResult {
+    /// `EstablishGlobalMember` accepted result.
+    GlobalMember(GlobalMemberCommandResult),
+    /// `UpdateGlobalLifecycleState` accepted result.
+    GlobalLifecycle(GlobalLifecycleCommandResult),
+}
+
+/// Typed stored accepted command envelope used as duplicate replay source.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityCommandAcceptedResultEnvelope {
+    /// Stable stored result identity.
+    pub stored_result_ref: IdentityStoredResultRef,
+    /// Operation context that produced the replayable accepted response.
+    pub operation_context_ref: IdentityOperationContextRef,
+    /// Formal command name.
+    pub command_name: IdentityCommandName,
+    /// Body-free stored surface marker.
+    pub surface_marker_ref: IdentityStoredSurfaceMarkerRef,
+    /// Full typed accepted result body.
+    pub result: IdentityCommandTypedResult,
+    /// Full public accepted effect surface.
+    pub effect: IdentityCommandEffectPublicSummary,
+    /// Timestamp when the accepted envelope was recorded.
+    pub recorded_at: IdentityTimestamp,
+}
+
+impl IdentityCommandAcceptedResultEnvelope {
+    /// Creates a stored accepted command envelope.
+    pub fn new(
+        stored_result_ref: IdentityStoredResultRef,
+        operation_context_ref: IdentityOperationContextRef,
+        command_name: IdentityCommandName,
+        surface_marker_ref: IdentityStoredSurfaceMarkerRef,
+        result: IdentityCommandTypedResult,
+        effect: IdentityCommandEffectPublicSummary,
+        recorded_at: IdentityTimestamp,
+    ) -> Self {
+        Self {
+            stored_result_ref,
+            operation_context_ref,
+            command_name,
+            surface_marker_ref,
+            result,
+            effect,
+            recorded_at,
+        }
+    }
+}
+
+/// Typed stored rejected command envelope used as duplicate replay source.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityCommandRejectedResultEnvelope {
+    /// Stable stored result identity.
+    pub stored_result_ref: IdentityStoredResultRef,
+    /// Operation context that produced the replayable rejection.
+    pub operation_context_ref: IdentityOperationContextRef,
+    /// Formal command name.
+    pub command_name: IdentityCommandName,
+    /// Body-free stored surface marker.
+    pub surface_marker_ref: IdentityStoredSurfaceMarkerRef,
+    /// Full public rejection surface.
+    pub rejection: IdentityProtocolRejection,
+    /// Timestamp when the rejected envelope was recorded.
+    pub recorded_at: IdentityTimestamp,
+}
+
+impl IdentityCommandRejectedResultEnvelope {
+    /// Creates a stored rejected command envelope.
+    pub fn new(
+        stored_result_ref: IdentityStoredResultRef,
+        operation_context_ref: IdentityOperationContextRef,
+        command_name: IdentityCommandName,
+        surface_marker_ref: IdentityStoredSurfaceMarkerRef,
+        rejection: IdentityProtocolRejection,
+        recorded_at: IdentityTimestamp,
+    ) -> Self {
+        Self {
+            stored_result_ref,
+            operation_context_ref,
+            command_name,
+            surface_marker_ref,
+            rejection,
             recorded_at,
         }
     }

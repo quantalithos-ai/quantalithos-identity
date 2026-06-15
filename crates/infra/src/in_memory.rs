@@ -2,45 +2,61 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use core_contracts::actor::ActorRef;
 use identity_application::errors::{ApplicationError, ApplicationErrorKind};
+use identity_application::mapper::{
+    DefaultIdentityAcceptedAuditTrailMarkerMapper, DefaultIdentityTruthChangeSubjectMapper,
+};
 use identity_application::ports::{
-    ExternalReferenceTypedSidecarRefs, HandoffDeliveryOutcome, HandoffReceiptResolution,
-    HandoffTargetResolution, IdentityAdapterAvailabilityPort,
-    IdentityCommandEffectSummaryRepository, IdentityCursorAssignerPort,
-    IdentityHandoffDeliveryPort, IdentityHandoffTargetPort, IdentityIdempotencyRepository,
-    IdentityJobReportRepository, IdentityOutboxRepository, IdentityProjectionRepository,
-    IdentityReadVisibilityRepository, IdentityReferenceStateRepository,
-    IdentityStoredResultRepository, IdentityUnitOfWork, IdentityUnitOfWorkManagerPort,
-    TraceHandoffIntentRepository,
+    ExternalReferenceTypedSidecarRefs, GlobalLifecycleRepository, GlobalMemberRepository,
+    HandoffDeliveryOutcome, HandoffReceiptResolution, HandoffTargetResolution,
+    IdentityAcceptedAuditTrailMarkerMapper, IdentityAdapterAvailabilityPort,
+    IdentityAuditTrailRepository, IdentityClockPort, IdentityCommandEffectSummaryRepository,
+    IdentityCursorAssignerPort, IdentityExternalSourceResolverPort, IdentityHandoffDeliveryPort,
+    IdentityHandoffTargetPort, IdentityIdGeneratorPort, IdentityIdempotencyRepository,
+    IdentityJobReportRepository, IdentityOperationContextFactoryPort, IdentityOutboxRepository,
+    IdentityProjectionRepository, IdentityReadVisibilityRepository,
+    IdentityReferenceStateRepository, IdentityStoredResultRepository,
+    IdentityTraceRecordRepository, IdentityTruthChangeSubjectMapper, IdentityUnitOfWork,
+    IdentityUnitOfWorkManagerPort, TraceHandoffIntentRepository,
 };
 use identity_application::support::{
-    IdempotencyReserveOutcome, IdentityAdapterAvailability, IdentityAdapterModeRef,
-    IdentityAdapterRef, IdentityCommandEffectSummary, IdentityCommandEffectSummaryRef,
+    AuditTrailId, IdempotencyReserveOutcome, IdentityAcceptedAuditTrailMarkers,
+    IdentityAcceptedSubjectRefs, IdentityAdapterAvailability, IdentityAdapterModeRef,
+    IdentityAdapterRef, IdentityCommandAcceptedResultEnvelope, IdentityCommandEffectSummary,
+    IdentityCommandEffectSummaryRef, IdentityCommandRejectedResultEnvelope,
     IdentityConsumerReceiptEnvelope, IdentityIdempotencyKey, IdentityIdempotencyRecord,
     IdentityIdempotencyRecordRef, IdentityJobRunReport, IdentityOperationContext,
     IdentityOperationContextRef, IdentityOperationName, IdentityProjectionRefSet,
-    IdentityRepositoryCursor, IdentityRepositoryPage, IdentityStoredResultKind,
-    IdentityTransactionRef, IdentityTruthRef, IdentityVersion, IdentityVersionedRef, Page,
-    StoredIdentityOperationResult, Versioned,
+    IdentityRepositoryCursor, IdentityRepositoryPage, IdentityRequestDigest,
+    IdentityRequestMetadataRef, IdentityStoredResultKind, IdentityStoredSurfaceMarkerRef,
+    IdentityTraceRecordId, IdentityTransactionRef, IdentityTruthRef, IdentityVersion,
+    IdentityVersionedRef, Page, StoredIdentityOperationResult, Versioned,
 };
 use identity_contracts::jobs::IdentityJobResultKind;
 use identity_contracts::protocol::IdentityJobName;
 use identity_contracts::receipts::TraceHandoffIntentRef;
 use identity_contracts::refs::{
-    AuditScopeRef, AuditTrailRef, ConsumerRef, ExternalReferenceKind, ExternalReferenceRef,
-    ExternalSourceRef, GlobalMemberRef, HandoffIssueRef, HandoffReceiptRef, HandoffScopeRef,
-    HandoffTargetRef, IdentityAuditSubjectRef, IdentityOutboxRecordRef, IdentityOutboxSubjectRef,
+    AuditCursorRef, AuditScopeRef, AuditTrailRef, ConsumerRef, ExternalReferenceKind,
+    ExternalReferenceRef, ExternalSourceRef, ExternalSourceVersionRef, GlobalMemberId,
+    GlobalMemberRef, GovernanceBasisRef, GovernanceBasisState, GovernanceBasisSummary,
+    HandoffIssueRef, HandoffReceiptRef, HandoffScopeRef, HandoffTargetRef, IdentityAuditSubjectRef,
+    IdentityChangeKindRef, IdentityJobRunRef, IdentityOutboxRecordRef, IdentityOutboxSubjectRef,
     IdentityProjectionCursorRef, IdentityProjectionRef, IdentityReferenceOwnerRef,
-    IdentitySourceOwner, IdentitySourceRef, IdentityTraceRecordRef, IdentityTraceSubjectRef,
-    IdentityTruthCursor, MemberSummaryViewRef, ProjectionStateRef, ReferenceResolutionStateRef,
-    TopicKeyRef, TraceHandoffSafeMaterialRef, VisibilityContextRef, VisibilityResultRef,
-    VisibilityScopeRef,
+    IdentitySourceOwner, IdentitySourceRef, IdentityTimestamp, IdentityTraceRecordRef,
+    IdentityTraceSubjectRef, IdentityTruthCursor, LifecycleRiskRef, MemberSummaryViewRef,
+    ProjectionStateRef, ReferenceResolutionStateRef, TopicKeyRef, TraceHandoffSafeMaterialRef,
+    VisibilityContextRef, VisibilityResultRef, VisibilityScopeRef,
 };
 use identity_contracts::views::{IdentityVisibilityAccessSummary, MemberSummaryView};
+use identity_domain::audit::{AuditTrail, AuditTrailEntry};
 use identity_domain::handoff::{HandoffStateKind, TraceHandoffIntent};
+use identity_domain::lifecycle::GlobalLifecycleState;
+use identity_domain::member_identity::GlobalMember;
 use identity_domain::outbox::{IdentityOutboxRecord, OutboxStateKind};
 use identity_domain::projection_state::{ProjectionState, ProjectionStateKind};
 use identity_domain::reference_state::{ReferenceResolutionState, ReferenceResolutionStateKind};
+use identity_domain::trace::IdentityTraceRecord;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FaultCase {
@@ -61,6 +77,68 @@ pub struct IdentityInMemoryRuntimeBuilder {
 impl IdentityInMemoryRuntimeBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn seed_member(mut self, member: GlobalMember, version: IdentityVersion) -> Self {
+        self.store.members.insert(
+            member_key(&member.member_ref),
+            StoredMember { member, version },
+        );
+        self
+    }
+
+    pub fn seed_lifecycle(
+        mut self,
+        member_ref: GlobalMemberRef,
+        lifecycle: GlobalLifecycleState,
+        version: IdentityVersion,
+    ) -> Self {
+        self.store.lifecycles.insert(
+            member_key(&member_ref),
+            StoredLifecycle {
+                member_ref,
+                lifecycle,
+                version,
+            },
+        );
+        self
+    }
+
+    pub fn seed_trace_record(
+        mut self,
+        trace_record: IdentityTraceRecord,
+        version: IdentityVersion,
+    ) -> Self {
+        let key = trace_record.trace_record_ref.as_str().to_owned();
+        self.store
+            .trace_subject_index
+            .entry(trace_record.subject_ref.as_str().to_owned())
+            .or_default()
+            .push(key.clone());
+        self.store
+            .trace_member_index
+            .entry(member_key(&trace_record.member_ref))
+            .or_default()
+            .push(key.clone());
+        self.store.trace_records.insert(
+            key,
+            StoredTraceRecord {
+                trace: trace_record,
+                version,
+            },
+        );
+        self
+    }
+
+    pub fn seed_audit_trail(mut self, trail: AuditTrail, version: IdentityVersion) -> Self {
+        let key = trail.audit_trail_ref.as_str().to_owned();
+        self.store
+            .audit_subject_index
+            .insert(trail.audit_subject_ref.as_str().to_owned(), key.clone());
+        self.store
+            .audit_trails
+            .insert(key, StoredAuditTrail { trail, version });
+        self
     }
 
     pub fn seed_member_summary_view(
@@ -174,6 +252,26 @@ impl IdentityInMemoryRuntimeBuilder {
     pub fn seed_consumer_receipt(mut self, envelope: IdentityConsumerReceiptEnvelope) -> Self {
         self.store
             .consumer_receipts
+            .insert(envelope.stored_result_ref.as_str().to_owned(), envelope);
+        self
+    }
+
+    pub fn seed_command_accepted_envelope(
+        mut self,
+        envelope: IdentityCommandAcceptedResultEnvelope,
+    ) -> Self {
+        self.store
+            .command_accepted_envelopes
+            .insert(envelope.stored_result_ref.as_str().to_owned(), envelope);
+        self
+    }
+
+    pub fn seed_command_rejected_envelope(
+        mut self,
+        envelope: IdentityCommandRejectedResultEnvelope,
+    ) -> Self {
+        self.store
+            .command_rejected_envelopes
             .insert(envelope.stored_result_ref.as_str().to_owned(), envelope);
         self
     }
@@ -339,6 +437,78 @@ impl IdentityInMemoryRuntime {
         ))
     }
 
+    fn predicted_member_version(
+        &self,
+        member_ref: &GlobalMemberRef,
+    ) -> Result<IdentityVersion, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(IdentityVersion::new(
+            store
+                .members
+                .get(&member_key(member_ref))
+                .map(|stored| stored.version.get() + 1)
+                .unwrap_or(1),
+        ))
+    }
+
+    fn predicted_lifecycle_version(
+        &self,
+        member_ref: &GlobalMemberRef,
+    ) -> Result<IdentityVersion, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(IdentityVersion::new(
+            store
+                .lifecycles
+                .get(&member_key(member_ref))
+                .map(|stored| stored.version.get() + 1)
+                .unwrap_or(1),
+        ))
+    }
+
+    fn predicted_trace_version(
+        &self,
+        trace_record_ref: &IdentityTraceRecordRef,
+    ) -> Result<IdentityVersion, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(IdentityVersion::new(
+            store
+                .trace_records
+                .get(trace_record_ref.as_str())
+                .map(|stored| stored.version.get() + 1)
+                .unwrap_or(1),
+        ))
+    }
+
+    fn predicted_audit_version(
+        &self,
+        audit_trail_ref: &AuditTrailRef,
+    ) -> Result<IdentityVersion, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(IdentityVersion::new(
+            store
+                .audit_trails
+                .get(audit_trail_ref.as_str())
+                .map(|stored| stored.version.get() + 1)
+                .unwrap_or(1),
+        ))
+    }
+
     fn predicted_projection_version(
         &self,
         projection_ref: &IdentityProjectionRef,
@@ -440,6 +610,13 @@ struct SharedRuntime {
 
 #[derive(Clone, Debug, Default)]
 struct RuntimeStore {
+    members: HashMap<String, StoredMember>,
+    lifecycles: HashMap<String, StoredLifecycle>,
+    trace_records: HashMap<String, StoredTraceRecord>,
+    trace_subject_index: HashMap<String, Vec<String>>,
+    trace_member_index: HashMap<String, Vec<String>>,
+    audit_trails: HashMap<String, StoredAuditTrail>,
+    audit_subject_index: HashMap<String, String>,
     member_summary_views: HashMap<String, StoredMemberSummaryView>,
     member_scope_index: HashMap<String, String>,
     projection_states: HashMap<String, StoredProjectionState>,
@@ -452,6 +629,8 @@ struct RuntimeStore {
     idempotency_key_index: HashMap<String, String>,
     stored_results: HashMap<String, StoredIdentityOperationResult>,
     stored_result_by_context: HashMap<String, String>,
+    command_accepted_envelopes: HashMap<String, IdentityCommandAcceptedResultEnvelope>,
+    command_rejected_envelopes: HashMap<String, IdentityCommandRejectedResultEnvelope>,
     consumer_receipts: HashMap<String, IdentityConsumerReceiptEnvelope>,
     handoff_callback_receipts: HashMap<String, IdentityConsumerReceiptEnvelope>,
     command_effect_summaries: HashMap<String, IdentityCommandEffectSummary>,
@@ -470,6 +649,31 @@ struct RuntimeStore {
 #[derive(Clone, Debug)]
 struct StoredMemberSummaryView {
     view: MemberSummaryView,
+    version: IdentityVersion,
+}
+
+#[derive(Clone, Debug)]
+struct StoredMember {
+    member: GlobalMember,
+    version: IdentityVersion,
+}
+
+#[derive(Clone, Debug)]
+struct StoredLifecycle {
+    member_ref: GlobalMemberRef,
+    lifecycle: GlobalLifecycleState,
+    version: IdentityVersion,
+}
+
+#[derive(Clone, Debug)]
+struct StoredTraceRecord {
+    trace: IdentityTraceRecord,
+    version: IdentityVersion,
+}
+
+#[derive(Clone, Debug)]
+struct StoredAuditTrail {
+    trail: AuditTrail,
     version: IdentityVersion,
 }
 
@@ -512,6 +716,31 @@ struct StoredJobReport {
 
 #[derive(Clone, Debug)]
 enum StagedOp {
+    SaveMember {
+        member: GlobalMember,
+        expected_version: Option<IdentityVersion>,
+    },
+    SaveLifecycle {
+        member_ref: GlobalMemberRef,
+        lifecycle: GlobalLifecycleState,
+        expected_version: Option<IdentityVersion>,
+    },
+    AppendTraceRecord {
+        trace_record: IdentityTraceRecord,
+    },
+    SaveTraceRecordState {
+        trace_record: IdentityTraceRecord,
+        expected_version: IdentityVersion,
+    },
+    SaveAuditTrail {
+        trail: AuditTrail,
+        expected_version: Option<IdentityVersion>,
+    },
+    AppendAuditEntry {
+        audit_trail_ref: AuditTrailRef,
+        entry: AuditTrailEntry,
+        expected_version: IdentityVersion,
+    },
     SaveMemberSummaryView {
         view: MemberSummaryView,
         expected_version: Option<IdentityVersion>,
@@ -546,6 +775,12 @@ enum StagedOp {
     },
     SaveStoredResult {
         result: StoredIdentityOperationResult,
+    },
+    SaveCommandAcceptedEnvelope {
+        envelope: IdentityCommandAcceptedResultEnvelope,
+    },
+    SaveCommandRejectedEnvelope {
+        envelope: IdentityCommandRejectedResultEnvelope,
     },
     SaveConsumerReceiptEnvelope {
         envelope: IdentityConsumerReceiptEnvelope,
@@ -697,6 +932,1035 @@ impl IdentityCursorAssignerPort for IdentityInMemoryRuntime {
         uow: &dyn IdentityUnitOfWork,
     ) -> Result<IdentityTruthCursor, ApplicationError> {
         uow.assign_reference_marker_cursor()
+    }
+}
+
+impl IdentityClockPort for IdentityInMemoryRuntime {
+    fn now(&self) -> Result<IdentityTimestamp, ApplicationError> {
+        let next = self
+            .shared
+            .next_truth_cursor_id
+            .fetch_add(1, Ordering::SeqCst) as i64;
+        IdentityTimestamp::from_clock(next)
+            .map_err(|error| ApplicationError::invalid_request(error.message))
+    }
+}
+
+impl IdentityIdGeneratorPort for IdentityInMemoryRuntime {
+    fn new_global_member_id(&self) -> Result<GlobalMemberId, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        GlobalMemberId::new(format!("member-{next}")).map_err(ApplicationError::from)
+    }
+
+    fn new_role_capability_summary_id(
+        &self,
+    ) -> Result<identity_contracts::refs::RoleCapabilitySummaryId, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        identity_contracts::refs::RoleCapabilitySummaryId::new(format!("summary-{next}"))
+            .map_err(ApplicationError::from)
+    }
+
+    fn new_role_capability_source_snapshot_id(
+        &self,
+    ) -> Result<identity_contracts::refs::RoleCapabilitySourceSnapshotId, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        identity_contracts::refs::RoleCapabilitySourceSnapshotId::new(format!("snapshot-{next}"))
+            .map_err(ApplicationError::from)
+    }
+
+    fn new_member_summary_view_id(
+        &self,
+    ) -> Result<identity_application::support::MemberSummaryViewId, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(identity_application::support::MemberSummaryViewId::new(
+            format!("view-{next}"),
+        ))
+    }
+
+    fn new_identity_trace_record_id(&self) -> Result<IdentityTraceRecordId, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(IdentityTraceRecordId::new(format!("trace-{next}")))
+    }
+
+    fn new_audit_trail_id(&self) -> Result<AuditTrailId, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(AuditTrailId::new(format!("audit-{next}")))
+    }
+
+    fn new_reconciliation_report_id(
+        &self,
+    ) -> Result<identity_application::support::ReconciliationReportId, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(identity_application::support::ReconciliationReportId::new(
+            format!("report-{next}"),
+        ))
+    }
+
+    fn new_identity_outbox_record_ref(&self) -> Result<IdentityOutboxRecordRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(IdentityOutboxRecordRef::new(format!("outbox-{next}")))
+    }
+
+    fn new_identity_outbox_payload_marker_ref(
+        &self,
+    ) -> Result<identity_contracts::refs::IdentityOutboxPayloadMarkerRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(
+            identity_contracts::refs::IdentityOutboxPayloadMarkerRef::new(format!(
+                "payload-{next}"
+            )),
+        )
+    }
+
+    fn new_trace_handoff_intent_ref(&self) -> Result<TraceHandoffIntentRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(TraceHandoffIntentRef::new(format!("handoff-{next}")))
+    }
+
+    fn new_handoff_receipt_ref(&self) -> Result<HandoffReceiptRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(HandoffReceiptRef::new(format!("handoff-receipt-{next}")))
+    }
+
+    fn new_handoff_issue_ref(&self) -> Result<HandoffIssueRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(HandoffIssueRef::new(identity_source_ref(
+            IdentitySourceOwner::Identity,
+            &format!("handoff-issue-{next}"),
+        )))
+    }
+
+    fn new_identity_operation_context_ref(
+        &self,
+    ) -> Result<IdentityOperationContextRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(IdentityOperationContextRef::new(format!("context-{next}")))
+    }
+
+    fn new_identity_idempotency_record_ref(
+        &self,
+    ) -> Result<IdentityIdempotencyRecordRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(IdentityIdempotencyRecordRef::new(format!(
+            "idem-record-{next}"
+        )))
+    }
+
+    fn new_identity_stored_result_ref(
+        &self,
+    ) -> Result<identity_contracts::refs::IdentityStoredResultRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(identity_contracts::refs::IdentityStoredResultRef::new(
+            format!("stored-result-{next}"),
+        ))
+    }
+
+    fn new_identity_stored_surface_marker_ref(
+        &self,
+    ) -> Result<IdentityStoredSurfaceMarkerRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(IdentityStoredSurfaceMarkerRef::new(format!(
+            "surface-{next}"
+        )))
+    }
+
+    fn new_identity_command_effect_summary_ref(
+        &self,
+    ) -> Result<IdentityCommandEffectSummaryRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(IdentityCommandEffectSummaryRef::new(format!(
+            "effect-{next}"
+        )))
+    }
+
+    fn new_identity_job_run_ref(&self) -> Result<IdentityJobRunRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(IdentityJobRunRef::new(format!("job-run-{next}")))
+    }
+
+    fn new_identity_job_report_ref(
+        &self,
+    ) -> Result<identity_contracts::refs::IdentityJobReportRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(identity_contracts::refs::IdentityJobReportRef::new(
+            format!("job-report-{next}"),
+        ))
+    }
+
+    fn new_identity_runtime_assembly_ref(
+        &self,
+    ) -> Result<identity_application::support::IdentityRuntimeAssemblyRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(
+            identity_application::support::IdentityRuntimeAssemblyRef::new(format!(
+                "runtime-{next}"
+            )),
+        )
+    }
+
+    fn new_identity_api_entry_ref(
+        &self,
+    ) -> Result<identity_application::support::IdentityApiEntryRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(identity_application::support::IdentityApiEntryRef::new(
+            format!("api-entry-{next}"),
+        ))
+    }
+
+    fn new_identity_entry_dispatch_ref(
+        &self,
+    ) -> Result<identity_application::support::IdentityEntryDispatchRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(
+            identity_application::support::IdentityEntryDispatchRef::new(format!(
+                "entry-dispatch-{next}"
+            )),
+        )
+    }
+
+    fn new_identity_worker_entry_ref(
+        &self,
+    ) -> Result<identity_application::support::IdentityWorkerEntryRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(identity_application::support::IdentityWorkerEntryRef::new(
+            format!("worker-entry-{next}"),
+        ))
+    }
+
+    fn new_identity_worker_dispatch_ref(
+        &self,
+    ) -> Result<identity_application::support::IdentityWorkerDispatchRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(
+            identity_application::support::IdentityWorkerDispatchRef::new(format!(
+                "worker-dispatch-{next}"
+            )),
+        )
+    }
+
+    fn new_identity_job_entry_ref(
+        &self,
+    ) -> Result<identity_application::support::IdentityJobEntryRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(identity_application::support::IdentityJobEntryRef::new(
+            format!("job-entry-{next}"),
+        ))
+    }
+
+    fn new_identity_job_dispatch_ref(
+        &self,
+    ) -> Result<identity_application::support::IdentityJobDispatchRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(identity_application::support::IdentityJobDispatchRef::new(
+            format!("job-dispatch-{next}"),
+        ))
+    }
+}
+
+impl IdentityOperationContextFactoryPort for IdentityInMemoryRuntime {
+    fn from_command(
+        &self,
+        operation_name: IdentityOperationName,
+        actor_ref: ActorRef,
+        request_metadata_ref: IdentityRequestMetadataRef,
+        idempotency_key: Option<IdentityIdempotencyKey>,
+        request_digest: IdentityRequestDigest,
+        trace_context_ref: Option<identity_contracts::refs::IdentityTraceContextRef>,
+        context_ref: IdentityOperationContextRef,
+        started_at: IdentityTimestamp,
+    ) -> Result<IdentityOperationContext, ApplicationError> {
+        Ok(IdentityOperationContext::from_command(
+            context_ref,
+            operation_name,
+            actor_ref,
+            request_metadata_ref,
+            idempotency_key,
+            request_digest,
+            trace_context_ref,
+            started_at,
+        ))
+    }
+
+    fn from_query(
+        &self,
+        operation_name: IdentityOperationName,
+        actor_ref: ActorRef,
+        request_metadata_ref: IdentityRequestMetadataRef,
+        request_digest: IdentityRequestDigest,
+        trace_context_ref: Option<identity_contracts::refs::IdentityTraceContextRef>,
+        context_ref: IdentityOperationContextRef,
+        started_at: IdentityTimestamp,
+    ) -> Result<IdentityOperationContext, ApplicationError> {
+        Ok(IdentityOperationContext::from_query(
+            context_ref,
+            operation_name,
+            actor_ref,
+            request_metadata_ref,
+            request_digest,
+            trace_context_ref,
+            started_at,
+        ))
+    }
+
+    fn from_inbound_event(
+        &self,
+        operation_name: IdentityOperationName,
+        actor_ref: ActorRef,
+        request_metadata_ref: IdentityRequestMetadataRef,
+        idempotency_key: IdentityIdempotencyKey,
+        request_digest: IdentityRequestDigest,
+        trace_context_ref: Option<identity_contracts::refs::IdentityTraceContextRef>,
+        source_event_ref: identity_contracts::refs::IdentitySourceEventRef,
+        context_ref: IdentityOperationContextRef,
+        started_at: IdentityTimestamp,
+    ) -> Result<IdentityOperationContext, ApplicationError> {
+        Ok(IdentityOperationContext::from_inbound_event(
+            context_ref,
+            operation_name,
+            actor_ref,
+            request_metadata_ref,
+            idempotency_key,
+            request_digest,
+            trace_context_ref,
+            source_event_ref,
+            started_at,
+        ))
+    }
+
+    fn from_job(
+        &self,
+        operation_name: IdentityOperationName,
+        actor_ref: ActorRef,
+        request_metadata_ref: IdentityRequestMetadataRef,
+        idempotency_key: IdentityIdempotencyKey,
+        request_digest: IdentityRequestDigest,
+        trace_context_ref: Option<identity_contracts::refs::IdentityTraceContextRef>,
+        job_run_ref: IdentityJobRunRef,
+        context_ref: IdentityOperationContextRef,
+        started_at: IdentityTimestamp,
+    ) -> Result<IdentityOperationContext, ApplicationError> {
+        Ok(IdentityOperationContext::from_job(
+            context_ref,
+            operation_name,
+            actor_ref,
+            request_metadata_ref,
+            idempotency_key,
+            request_digest,
+            trace_context_ref,
+            job_run_ref,
+            started_at,
+        ))
+    }
+
+    fn from_handoff_callback(
+        &self,
+        operation_name: IdentityOperationName,
+        actor_ref: ActorRef,
+        request_metadata_ref: IdentityRequestMetadataRef,
+        idempotency_key: IdentityIdempotencyKey,
+        request_digest: IdentityRequestDigest,
+        trace_context_ref: Option<identity_contracts::refs::IdentityTraceContextRef>,
+        source_event_ref: identity_contracts::refs::IdentitySourceEventRef,
+        context_ref: IdentityOperationContextRef,
+        started_at: IdentityTimestamp,
+    ) -> Result<IdentityOperationContext, ApplicationError> {
+        Ok(IdentityOperationContext::from_handoff_callback(
+            context_ref,
+            operation_name,
+            actor_ref,
+            request_metadata_ref,
+            idempotency_key,
+            request_digest,
+            trace_context_ref,
+            source_event_ref,
+            started_at,
+        ))
+    }
+}
+
+impl GlobalMemberRepository for IdentityInMemoryRuntime {
+    fn get_member_with_version(
+        &self,
+        member_ref: GlobalMemberRef,
+    ) -> Result<Option<Versioned<GlobalMember>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .members
+            .get(&member_key(&member_ref))
+            .map(|stored| Versioned {
+                value: stored.member.clone(),
+                version: stored.version,
+            }))
+    }
+
+    fn get_anchor_state(
+        &self,
+        member_ref: GlobalMemberRef,
+    ) -> Result<Option<identity_domain::member_identity::IdentityAnchorState>, ApplicationError>
+    {
+        Ok(self
+            .get_member_with_version(member_ref)?
+            .map(|versioned| versioned.value.anchor_state))
+    }
+
+    fn list_members(
+        &self,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<GlobalMemberRef>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let mut items: Vec<_> = store
+            .members
+            .values()
+            .map(|stored| IdentityVersionedRef {
+                value_ref: stored.member.member_ref.clone(),
+                version: stored.version,
+            })
+            .collect();
+        items.sort_by(|left, right| {
+            left.value_ref
+                .id()
+                .as_str()
+                .cmp(right.value_ref.id().as_str())
+        });
+        let (items, next_cursor) = paged(items, page, "member");
+        Ok(Page { items, next_cursor })
+    }
+
+    fn save_member(
+        &self,
+        member: GlobalMember,
+        expected_version: Option<IdentityVersion>,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<GlobalMemberRef>, ApplicationError> {
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveMember {
+                member: member.clone(),
+                expected_version,
+            },
+        )?;
+        Ok(IdentityVersionedRef {
+            value_ref: member.member_ref.clone(),
+            version: self.predicted_member_version(&member.member_ref)?,
+        })
+    }
+}
+
+impl GlobalLifecycleRepository for IdentityInMemoryRuntime {
+    fn get_lifecycle_with_version(
+        &self,
+        member_ref: GlobalMemberRef,
+    ) -> Result<Option<Versioned<GlobalLifecycleState>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .lifecycles
+            .get(&member_key(&member_ref))
+            .map(|stored| Versioned {
+                value: stored.lifecycle.clone(),
+                version: stored.version,
+            }))
+    }
+
+    fn list_lifecycles(
+        &self,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<GlobalMemberRef>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let mut items: Vec<_> = store
+            .lifecycles
+            .values()
+            .map(|stored| IdentityVersionedRef {
+                value_ref: stored.member_ref.clone(),
+                version: stored.version,
+            })
+            .collect();
+        items.sort_by(|left, right| {
+            left.value_ref
+                .id()
+                .as_str()
+                .cmp(right.value_ref.id().as_str())
+        });
+        let (items, next_cursor) = paged(items, page, "lifecycle");
+        Ok(Page { items, next_cursor })
+    }
+
+    fn save_lifecycle(
+        &self,
+        member_ref: GlobalMemberRef,
+        lifecycle_state: GlobalLifecycleState,
+        expected_version: Option<IdentityVersion>,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<GlobalMemberRef>, ApplicationError> {
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveLifecycle {
+                member_ref: member_ref.clone(),
+                lifecycle: lifecycle_state,
+                expected_version,
+            },
+        )?;
+        Ok(IdentityVersionedRef {
+            value_ref: member_ref.clone(),
+            version: self.predicted_lifecycle_version(&member_ref)?,
+        })
+    }
+}
+
+impl IdentityTraceRecordRepository for IdentityInMemoryRuntime {
+    fn get_trace_record(
+        &self,
+        trace_record_ref: IdentityTraceRecordRef,
+    ) -> Result<Option<Versioned<IdentityTraceRecord>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .trace_records
+            .get(trace_record_ref.as_str())
+            .map(|stored| Versioned {
+                value: stored.trace.clone(),
+                version: stored.version,
+            }))
+    }
+
+    fn list_trace_records_by_member(
+        &self,
+        member_ref: GlobalMemberRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<IdentityTraceRecordRef>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let keys = store
+            .trace_member_index
+            .get(&member_key(&member_ref))
+            .cloned()
+            .unwrap_or_default();
+        let mut items: Vec<_> = keys
+            .into_iter()
+            .filter_map(|key| store.trace_records.get(&key))
+            .map(|stored| IdentityVersionedRef {
+                value_ref: stored.trace.trace_record_ref.clone(),
+                version: stored.version,
+            })
+            .collect();
+        items.sort_by(|left, right| left.value_ref.as_str().cmp(right.value_ref.as_str()));
+        let (items, next_cursor) = paged(items, page, "trace-member");
+        Ok(Page { items, next_cursor })
+    }
+
+    fn list_trace_records_by_subject(
+        &self,
+        subject_ref: IdentityTraceSubjectRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<IdentityTraceRecordRef>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let keys = store
+            .trace_subject_index
+            .get(subject_ref.as_str())
+            .cloned()
+            .unwrap_or_default();
+        let mut items: Vec<_> = keys
+            .into_iter()
+            .filter_map(|key| store.trace_records.get(&key))
+            .map(|stored| IdentityVersionedRef {
+                value_ref: stored.trace.trace_record_ref.clone(),
+                version: stored.version,
+            })
+            .collect();
+        items.sort_by(|left, right| left.value_ref.as_str().cmp(right.value_ref.as_str()));
+        let (items, next_cursor) = paged(items, page, "trace-subject");
+        Ok(Page { items, next_cursor })
+    }
+
+    fn list_trace_records_after_cursor(
+        &self,
+        subject_ref: IdentityTraceSubjectRef,
+        after_cursor: Option<IdentityTruthCursor>,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<IdentityTraceRecordRef>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let keys = store
+            .trace_subject_index
+            .get(subject_ref.as_str())
+            .cloned()
+            .unwrap_or_default();
+        let mut items: Vec<_> = keys
+            .into_iter()
+            .filter_map(|key| store.trace_records.get(&key))
+            .filter(|stored| {
+                after_cursor
+                    .as_ref()
+                    .map(|cursor| stored.trace.source_cursor_ref.as_str() > cursor.as_str())
+                    .unwrap_or(true)
+            })
+            .map(|stored| IdentityVersionedRef {
+                value_ref: stored.trace.trace_record_ref.clone(),
+                version: stored.version,
+            })
+            .collect();
+        items.sort_by(|left, right| left.value_ref.as_str().cmp(right.value_ref.as_str()));
+        let (items, next_cursor) = paged(items, page, "trace-cursor");
+        Ok(Page { items, next_cursor })
+    }
+
+    fn list_trace_records_by_change_kind(
+        &self,
+        member_ref: GlobalMemberRef,
+        change_kind_ref: IdentityChangeKindRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<IdentityTraceRecordRef>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let keys = store
+            .trace_member_index
+            .get(&member_key(&member_ref))
+            .cloned()
+            .unwrap_or_default();
+        let mut items: Vec<_> = keys
+            .into_iter()
+            .filter_map(|key| store.trace_records.get(&key))
+            .filter(|stored| stored.trace.change_kind_ref.same_kind(&change_kind_ref))
+            .map(|stored| IdentityVersionedRef {
+                value_ref: stored.trace.trace_record_ref.clone(),
+                version: stored.version,
+            })
+            .collect();
+        items.sort_by(|left, right| left.value_ref.as_str().cmp(right.value_ref.as_str()));
+        let (items, next_cursor) = paged(items, page, "trace-kind");
+        Ok(Page { items, next_cursor })
+    }
+
+    fn append_trace_record(
+        &self,
+        trace_record: IdentityTraceRecord,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<IdentityTraceRecordRef>, ApplicationError> {
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::AppendTraceRecord {
+                trace_record: trace_record.clone(),
+            },
+        )?;
+        Ok(IdentityVersionedRef {
+            value_ref: trace_record.trace_record_ref.clone(),
+            version: self.predicted_trace_version(&trace_record.trace_record_ref)?,
+        })
+    }
+
+    fn mark_trace_superseded_by_correction(
+        &self,
+        trace_record: IdentityTraceRecord,
+        expected_version: IdentityVersion,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<IdentityTraceRecordRef>, ApplicationError> {
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveTraceRecordState {
+                trace_record: trace_record.clone(),
+                expected_version,
+            },
+        )?;
+        Ok(IdentityVersionedRef {
+            value_ref: trace_record.trace_record_ref.clone(),
+            version: IdentityVersion::new(expected_version.get() + 1),
+        })
+    }
+}
+
+impl IdentityAuditTrailRepository for IdentityInMemoryRuntime {
+    fn get_audit_trail_with_version(
+        &self,
+        audit_trail_ref: AuditTrailRef,
+    ) -> Result<Option<Versioned<AuditTrail>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .audit_trails
+            .get(audit_trail_ref.as_str())
+            .map(|stored| Versioned {
+                value: stored.trail.clone(),
+                version: stored.version,
+            }))
+    }
+
+    fn find_audit_trail_by_subject(
+        &self,
+        audit_subject_ref: IdentityAuditSubjectRef,
+    ) -> Result<Option<Versioned<AuditTrail>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let Some(key) = store.audit_subject_index.get(audit_subject_ref.as_str()) else {
+            return Ok(None);
+        };
+        Ok(store.audit_trails.get(key).map(|stored| Versioned {
+            value: stored.trail.clone(),
+            version: stored.version,
+        }))
+    }
+
+    fn list_audit_entries(
+        &self,
+        audit_trail_ref: AuditTrailRef,
+        audit_scope_ref: AuditScopeRef,
+        _cursor_ref: Option<AuditCursorRef>,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<AuditTrailEntry>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let Some(stored) = store.audit_trails.get(audit_trail_ref.as_str()) else {
+            return Ok(Page {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        };
+        let filtered = stored.trail.filter_by_scope(&audit_scope_ref).entries;
+        let (items, next_cursor) = paged(filtered, page, "audit-entry");
+        Ok(Page { items, next_cursor })
+    }
+
+    fn save_audit_trail(
+        &self,
+        audit_trail: AuditTrail,
+        expected_version: Option<IdentityVersion>,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<AuditTrailRef>, ApplicationError> {
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveAuditTrail {
+                trail: audit_trail.clone(),
+                expected_version,
+            },
+        )?;
+        Ok(IdentityVersionedRef {
+            value_ref: audit_trail.audit_trail_ref.clone(),
+            version: self.predicted_audit_version(&audit_trail.audit_trail_ref)?,
+        })
+    }
+
+    fn append_audit_entry(
+        &self,
+        audit_trail_ref: AuditTrailRef,
+        entry: AuditTrailEntry,
+        expected_version: IdentityVersion,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<AuditTrailRef>, ApplicationError> {
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::AppendAuditEntry {
+                audit_trail_ref: audit_trail_ref.clone(),
+                entry,
+                expected_version,
+            },
+        )?;
+        Ok(IdentityVersionedRef {
+            value_ref: audit_trail_ref,
+            version: IdentityVersion::new(expected_version.get() + 1),
+        })
+    }
+}
+
+impl IdentityTruthChangeSubjectMapper for IdentityInMemoryRuntime {
+    fn member_subjects(&self, member_ref: GlobalMemberRef) -> IdentityAcceptedSubjectRefs {
+        DefaultIdentityTruthChangeSubjectMapper.member_subjects(member_ref)
+    }
+
+    fn role_capability_subjects(
+        &self,
+        summary_ref: identity_contracts::refs::RoleCapabilitySummaryRef,
+    ) -> IdentityAcceptedSubjectRefs {
+        DefaultIdentityTruthChangeSubjectMapper.role_capability_subjects(summary_ref)
+    }
+
+    fn role_capability_source_snapshot_subjects(
+        &self,
+        snapshot_ref: identity_contracts::refs::RoleCapabilitySourceSnapshotRef,
+    ) -> IdentityAcceptedSubjectRefs {
+        DefaultIdentityTruthChangeSubjectMapper
+            .role_capability_source_snapshot_subjects(snapshot_ref)
+    }
+
+    fn career_record_subjects(
+        &self,
+        record_ref: identity_contracts::refs::CareerRecordRef,
+    ) -> IdentityAcceptedSubjectRefs {
+        DefaultIdentityTruthChangeSubjectMapper.career_record_subjects(record_ref)
+    }
+
+    fn memory_reference_subjects(
+        &self,
+        reference_ref: identity_contracts::refs::MemoryReferenceRef,
+    ) -> IdentityAcceptedSubjectRefs {
+        DefaultIdentityTruthChangeSubjectMapper.memory_reference_subjects(reference_ref)
+    }
+
+    fn outbox_record_subjects(
+        &self,
+        outbox_ref: IdentityOutboxRecordRef,
+    ) -> IdentityAcceptedSubjectRefs {
+        DefaultIdentityTruthChangeSubjectMapper.outbox_record_subjects(outbox_ref)
+    }
+
+    fn handoff_intent_subjects(
+        &self,
+        intent_ref: TraceHandoffIntentRef,
+    ) -> IdentityAcceptedSubjectRefs {
+        DefaultIdentityTruthChangeSubjectMapper.handoff_intent_subjects(intent_ref)
+    }
+}
+
+impl IdentityAcceptedAuditTrailMarkerMapper for IdentityInMemoryRuntime {
+    fn accepted_command_audit_markers(
+        &self,
+        context: &IdentityOperationContext,
+        subjects: &IdentityAcceptedSubjectRefs,
+        change_kind_ref: &IdentityChangeKindRef,
+        source_cursor_ref: &IdentityTruthCursor,
+    ) -> IdentityAcceptedAuditTrailMarkers {
+        DefaultIdentityAcceptedAuditTrailMarkerMapper.accepted_command_audit_markers(
+            context,
+            subjects,
+            change_kind_ref,
+            source_cursor_ref,
+        )
+    }
+}
+
+impl IdentityExternalSourceResolverPort for IdentityInMemoryRuntime {
+    fn resolve_governance_basis(
+        &self,
+        basis_ref: GovernanceBasisRef,
+        risk_ref: Option<LifecycleRiskRef>,
+    ) -> Result<GovernanceBasisSummary, ApplicationError> {
+        let state = if basis_ref.external_ref.as_str().contains("unavailable") {
+            GovernanceBasisState::Unavailable
+        } else if basis_ref.external_ref.as_str().contains("stale") {
+            GovernanceBasisState::Stale
+        } else if basis_ref.external_ref.as_str().contains("invalid") {
+            GovernanceBasisState::InvalidForAction
+        } else if basis_ref.external_ref.as_str().contains("missing") {
+            GovernanceBasisState::NotFound
+        } else {
+            GovernanceBasisState::Valid
+        };
+        Ok(GovernanceBasisSummary::from_resolver(
+            basis_ref, state, risk_ref,
+        ))
+    }
+
+    fn resolve_role_capability_source(
+        &self,
+        source_ref: identity_contracts::refs::RoleCapabilitySourceRef,
+    ) -> Result<identity_application::ports::RoleCapabilitySourceResolution, ApplicationError> {
+        Ok(
+            identity_application::ports::RoleCapabilitySourceResolution {
+                source_ref: source_ref.clone(),
+                source_state:
+                    identity_domain::role_capability::RoleCapabilitySourceStateKind::SourceResolved,
+                source_version_ref: Some(
+                    identity_contracts::refs::RoleCapabilitySourceVersionRef::new(
+                        source_ref.clone(),
+                        "v1",
+                    )?,
+                ),
+                safe_summary_ref: Some(
+                    identity_contracts::refs::RoleCapabilitySafeSummaryRef::new(
+                        source_ref.clone(),
+                        "safe-summary-1",
+                    )?,
+                ),
+                evidence_refs: Vec::new(),
+                material_marker: identity_contracts::refs::RoleCapabilityChangeMaterialMarker::new(
+                    identity_contracts::refs::RoleCapabilityChangeMaterialKind::SafeSummaryMarker,
+                    Some(source_ref.source_ref.clone()),
+                ),
+            },
+        )
+    }
+
+    fn resolve_capability_evidence(
+        &self,
+        evidence_ref: identity_contracts::refs::CapabilityEvidenceRef,
+    ) -> Result<identity_application::ports::CapabilityEvidenceResolution, ApplicationError> {
+        Ok(identity_application::ports::CapabilityEvidenceResolution {
+            evidence_ref: evidence_ref.clone(),
+            evidence_state: ReferenceResolutionStateKind::Resolved,
+            safe_summary_ref: Some(
+                identity_contracts::refs::ExternalReferenceSafeSummaryRef::new(
+                    ExternalReferenceRef::new(
+                        ExternalReferenceKind::MethodSource,
+                        evidence_ref.source_ref.clone(),
+                    ),
+                    evidence_ref.source_ref.clone(),
+                ),
+            ),
+            source_version_ref: Some(ExternalSourceVersionRef::new(
+                evidence_ref.source_ref.clone(),
+            )),
+        })
+    }
+
+    fn resolve_work_participation(
+        &self,
+        _source_ref: identity_contracts::refs::WorkSourceRef,
+    ) -> Result<identity_contracts::refs::WorkParticipationSourceSummary, ApplicationError> {
+        Err(ApplicationError::consistency_defect(
+            "work participation resolver is not implemented in this fake runtime",
+        ))
+    }
+
+    fn resolve_memory_reference_source(
+        &self,
+        source_ref: identity_contracts::refs::MemoryReferenceSourceRef,
+    ) -> Result<identity_contracts::refs::MemoryReferenceSourceSummary, ApplicationError> {
+        Ok(
+            identity_contracts::refs::MemoryReferenceSourceSummary::from_resolver(
+                source_ref,
+                None,
+                None,
+                None,
+                None,
+                identity_contracts::refs::MemoryReferenceSourceState::Trusted,
+            ),
+        )
+    }
+
+    fn resolve_archive_handoff_source(
+        &self,
+        handoff_ref: identity_contracts::refs::ArchiveHandoffRef,
+    ) -> Result<identity_contracts::refs::MemoryReferenceSourceSummary, ApplicationError> {
+        let source_ref = identity_contracts::refs::MemoryReferenceSourceRef::new(
+            identity_contracts::refs::MemoryReferenceSourceKind::ArchiveHandoffResult,
+            handoff_ref.source_ref.clone(),
+        )?;
+        Ok(
+            identity_contracts::refs::MemoryReferenceSourceSummary::from_resolver(
+                source_ref,
+                None,
+                None,
+                Some(handoff_ref),
+                None,
+                identity_contracts::refs::MemoryReferenceSourceState::HandoffResultAccepted,
+            ),
+        )
     }
 }
 
@@ -1741,6 +3005,35 @@ impl IdentityStoredResultRepository for IdentityInMemoryRuntime {
         Ok(result.stored_result_ref)
     }
 
+    fn get_command_accepted_result(
+        &self,
+        stored_result_ref: identity_contracts::refs::IdentityStoredResultRef,
+    ) -> Result<Option<IdentityCommandAcceptedResultEnvelope>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .command_accepted_envelopes
+            .get(stored_result_ref.as_str())
+            .cloned())
+    }
+
+    fn save_command_accepted_envelope(
+        &self,
+        envelope: IdentityCommandAcceptedResultEnvelope,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<identity_contracts::refs::IdentityStoredResultRef, ApplicationError> {
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveCommandAcceptedEnvelope {
+                envelope: envelope.clone(),
+            },
+        )?;
+        Ok(envelope.stored_result_ref)
+    }
+
     fn save_command_rejected_result(
         &self,
         result: StoredIdentityOperationResult,
@@ -1754,6 +3047,35 @@ impl IdentityStoredResultRepository for IdentityInMemoryRuntime {
             },
         )?;
         Ok(result.stored_result_ref)
+    }
+
+    fn get_command_rejected_result(
+        &self,
+        stored_result_ref: identity_contracts::refs::IdentityStoredResultRef,
+    ) -> Result<Option<IdentityCommandRejectedResultEnvelope>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .command_rejected_envelopes
+            .get(stored_result_ref.as_str())
+            .cloned())
+    }
+
+    fn save_command_rejected_envelope(
+        &self,
+        envelope: IdentityCommandRejectedResultEnvelope,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<identity_contracts::refs::IdentityStoredResultRef, ApplicationError> {
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveCommandRejectedEnvelope {
+                envelope: envelope.clone(),
+            },
+        )?;
+        Ok(envelope.stored_result_ref)
     }
 
     fn save_consumer_receipt_result(
@@ -2070,6 +3392,31 @@ fn apply_op(
     op: StagedOp,
 ) -> Result<(), ApplicationError> {
     match op {
+        StagedOp::SaveMember {
+            member,
+            expected_version,
+        } => apply_save_member(store, member, expected_version),
+        StagedOp::SaveLifecycle {
+            member_ref,
+            lifecycle,
+            expected_version,
+        } => apply_save_lifecycle(store, member_ref, lifecycle, expected_version),
+        StagedOp::AppendTraceRecord { trace_record } => {
+            apply_append_trace_record(store, trace_record)
+        }
+        StagedOp::SaveTraceRecordState {
+            trace_record,
+            expected_version,
+        } => apply_save_trace_record_state(store, trace_record, expected_version),
+        StagedOp::SaveAuditTrail {
+            trail,
+            expected_version,
+        } => apply_save_audit_trail(store, trail, expected_version),
+        StagedOp::AppendAuditEntry {
+            audit_trail_ref,
+            entry,
+            expected_version,
+        } => apply_append_audit_entry(store, audit_trail_ref, entry, expected_version),
         StagedOp::SaveMemberSummaryView {
             view,
             expected_version,
@@ -2103,6 +3450,12 @@ fn apply_op(
             expected_version,
         } => apply_save_idempotency_terminal(store, record, expected_version),
         StagedOp::SaveStoredResult { result } => apply_save_stored_result(store, result),
+        StagedOp::SaveCommandAcceptedEnvelope { envelope } => {
+            apply_save_command_accepted_envelope(store, envelope)
+        }
+        StagedOp::SaveCommandRejectedEnvelope { envelope } => {
+            apply_save_command_rejected_envelope(store, envelope)
+        }
         StagedOp::SaveConsumerReceiptEnvelope { envelope } => {
             apply_save_consumer_receipt(store, envelope)
         }
@@ -2115,6 +3468,209 @@ fn apply_op(
             expected_version,
         } => apply_save_job_report(store, report, expected_version),
     }
+}
+
+fn apply_save_member(
+    store: &mut RuntimeStore,
+    member: GlobalMember,
+    expected_version: Option<IdentityVersion>,
+) -> Result<(), ApplicationError> {
+    let key = member_key(&member.member_ref);
+    match (store.members.get(&key), expected_version) {
+        (None, None) => {
+            store.members.insert(
+                key,
+                StoredMember {
+                    member,
+                    version: IdentityVersion::new(1),
+                },
+            );
+            Ok(())
+        }
+        (Some(existing), Some(expected)) if existing.version == expected => {
+            store.members.insert(
+                key,
+                StoredMember {
+                    member,
+                    version: IdentityVersion::new(expected.get() + 1),
+                },
+            );
+            Ok(())
+        }
+        (None, Some(_)) => Err(ApplicationError::not_found(
+            "member truth not found for update",
+        )),
+        _ => Err(ApplicationError::optimistic_version_conflict(
+            "member truth version mismatch",
+        )),
+    }
+}
+
+fn apply_save_lifecycle(
+    store: &mut RuntimeStore,
+    member_ref: GlobalMemberRef,
+    lifecycle: GlobalLifecycleState,
+    expected_version: Option<IdentityVersion>,
+) -> Result<(), ApplicationError> {
+    let key = member_key(&member_ref);
+    match (store.lifecycles.get(&key), expected_version) {
+        (None, None) => {
+            store.lifecycles.insert(
+                key,
+                StoredLifecycle {
+                    member_ref,
+                    lifecycle,
+                    version: IdentityVersion::new(1),
+                },
+            );
+            Ok(())
+        }
+        (Some(existing), Some(expected)) if existing.version == expected => {
+            store.lifecycles.insert(
+                key,
+                StoredLifecycle {
+                    member_ref,
+                    lifecycle,
+                    version: IdentityVersion::new(expected.get() + 1),
+                },
+            );
+            Ok(())
+        }
+        (None, Some(_)) => Err(ApplicationError::not_found(
+            "lifecycle truth not found for update",
+        )),
+        _ => Err(ApplicationError::optimistic_version_conflict(
+            "lifecycle truth version mismatch",
+        )),
+    }
+}
+
+fn apply_append_trace_record(
+    store: &mut RuntimeStore,
+    trace_record: IdentityTraceRecord,
+) -> Result<(), ApplicationError> {
+    let key = trace_record.trace_record_ref.as_str().to_owned();
+    if store.trace_records.contains_key(&key) {
+        return Err(ApplicationError::new(
+            ApplicationErrorKind::FormalUniqueConflict,
+            "trace record already exists",
+        ));
+    }
+    store
+        .trace_subject_index
+        .entry(trace_record.subject_ref.as_str().to_owned())
+        .or_default()
+        .push(key.clone());
+    store
+        .trace_member_index
+        .entry(member_key(&trace_record.member_ref))
+        .or_default()
+        .push(key.clone());
+    store.trace_records.insert(
+        key,
+        StoredTraceRecord {
+            trace: trace_record,
+            version: IdentityVersion::new(1),
+        },
+    );
+    Ok(())
+}
+
+fn apply_save_trace_record_state(
+    store: &mut RuntimeStore,
+    trace_record: IdentityTraceRecord,
+    expected_version: IdentityVersion,
+) -> Result<(), ApplicationError> {
+    let key = trace_record.trace_record_ref.as_str().to_owned();
+    let Some(existing) = store.trace_records.get(&key) else {
+        return Err(ApplicationError::not_found(
+            "trace record not found for update",
+        ));
+    };
+    if existing.version != expected_version {
+        return Err(ApplicationError::optimistic_version_conflict(
+            "trace record version mismatch",
+        ));
+    }
+    store.trace_records.insert(
+        key,
+        StoredTraceRecord {
+            trace: trace_record,
+            version: IdentityVersion::new(expected_version.get() + 1),
+        },
+    );
+    Ok(())
+}
+
+fn apply_save_audit_trail(
+    store: &mut RuntimeStore,
+    trail: AuditTrail,
+    expected_version: Option<IdentityVersion>,
+) -> Result<(), ApplicationError> {
+    let key = trail.audit_trail_ref.as_str().to_owned();
+    match (store.audit_trails.get(&key), expected_version) {
+        (None, None) => {
+            store
+                .audit_subject_index
+                .insert(trail.audit_subject_ref.as_str().to_owned(), key.clone());
+            store.audit_trails.insert(
+                key,
+                StoredAuditTrail {
+                    trail,
+                    version: IdentityVersion::new(1),
+                },
+            );
+            Ok(())
+        }
+        (Some(existing), Some(expected)) if existing.version == expected => {
+            store
+                .audit_subject_index
+                .insert(trail.audit_subject_ref.as_str().to_owned(), key.clone());
+            store.audit_trails.insert(
+                key,
+                StoredAuditTrail {
+                    trail,
+                    version: IdentityVersion::new(expected.get() + 1),
+                },
+            );
+            Ok(())
+        }
+        (None, Some(_)) => Err(ApplicationError::not_found(
+            "audit trail not found for update",
+        )),
+        _ => Err(ApplicationError::optimistic_version_conflict(
+            "audit trail version mismatch",
+        )),
+    }
+}
+
+fn apply_append_audit_entry(
+    store: &mut RuntimeStore,
+    audit_trail_ref: AuditTrailRef,
+    entry: AuditTrailEntry,
+    expected_version: IdentityVersion,
+) -> Result<(), ApplicationError> {
+    let key = audit_trail_ref.as_str().to_owned();
+    let Some(existing) = store.audit_trails.get(&key) else {
+        return Err(ApplicationError::not_found(
+            "audit trail not found for append",
+        ));
+    };
+    if existing.version != expected_version {
+        return Err(ApplicationError::optimistic_version_conflict(
+            "audit trail version mismatch",
+        ));
+    }
+    let mut next = existing.trail.clone();
+    next.entries.push(entry);
+    store.audit_trails.insert(
+        key,
+        StoredAuditTrail {
+            trail: next,
+            version: IdentityVersion::new(expected_version.get() + 1),
+        },
+    );
+    Ok(())
 }
 
 fn apply_save_member_summary_view(
@@ -2503,6 +4059,46 @@ fn apply_save_stored_result(
         stored_result_ref.clone(),
     );
     store.stored_results.insert(stored_result_ref, result);
+    Ok(())
+}
+
+fn apply_save_command_accepted_envelope(
+    store: &mut RuntimeStore,
+    envelope: IdentityCommandAcceptedResultEnvelope,
+) -> Result<(), ApplicationError> {
+    let stored_result_ref = envelope.stored_result_ref.as_str().to_owned();
+    if store
+        .command_accepted_envelopes
+        .contains_key(&stored_result_ref)
+    {
+        return Err(ApplicationError::new(
+            ApplicationErrorKind::FormalUniqueConflict,
+            "command accepted envelope already exists",
+        ));
+    }
+    store
+        .command_accepted_envelopes
+        .insert(stored_result_ref, envelope);
+    Ok(())
+}
+
+fn apply_save_command_rejected_envelope(
+    store: &mut RuntimeStore,
+    envelope: IdentityCommandRejectedResultEnvelope,
+) -> Result<(), ApplicationError> {
+    let stored_result_ref = envelope.stored_result_ref.as_str().to_owned();
+    if store
+        .command_rejected_envelopes
+        .contains_key(&stored_result_ref)
+    {
+        return Err(ApplicationError::new(
+            ApplicationErrorKind::FormalUniqueConflict,
+            "command rejected envelope already exists",
+        ));
+    }
+    store
+        .command_rejected_envelopes
+        .insert(stored_result_ref, envelope);
     Ok(())
 }
 
@@ -3010,18 +4606,26 @@ fn identity_source_ref(owner: IdentitySourceOwner, token: &str) -> IdentitySourc
 #[cfg(test)]
 mod tests {
     use core_contracts::actor::{ActorKind, ActorRef};
+    use identity_application::command::{IdentityCommandService, IdentityCommandServiceDeps};
+    use identity_contracts::commands::{
+        EstablishGlobalMemberRequest, IdentityCommandOutcome, IdentityCommandRequest,
+        UpdateGlobalLifecycleStateRequest,
+    };
     use identity_contracts::events::{IdentityConsumerOutcome, IdentityConsumerReceipt};
+    use identity_contracts::metadata::{IdentityCommandMetadata, IdentityRequestDigestMarker};
     use identity_contracts::protocol::{
-        IdentityDigestAlgorithmMarkerRef, IdentityInboundConsumerName, IdentityJobName,
-        IdentityProtocolSchemaVersionRef,
+        IdentityCommandName, IdentityDigestAlgorithmMarkerRef, IdentityInboundConsumerName,
+        IdentityJobName, IdentityProtocolSchemaVersionRef,
     };
     use identity_contracts::receipts::MaintenanceIssueRef;
     use identity_contracts::refs::{
-        ExternalReferenceSafeSummaryRef, ExternalSourceVersionRef, HandoffAttemptRef,
-        IdentityCanonicalRequestMarkerRef, IdentityChangeKind, IdentityConsumerReceiptRef,
-        IdentityJobReportRef, IdentityJobRunRef, IdentityJobScopeMarkerRef,
-        IdentityOperationChannel, IdentityOutboxPayloadMarkerRef, IdentityRequestDigestValue,
-        IdentityStoredResultRef, IdentityTimestamp, TopicKeyRef,
+        ExternalReferenceSafeSummaryRef, ExternalSourceVersionRef,
+        GlobalLifecycleStateKind as PublicLifecycleStateKind, HandoffAttemptRef,
+        IdentityApiRequestMarkerRef, IdentityCanonicalRequestMarkerRef, IdentityChangeKind,
+        IdentityConsumerReceiptRef, IdentityJobReportRef, IdentityJobRunRef,
+        IdentityJobScopeMarkerRef, IdentityOperationChannel, IdentityOutboxPayloadMarkerRef,
+        IdentityRequestDigestValue, IdentityStoredResultRef, IdentityTimestamp,
+        LifecycleReasonKind, LifecycleReasonRef, TopicKeyRef,
     };
     use identity_contracts::views::{
         IdentityReadMaterialKind, IdentityReadMaterialMarker, MemberSummarySliceKind,
@@ -3171,6 +4775,135 @@ mod tests {
             IdentityRequestDigestValue::new(format!("digest-{token}")),
             IdentityProtocolSchemaVersionRef::new("identity.command.v1"),
             IdentityDigestAlgorithmMarkerRef::new("sha256-v1"),
+        )
+    }
+
+    fn request_digest_marker(token: &str) -> IdentityRequestDigestMarker {
+        IdentityRequestDigestMarker {
+            canonical_marker_ref: IdentityCanonicalRequestMarkerRef::new(format!(
+                "canonical-{token}"
+            )),
+            digest_value: IdentityRequestDigestValue::new(format!("digest-{token}")),
+            schema_version_ref: IdentityProtocolSchemaVersionRef::new("identity.command.v1"),
+            algorithm_marker_ref: IdentityDigestAlgorithmMarkerRef::new("sha256-v1"),
+        }
+    }
+
+    fn lifecycle_reason(token: &str, kind: LifecycleReasonKind) -> LifecycleReasonRef {
+        LifecycleReasonRef::new(
+            kind,
+            identity_source_ref(IdentitySourceOwner::Identity, token),
+        )
+        .expect("lifecycle reason")
+    }
+
+    fn command_service<'a>(runtime: &'a IdentityInMemoryRuntime) -> IdentityCommandService<'a> {
+        IdentityCommandService::new(IdentityCommandServiceDeps {
+            unit_of_work_manager: runtime,
+            clock: runtime,
+            id_generator: runtime,
+            cursor_assigner: runtime,
+            operation_context_factory: runtime,
+            idempotency_repository: runtime,
+            stored_result_repository: runtime,
+            effect_summary_repository: runtime,
+            truth_change_subject_mapper: runtime,
+            accepted_audit_trail_marker_mapper: runtime,
+            member_repository: runtime,
+            lifecycle_repository: runtime,
+            trace_record_repository: runtime,
+            audit_trail_repository: runtime,
+            outbox_repository: runtime,
+            projection_repository: runtime,
+            external_source_resolver: runtime,
+        })
+    }
+
+    fn establish_request(
+        token: &str,
+        requested_member_ref: Option<GlobalMemberRef>,
+    ) -> IdentityCommandRequest<EstablishGlobalMemberRequest> {
+        IdentityCommandRequest {
+            actor_ref: ActorRef::new("actor-1", ActorKind::Human),
+            command_name: IdentityCommandName::new("EstablishGlobalMember"),
+            metadata: IdentityCommandMetadata {
+                idempotency_key: format!("idem-{token}").into(),
+                request_marker_ref: IdentityApiRequestMarkerRef::new(format!("request-{token}")),
+                schema_version_ref: IdentityProtocolSchemaVersionRef::new("identity.command.v1"),
+                trace_context_ref: None,
+            },
+            digest: request_digest_marker(token),
+            body: EstablishGlobalMemberRequest {
+                requested_member_ref,
+                source_ref: identity_source_ref(IdentitySourceOwner::Identity, "member-source-1"),
+                anchor_reason_ref: None,
+                initial_lifecycle_reason_ref: lifecycle_reason(
+                    "member-source-1",
+                    LifecycleReasonKind::InitialProvisioned,
+                ),
+            },
+        }
+    }
+
+    fn establish_context(token: &str) -> IdentityOperationContext {
+        IdentityOperationContext::from_command(
+            IdentityOperationContextRef::new(format!("context-establish-{token}")),
+            IdentityOperationName::new("EstablishGlobalMember"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            identity_application::support::IdentityRequestMetadataRef::new(format!(
+                "metadata-establish-{token}"
+            )),
+            Some(IdentityIdempotencyKey::new(format!("idem-{token}"))),
+            request_digest(token),
+            None,
+            timestamp(1),
+        )
+    }
+
+    fn update_lifecycle_request(
+        token: &str,
+        member_ref: GlobalMemberRef,
+        target_state: PublicLifecycleStateKind,
+    ) -> IdentityCommandRequest<UpdateGlobalLifecycleStateRequest> {
+        IdentityCommandRequest {
+            actor_ref: ActorRef::new("actor-1", ActorKind::Human),
+            command_name: IdentityCommandName::new("UpdateGlobalLifecycleState"),
+            metadata: IdentityCommandMetadata {
+                idempotency_key: format!("idem-lifecycle-{token}").into(),
+                request_marker_ref: IdentityApiRequestMarkerRef::new(format!(
+                    "request-lifecycle-{token}"
+                )),
+                schema_version_ref: IdentityProtocolSchemaVersionRef::new("identity.command.v1"),
+                trace_context_ref: None,
+            },
+            digest: request_digest_marker(&format!("lifecycle-{token}")),
+            body: UpdateGlobalLifecycleStateRequest {
+                member_ref,
+                target_state,
+                reason_ref: lifecycle_reason(
+                    "lifecycle-source-1",
+                    LifecycleReasonKind::ManualPause,
+                ),
+                basis_ref: None,
+                action_risk_ref: None,
+            },
+        }
+    }
+
+    fn update_lifecycle_context(token: &str) -> IdentityOperationContext {
+        IdentityOperationContext::from_command(
+            IdentityOperationContextRef::new(format!("context-lifecycle-{token}")),
+            IdentityOperationName::new("UpdateGlobalLifecycleState"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            identity_application::support::IdentityRequestMetadataRef::new(format!(
+                "metadata-lifecycle-{token}"
+            )),
+            Some(IdentityIdempotencyKey::new(format!(
+                "idem-lifecycle-{token}"
+            ))),
+            request_digest(&format!("lifecycle-{token}")),
+            None,
+            timestamp(1),
         )
     }
 
@@ -3967,5 +5700,133 @@ mod tests {
             .expect("resolve")
             .expect("summary access");
         assert_eq!(access.scope_ref, scope_ref("scope-a"));
+    }
+
+    #[test]
+    fn establish_member_persists_member_lifecycle_trace_audit_and_replay() {
+        let runtime = IdentityInMemoryRuntime::builder().build();
+        let service = command_service(&runtime);
+        let requested_member = member_ref("member-establish-1");
+
+        let accepted = service
+            .establish_global_member(
+                establish_request("establish-1", Some(requested_member.clone())),
+                establish_context("establish-1"),
+            )
+            .expect("accepted");
+        let accepted_response = match accepted {
+            IdentityCommandOutcome::Accepted(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(accepted_response.result.member_ref, requested_member);
+        assert_eq!(
+            accepted_response.result.lifecycle_state_kind,
+            PublicLifecycleStateKind::Available
+        );
+        assert_eq!(accepted_response.effect.trace_refs.len(), 1);
+        assert_eq!(accepted_response.effect.audit_subject_refs.len(), 1);
+        assert_eq!(accepted_response.effect.outbox_refs.len(), 2);
+
+        let persisted_member = runtime
+            .get_member_with_version(requested_member.clone())
+            .expect("load member")
+            .expect("member");
+        assert_eq!(persisted_member.value.member_ref, requested_member);
+        let persisted_lifecycle = runtime
+            .get_lifecycle_with_version(member_ref("member-establish-1"))
+            .expect("load lifecycle")
+            .expect("lifecycle");
+        assert_eq!(
+            persisted_lifecycle.value.state_kind,
+            identity_domain::lifecycle::GlobalLifecycleStateKind::Available
+        );
+        let audit = runtime
+            .find_audit_trail_by_subject(accepted_response.effect.audit_subject_refs[0].clone())
+            .expect("find audit")
+            .expect("audit");
+        assert_eq!(audit.value.entries.len(), 1);
+
+        let replay = service
+            .establish_global_member(
+                establish_request("establish-1", Some(member_ref("member-establish-1"))),
+                establish_context("establish-1"),
+            )
+            .expect("replay");
+        let replay_response = match replay {
+            IdentityCommandOutcome::Accepted(response) => response,
+            other => panic!("unexpected replay outcome: {other:?}"),
+        };
+        assert_eq!(replay_response.result_ref, accepted_response.result_ref);
+        assert_eq!(replay_response.effect, accepted_response.effect);
+    }
+
+    #[test]
+    fn update_lifecycle_uses_member_key_and_replays_from_stored_envelope() {
+        let member = GlobalMember::establish(
+            member_ref("member-lifecycle-1"),
+            identity_source_ref(IdentitySourceOwner::Identity, "member-source-1"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let lifecycle = identity_domain::lifecycle::GlobalLifecycleState::initial_available(
+            ActorRef::new("actor-1", ActorKind::Human),
+            lifecycle_reason("member-source-1", LifecycleReasonKind::InitialProvisioned),
+            timestamp(1),
+        );
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member, IdentityVersion::new(1))
+            .seed_lifecycle(
+                member_ref("member-lifecycle-1"),
+                lifecycle,
+                IdentityVersion::new(1),
+            )
+            .build();
+        let service = command_service(&runtime);
+
+        let accepted = service
+            .update_global_lifecycle_state(
+                update_lifecycle_request(
+                    "pause-1",
+                    member_ref("member-lifecycle-1"),
+                    PublicLifecycleStateKind::Paused,
+                ),
+                update_lifecycle_context("pause-1"),
+            )
+            .expect("accepted");
+        let accepted_response = match accepted {
+            IdentityCommandOutcome::Accepted(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(
+            accepted_response.result.lifecycle_state_kind,
+            PublicLifecycleStateKind::Paused
+        );
+
+        let persisted = runtime
+            .get_lifecycle_with_version(member_ref("member-lifecycle-1"))
+            .expect("load lifecycle")
+            .expect("lifecycle");
+        assert_eq!(persisted.version, IdentityVersion::new(2));
+        assert_eq!(
+            persisted.value.state_kind,
+            identity_domain::lifecycle::GlobalLifecycleStateKind::Paused
+        );
+
+        let replay = service
+            .update_global_lifecycle_state(
+                update_lifecycle_request(
+                    "pause-1",
+                    member_ref("member-lifecycle-1"),
+                    PublicLifecycleStateKind::Paused,
+                ),
+                update_lifecycle_context("pause-1"),
+            )
+            .expect("replay");
+        let replay_response = match replay {
+            IdentityCommandOutcome::Accepted(response) => response,
+            other => panic!("unexpected replay outcome: {other:?}"),
+        };
+        assert_eq!(replay_response.result_ref, accepted_response.result_ref);
     }
 }

@@ -42,9 +42,11 @@ use identity_domain::trace::IdentityTraceRecord;
 
 use crate::errors::ApplicationError;
 use crate::support::{
-    AuditTrailId, IdempotencyReserveOutcome, IdentityAcceptedSubjectRefs,
-    IdentityAdapterAvailability, IdentityAdapterModeRef, IdentityAdapterRef, IdentityApiEntryRef,
-    IdentityApiRouteRef, IdentityCommandEffectSummaryRef, IdentityConsumerReceiptEnvelope,
+    AuditTrailId, IdempotencyReserveOutcome, IdentityAcceptedAuditTrailMarkers,
+    IdentityAcceptedSubjectRefs, IdentityAdapterAvailability, IdentityAdapterModeRef,
+    IdentityAdapterRef, IdentityApiEntryRef, IdentityApiRouteRef,
+    IdentityCommandAcceptedResultEnvelope, IdentityCommandEffectSummaryRef,
+    IdentityCommandRejectedResultEnvelope, IdentityConsumerReceiptEnvelope,
     IdentityDispatchTargetRef, IdentityEntryDispatchRef, IdentityEntrySurfaceKind,
     IdentityIdempotencyKey, IdentityIdempotencyRecordRef, IdentityJobDispatchRef,
     IdentityJobEntryRef, IdentityOperationContext, IdentityOperationContextRef,
@@ -317,6 +319,18 @@ pub trait IdentityTruthChangeSubjectMapper {
     ) -> IdentityAcceptedSubjectRefs;
 }
 
+/// Maps accepted write context into body-free audit scope and visibility markers.
+pub trait IdentityAcceptedAuditTrailMarkerMapper {
+    /// Returns the accepted audit markers for one accepted write transaction.
+    fn accepted_command_audit_markers(
+        &self,
+        context: &IdentityOperationContext,
+        subjects: &IdentityAcceptedSubjectRefs,
+        change_kind_ref: &IdentityChangeKindRef,
+        source_cursor_ref: &IdentityTruthCursor,
+    ) -> IdentityAcceptedAuditTrailMarkers;
+}
+
 /// Maps body-free identity marker refs into trace subject refs.
 pub trait IdentityMarkerSubjectMapper {
     /// Returns the trace subject for a source marker.
@@ -502,6 +516,7 @@ pub trait GlobalLifecycleRepository {
     /// Saves lifecycle state using an optional expected version.
     fn save_lifecycle(
         &self,
+        member_ref: GlobalMemberRef,
         lifecycle_state: GlobalLifecycleState,
         expected_version: Option<IdentityVersion>,
         uow: &dyn IdentityUnitOfWork,
@@ -1279,10 +1294,36 @@ pub trait IdentityStoredResultRepository {
         uow: &dyn IdentityUnitOfWork,
     ) -> Result<IdentityStoredResultRef, ApplicationError>;
 
+    /// Loads a typed accepted command envelope by stored result ref.
+    fn get_command_accepted_result(
+        &self,
+        stored_result_ref: IdentityStoredResultRef,
+    ) -> Result<Option<IdentityCommandAcceptedResultEnvelope>, ApplicationError>;
+
+    /// Saves a typed accepted command envelope.
+    fn save_command_accepted_envelope(
+        &self,
+        envelope: IdentityCommandAcceptedResultEnvelope,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityStoredResultRef, ApplicationError>;
+
     /// Saves a stored rejected command result shell.
     fn save_command_rejected_result(
         &self,
         result: StoredIdentityOperationResult,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityStoredResultRef, ApplicationError>;
+
+    /// Loads a typed rejected command envelope by stored result ref.
+    fn get_command_rejected_result(
+        &self,
+        stored_result_ref: IdentityStoredResultRef,
+    ) -> Result<Option<IdentityCommandRejectedResultEnvelope>, ApplicationError>;
+
+    /// Saves a typed rejected command envelope.
+    fn save_command_rejected_envelope(
+        &self,
+        envelope: IdentityCommandRejectedResultEnvelope,
         uow: &dyn IdentityUnitOfWork,
     ) -> Result<IdentityStoredResultRef, ApplicationError>;
 

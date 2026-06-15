@@ -5,21 +5,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use identity_contracts::protocol::IdentityJobName;
 use identity_contracts::receipts::{MaintenanceIssueRef, TraceHandoffIntentRef};
 use identity_contracts::refs::{
-    ExternalReferenceRef, GlobalMemberRef, HandoffIssueRef, HandoffReceiptRef,
+    AuditScopeRef, ExternalReferenceRef, GlobalMemberRef, HandoffIssueRef, HandoffReceiptRef,
     IdentityAuditSubjectRef, IdentityConsumerBindingRef, IdentityJobRunRef,
     IdentityOutboxRecordRef, IdentityOutboxSubjectRef, IdentityProjectionRef, IdentitySourceRef,
     IdentityTraceSubjectRef, OutboxDeliveryIssueRef, RoleCapabilitySourceSnapshotRef,
-    RoleCapabilitySummaryRef,
+    RoleCapabilitySummaryRef, VisibilityResultRef,
+};
+use identity_contracts::refs::{
+    IdentityChangeKindRef, IdentityReadSurfaceKind, IdentityTruthCursor,
 };
 
 use crate::errors::ApplicationError;
 use crate::ports::{
-    IdentityDispatchTargetCatalogPort, IdentityMaintenanceIssueMapper, IdentityMarkerSubjectMapper,
-    IdentityTruthChangeSubjectMapper,
+    IdentityAcceptedAuditTrailMarkerMapper, IdentityDispatchTargetCatalogPort,
+    IdentityMaintenanceIssueMapper, IdentityMarkerSubjectMapper, IdentityTruthChangeSubjectMapper,
 };
 use crate::support::{
-    IdentityAcceptedSubjectRefs, IdentityApiRouteRef, IdentityDispatchTargetRef,
-    IdentityEntrySurfaceKind,
+    IdentityAcceptedAuditTrailMarkers, IdentityAcceptedSubjectRefs, IdentityApiRouteRef,
+    IdentityDispatchTargetRef, IdentityEntrySurfaceKind, IdentityOperationContext,
 };
 
 /// Default mapper that derives accepted trace/audit/outbox subjects from typed truth refs.
@@ -85,6 +88,63 @@ impl IdentityTruthChangeSubjectMapper for DefaultIdentityTruthChangeSubjectMappe
         intent_ref: TraceHandoffIntentRef,
     ) -> IdentityAcceptedSubjectRefs {
         Self::accepted_subjects("trace-handoff-intent", intent_ref.as_str())
+    }
+}
+
+/// Default mapper that derives accepted-write audit material markers.
+#[derive(Clone, Debug, Default)]
+pub struct DefaultIdentityAcceptedAuditTrailMarkerMapper;
+
+impl DefaultIdentityAcceptedAuditTrailMarkerMapper {
+    fn marker_key(
+        context: &IdentityOperationContext,
+        subjects: &IdentityAcceptedSubjectRefs,
+        change_kind_ref: &IdentityChangeKindRef,
+        source_cursor_ref: &IdentityTruthCursor,
+        family: &str,
+    ) -> String {
+        format!(
+            "accepted-audit:{family}:{}:{}:{:?}:{}",
+            context.operation_name.as_str(),
+            subjects.audit_subject_ref.as_str(),
+            change_kind_ref.change_kind,
+            source_cursor_ref.as_str(),
+        )
+    }
+}
+
+impl IdentityAcceptedAuditTrailMarkerMapper for DefaultIdentityAcceptedAuditTrailMarkerMapper {
+    fn accepted_command_audit_markers(
+        &self,
+        context: &IdentityOperationContext,
+        subjects: &IdentityAcceptedSubjectRefs,
+        change_kind_ref: &IdentityChangeKindRef,
+        source_cursor_ref: &IdentityTruthCursor,
+    ) -> IdentityAcceptedAuditTrailMarkers {
+        IdentityAcceptedAuditTrailMarkers {
+            audit_scope_ref: AuditScopeRef::new(Self::marker_key(
+                context,
+                subjects,
+                change_kind_ref,
+                source_cursor_ref,
+                "scope",
+            )),
+            trail_visibility_result_ref: VisibilityResultRef::new(Self::marker_key(
+                context,
+                subjects,
+                change_kind_ref,
+                source_cursor_ref,
+                "trail",
+            )),
+            entry_visibility_result_ref: VisibilityResultRef::new(Self::marker_key(
+                context,
+                subjects,
+                change_kind_ref,
+                source_cursor_ref,
+                "entry",
+            )),
+            read_surface_kind: IdentityReadSurfaceKind::Found,
+        }
     }
 }
 
