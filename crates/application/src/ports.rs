@@ -6,7 +6,7 @@ use identity_contracts::receipts::MaintenanceIssueRef;
 use identity_contracts::receipts::TraceHandoffIntentRef;
 use identity_contracts::refs::{
     ArchiveHandoffRef, ArchiveRef, AuditCursorRef, AuditScopeRef, AuditTrailRef,
-    CapabilityEvidenceRef, CareerRecordRef, CareerSourceMarkerRef, ConsumerRef,
+    CapabilityEvidenceRef, CareerRecordId, CareerRecordRef, CareerSourceMarkerRef, ConsumerRef,
     ExternalReferenceRef, ExternalReferenceSafeSummaryRef, ExternalSourceVersionRef,
     GlobalMemberId, GlobalMemberRef, GovernanceBasisRef, GovernanceBasisSummary, HandoffAttemptRef,
     HandoffIssueRef, HandoffReceiptRef, HandoffScopeRef, HandoffTargetRef, IdentityAuditSubjectRef,
@@ -16,8 +16,8 @@ use identity_contracts::refs::{
     IdentityReferenceOwnerRef, IdentitySourceEventRef, IdentitySourceRef, IdentityStoredResultRef,
     IdentityTraceRecordRef, IdentityTraceSubjectRef, IdentityTruthCursor,
     IdentityVisibilityDecisionRef, LifecycleRiskRef, MaintenanceScopeRef, MemberSummaryViewRef,
-    MemoryRef, MemoryReferenceRef, MemoryReferenceSourceRef, OutboxDeliveryAttemptRef,
-    OutboxDeliveryIssueRef, ProjectionStateRef, ReconciliationReportRef,
+    MemoryRef, MemoryReferenceId, MemoryReferenceRef, MemoryReferenceSourceRef,
+    OutboxDeliveryAttemptRef, OutboxDeliveryIssueRef, ProjectionStateRef, ReconciliationReportRef,
     ReferenceResolutionStateRef, RoleCapabilitySafeSummaryRef, RoleCapabilitySourceRef,
     RoleCapabilitySourceSnapshotId, RoleCapabilitySourceSnapshotRef,
     RoleCapabilitySourceVersionRef, RoleCapabilitySummaryId, RoleCapabilitySummaryRef, TopicKeyRef,
@@ -99,6 +99,12 @@ pub trait IdentityIdGeneratorPort {
     fn new_role_capability_source_snapshot_id(
         &self,
     ) -> Result<RoleCapabilitySourceSnapshotId, ApplicationError>;
+
+    /// Generates a new career record id.
+    fn new_career_record_id(&self) -> Result<CareerRecordId, ApplicationError>;
+
+    /// Generates a new memory reference id.
+    fn new_memory_reference_id(&self) -> Result<MemoryReferenceId, ApplicationError>;
 
     /// Generates a new member summary view id.
     fn new_member_summary_view_id(&self) -> Result<MemberSummaryViewId, ApplicationError>;

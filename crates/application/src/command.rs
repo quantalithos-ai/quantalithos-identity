@@ -2,9 +2,11 @@
 
 use core_contracts::actor::ActorRef;
 use identity_contracts::commands::{
-    EstablishGlobalMemberRequest, GlobalLifecycleCommandResult, GlobalMemberCommandResult,
-    IdentityCommandEffectPublicSummary, IdentityCommandOutcome, IdentityCommandRequest,
-    IdentityCommandResponse, UpdateGlobalLifecycleStateRequest,
+    AppendCareerRecordRequest, CareerRecordCommandResult, EstablishGlobalMemberRequest,
+    GlobalLifecycleCommandResult, GlobalMemberCommandResult, IdentityCommandEffectPublicSummary,
+    IdentityCommandOutcome, IdentityCommandRequest, IdentityCommandResponse,
+    MaintainMemoryReferenceRequest, MaintainRoleCapabilitySummaryRequest,
+    MemoryReferenceCommandResult, RoleCapabilityCommandResult, UpdateGlobalLifecycleStateRequest,
 };
 use identity_contracts::metadata::{
     IdentityDegradedKind, IdentityDegradedMarker, IdentityProtocolRejection,
@@ -19,26 +21,37 @@ use identity_contracts::refs::{
     IdentityChangeReasonRef, IdentityDegradedMarkerRef, IdentityOperationChannel,
     IdentityOutboxPayloadMarkerRef, IdentityProjectionRef, IdentitySourceOwner, IdentitySourceRef,
     IdentityStoredResultRef, IdentityTimestamp, IdentityTraceRecordRef, IdentityTruthCursor,
-    MaintenanceScopeRef, TopicKeyRef,
+    MaintenanceScopeRef, MemoryReferenceSourceState,
+    MemoryReferenceStateKind as PublicMemoryReferenceStateKind, RoleCapabilitySourceStateKind,
+    RoleCapabilitySummaryStateKind, TopicKeyRef,
 };
 use identity_contracts::views::{IdentityReadMaterialKind, IdentityReadMaterialMarker};
 use identity_domain::audit::{AuditTrail, AuditTrailEntry};
+use identity_domain::career::{CareerAppendPolicy, CareerRecord, CareerRecordStateKind};
 use identity_domain::lifecycle::{
     GlobalLifecycleState, GlobalLifecycleStateKind, HighRiskLifecycleGuard,
     LifecycleTransitionPolicy,
 };
 use identity_domain::member_identity::{GlobalMember, IdentityAnchorPolicy, IdentityAnchorState};
+use identity_domain::memory_reference::{
+    MemoryReference, MemoryReferencePolicy, MemoryReferenceState, MemoryReferenceStateKind,
+};
 use identity_domain::outbox::{IdentityOutboxRecord, OutboxState};
+use identity_domain::role_capability::{
+    RoleCapabilitySourcePolicy, RoleCapabilitySourceSnapshot, RoleCapabilitySummary,
+};
 use identity_domain::trace::IdentityTraceRecord;
 
 use crate::errors::{ApplicationError, ApplicationErrorKind};
 use crate::ports::{
-    GlobalLifecycleRepository, GlobalMemberRepository, IdentityAcceptedAuditTrailMarkerMapper,
-    IdentityAuditTrailRepository, IdentityClockPort, IdentityCommandEffectSummaryRepository,
-    IdentityCursorAssignerPort, IdentityExternalSourceResolverPort, IdentityIdGeneratorPort,
-    IdentityIdempotencyRepository, IdentityOperationContextFactoryPort, IdentityOutboxRepository,
-    IdentityProjectionRepository, IdentityStoredResultRepository, IdentityTraceRecordRepository,
+    CareerRecordRepository, GlobalLifecycleRepository, GlobalMemberRepository,
+    IdentityAcceptedAuditTrailMarkerMapper, IdentityAuditTrailRepository, IdentityClockPort,
+    IdentityCommandEffectSummaryRepository, IdentityCursorAssignerPort,
+    IdentityExternalSourceResolverPort, IdentityIdGeneratorPort, IdentityIdempotencyRepository,
+    IdentityOperationContextFactoryPort, IdentityOutboxRepository, IdentityProjectionRepository,
+    IdentityStoredResultRepository, IdentityTraceRecordRepository,
     IdentityTruthChangeSubjectMapper, IdentityUnitOfWork, IdentityUnitOfWorkManagerPort,
+    MemoryReferenceRepository, RoleCapabilityRepository,
 };
 use crate::support::{
     IdempotencyReserveOutcome, IdentityAcceptedEffectKind, IdentityAcceptedSubjectRefs,
@@ -73,6 +86,12 @@ pub struct IdentityCommandServiceDeps<'a> {
     pub member_repository: &'a dyn GlobalMemberRepository,
     /// Lifecycle truth repository.
     pub lifecycle_repository: &'a dyn GlobalLifecycleRepository,
+    /// Role capability summary and source snapshot repository.
+    pub role_capability_repository: &'a dyn RoleCapabilityRepository,
+    /// Append-only career record repository.
+    pub career_record_repository: &'a dyn CareerRecordRepository,
+    /// Memory reference relation repository.
+    pub memory_reference_repository: &'a dyn MemoryReferenceRepository,
     /// Accepted trace append repository.
     pub trace_record_repository: &'a dyn IdentityTraceRecordRepository,
     /// Audit trail repository.
@@ -663,6 +682,146 @@ impl<'a> IdentityCommandService<'a> {
             )?;
         let _ = typed_request;
         Ok(IdentityCommandOutcome::Rejected(rejection))
+    }
+
+    fn save_replayable_rejected_outcome<TRequest, TResult>(
+        &self,
+        command_name: &IdentityCommandName,
+        typed_request: &IdentityCommandRequest<TRequest>,
+        context: &IdentityOperationContext,
+        rejection: IdentityProtocolRejection,
+        reserved: Versioned<crate::support::IdentityIdempotencyRecord>,
+        now: IdentityTimestamp,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityCommandOutcome<TResult>, ApplicationError> {
+        let stored_result_ref = self.deps.id_generator.new_identity_stored_result_ref()?;
+        let surface_marker_ref = self
+            .deps
+            .id_generator
+            .new_identity_stored_surface_marker_ref()?;
+        let stored = StoredIdentityOperationResult::command_rejected(
+            stored_result_ref.clone(),
+            context.context_ref.clone(),
+            surface_marker_ref.clone(),
+            now,
+        );
+        self.deps
+            .stored_result_repository
+            .save_command_rejected_result(stored, uow)?;
+        let envelope = IdentityCommandRejectedResultEnvelope::new(
+            stored_result_ref.clone(),
+            context.context_ref.clone(),
+            command_name.clone(),
+            surface_marker_ref,
+            rejection.clone(),
+            now,
+        );
+        self.deps
+            .stored_result_repository
+            .save_command_rejected_envelope(envelope, uow)?;
+        self.deps
+            .idempotency_repository
+            .complete_rejected_with_stored_result(
+                reserved.value,
+                stored_result_ref,
+                now,
+                reserved.version,
+                uow,
+            )?;
+        let _ = typed_request;
+        Ok(IdentityCommandOutcome::Rejected(rejection))
+    }
+
+    fn command_not_found_rejection(
+        &self,
+        command_name: &IdentityCommandName,
+        issue: impl Into<String>,
+    ) -> IdentityProtocolRejection {
+        Self::protocol_rejection(command_name, IdentityProtocolRejectionKind::NotFound, issue)
+    }
+
+    fn map_public_role_summary_state(
+        state: identity_domain::role_capability::RoleCapabilitySummaryStateKind,
+    ) -> RoleCapabilitySummaryStateKind {
+        match state {
+            identity_domain::role_capability::RoleCapabilitySummaryStateKind::Active => {
+                RoleCapabilitySummaryStateKind::Active
+            }
+            identity_domain::role_capability::RoleCapabilitySummaryStateKind::Stale => {
+                RoleCapabilitySummaryStateKind::Stale
+            }
+            identity_domain::role_capability::RoleCapabilitySummaryStateKind::Unavailable => {
+                RoleCapabilitySummaryStateKind::Unavailable
+            }
+            identity_domain::role_capability::RoleCapabilitySummaryStateKind::PendingReconciliation => {
+                RoleCapabilitySummaryStateKind::PendingReconciliation
+            }
+            identity_domain::role_capability::RoleCapabilitySummaryStateKind::Superseded => {
+                RoleCapabilitySummaryStateKind::Superseded
+            }
+        }
+    }
+
+    fn map_public_role_source_state(
+        state: identity_domain::role_capability::RoleCapabilitySourceStateKind,
+    ) -> RoleCapabilitySourceStateKind {
+        match state {
+            identity_domain::role_capability::RoleCapabilitySourceStateKind::SourceResolved => {
+                RoleCapabilitySourceStateKind::SourceResolved
+            }
+            identity_domain::role_capability::RoleCapabilitySourceStateKind::SourceStale => {
+                RoleCapabilitySourceStateKind::SourceStale
+            }
+            identity_domain::role_capability::RoleCapabilitySourceStateKind::SourceUnavailable => {
+                RoleCapabilitySourceStateKind::SourceUnavailable
+            }
+            identity_domain::role_capability::RoleCapabilitySourceStateKind::SourceUnrecognized => {
+                RoleCapabilitySourceStateKind::SourceUnrecognized
+            }
+            identity_domain::role_capability::RoleCapabilitySourceStateKind::SourceSuperseded => {
+                RoleCapabilitySourceStateKind::SourceSuperseded
+            }
+        }
+    }
+
+    fn map_public_career_record_state(
+        state: CareerRecordStateKind,
+    ) -> identity_contracts::refs::CareerRecordStateKind {
+        match state {
+            CareerRecordStateKind::Appended => {
+                identity_contracts::refs::CareerRecordStateKind::Appended
+            }
+            CareerRecordStateKind::CorrectionAppended => {
+                identity_contracts::refs::CareerRecordStateKind::CorrectionAppended
+            }
+            CareerRecordStateKind::SupersededByCorrection => {
+                identity_contracts::refs::CareerRecordStateKind::SupersededByCorrection
+            }
+            CareerRecordStateKind::SourcePendingReview => {
+                identity_contracts::refs::CareerRecordStateKind::SourcePendingReview
+            }
+        }
+    }
+
+    fn map_public_memory_reference_state(
+        state: MemoryReferenceStateKind,
+    ) -> PublicMemoryReferenceStateKind {
+        match state {
+            MemoryReferenceStateKind::Linked => PublicMemoryReferenceStateKind::Linked,
+            MemoryReferenceStateKind::PendingVerification => {
+                PublicMemoryReferenceStateKind::PendingVerification
+            }
+            MemoryReferenceStateKind::Stale => PublicMemoryReferenceStateKind::Stale,
+            MemoryReferenceStateKind::Unavailable => PublicMemoryReferenceStateKind::Unavailable,
+            MemoryReferenceStateKind::Migrated => PublicMemoryReferenceStateKind::Migrated,
+            MemoryReferenceStateKind::Archived => PublicMemoryReferenceStateKind::Archived,
+            MemoryReferenceStateKind::HandoffPending => {
+                PublicMemoryReferenceStateKind::HandoffPending
+            }
+            MemoryReferenceStateKind::HandoffFailed => {
+                PublicMemoryReferenceStateKind::HandoffFailed
+            }
+        }
     }
 
     /// Shared skeleton for the member-establish command vertical slice.
@@ -1474,6 +1633,1741 @@ impl<'a> IdentityCommandService<'a> {
                             command_name.clone(),
                             surface_marker_ref,
                             IdentityCommandTypedResult::GlobalLifecycle(result.clone()),
+                            effect.clone(),
+                            now,
+                        ),
+                        uow.as_ref(),
+                    )?;
+                self.deps
+                    .idempotency_repository
+                    .complete_with_stored_result(
+                        record.value,
+                        stored_result_ref.clone(),
+                        now,
+                        record.version,
+                        uow.as_ref(),
+                    )?;
+                self.deps.unit_of_work_manager.commit(uow)?;
+                Ok(IdentityCommandOutcome::Accepted(Self::accepted_response(
+                    command_name,
+                    stored_result_ref,
+                    result,
+                    effect,
+                )))
+            }
+        }
+    }
+
+    /// Shared skeleton for the role capability summary command vertical slice.
+    pub fn maintain_role_capability_summary(
+        &self,
+        request: IdentityCommandRequest<MaintainRoleCapabilitySummaryRequest>,
+        context: IdentityOperationContext,
+    ) -> Result<IdentityCommandOutcome<RoleCapabilityCommandResult>, ApplicationError> {
+        Self::assert_command_context(&request, &context)?;
+        let command_name = request.command_name.clone();
+        let now = self.deps.clock.now()?;
+        let uow = self.deps.unit_of_work_manager.begin()?;
+        let reserve = match self.reserve_idempotency(&context, now, uow.as_ref()) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.rollback_quietly(uow);
+                return self
+                    .map_runtime_unavailable(&command_name, error)
+                    .map(IdentityCommandOutcome::Rejected);
+            }
+        };
+
+        match reserve {
+            IdempotencyReserveOutcome::ReplayAvailable {
+                stored_result_ref, ..
+            } => {
+                self.rollback_quietly(uow);
+                self.load_replayed_command_outcome(command_name, stored_result_ref, |typed| {
+                    match typed {
+                        IdentityCommandTypedResult::RoleCapability(result) => Some(result),
+                        _ => None,
+                    }
+                })
+            }
+            IdempotencyReserveOutcome::Conflict(record) => {
+                let rejection = Self::protocol_rejection(
+                    &command_name,
+                    IdentityProtocolRejectionKind::DuplicateConflict,
+                    "same idempotency key is already bound to different canonical material",
+                );
+                self.deps.idempotency_repository.mark_conflict(
+                    record.value,
+                    now,
+                    record.version,
+                    uow.as_ref(),
+                )?;
+                self.deps.unit_of_work_manager.commit(uow)?;
+                Ok(IdentityCommandOutcome::Rejected(rejection))
+            }
+            IdempotencyReserveOutcome::InFlight(_) => {
+                self.rollback_quietly(uow);
+                Ok(IdentityCommandOutcome::Rejected(
+                    Self::adapter_unavailable_rejection(
+                        &command_name,
+                        "same command idempotency key and digest is still in flight",
+                    ),
+                ))
+            }
+            IdempotencyReserveOutcome::Reserved(record) => {
+                let member_exists = self
+                    .deps
+                    .member_repository
+                    .get_member_with_version(request.body.member_ref.clone())?
+                    .is_some();
+                if !member_exists {
+                    let rejection =
+                        self.command_not_found_rejection(&command_name, "member does not exist");
+                    let outcome = self.save_replayable_rejected_outcome(
+                        &command_name,
+                        &request,
+                        &context,
+                        rejection,
+                        record,
+                        now,
+                        uow.as_ref(),
+                    )?;
+                    self.deps.unit_of_work_manager.commit(uow)?;
+                    return Ok(outcome);
+                }
+
+                let requested_summary_v = match request.body.requested_summary_ref.clone() {
+                    Some(summary_ref) => self
+                        .deps
+                        .role_capability_repository
+                        .get_summary_with_version(summary_ref)?,
+                    None => None,
+                };
+                let current_by_member_v = self
+                    .deps
+                    .role_capability_repository
+                    .find_current_summary_by_member(request.body.member_ref.clone())?;
+
+                if let (Some(requested), Some(current)) =
+                    (requested_summary_v.as_ref(), current_by_member_v.as_ref())
+                {
+                    if !requested
+                        .value
+                        .summary_ref
+                        .same_summary(&current.value.summary_ref)
+                    {
+                        let rejection = Self::protocol_rejection(
+                            &command_name,
+                            IdentityProtocolRejectionKind::Conflict,
+                            "requested summary ref does not match the current summary for member",
+                        );
+                        let outcome = self.save_replayable_rejected_outcome(
+                            &command_name,
+                            &request,
+                            &context,
+                            rejection,
+                            record,
+                            now,
+                            uow.as_ref(),
+                        )?;
+                        self.deps.unit_of_work_manager.commit(uow)?;
+                        return Ok(outcome);
+                    }
+                }
+
+                let current_summary_v = requested_summary_v.or(current_by_member_v);
+                let current_snapshot_v = self
+                    .deps
+                    .role_capability_repository
+                    .find_source_snapshot_by_source(request.body.source_ref.clone())?;
+
+                let source_resolution = self
+                    .deps
+                    .external_source_resolver
+                    .resolve_role_capability_source(request.body.source_ref.clone())?;
+                if !source_resolution
+                    .source_ref
+                    .same_source(&request.body.source_ref)
+                {
+                    let rejection = Self::protocol_rejection(
+                        &command_name,
+                        IdentityProtocolRejectionKind::InvalidRequest,
+                        "resolved role source does not match request source",
+                    );
+                    let outcome = self.save_replayable_rejected_outcome(
+                        &command_name,
+                        &request,
+                        &context,
+                        rejection,
+                        record,
+                        now,
+                        uow.as_ref(),
+                    )?;
+                    self.deps.unit_of_work_manager.commit(uow)?;
+                    return Ok(outcome);
+                }
+                if source_resolution.source_state
+                    != identity_domain::role_capability::RoleCapabilitySourceStateKind::SourceResolved
+                {
+                    let rejection = match source_resolution.source_state {
+                        identity_domain::role_capability::RoleCapabilitySourceStateKind::SourceUnavailable => {
+                            Self::adapter_unavailable_rejection(
+                                &command_name,
+                                "role capability source is unavailable for active summary maintenance",
+                            )
+                        }
+                        identity_domain::role_capability::RoleCapabilitySourceStateKind::SourceUnrecognized => {
+                            Self::protocol_rejection(
+                                &command_name,
+                                IdentityProtocolRejectionKind::PolicyDenied,
+                                "role capability source is unrecognized for active summary maintenance",
+                            )
+                        }
+                        _ => Self::protocol_rejection(
+                            &command_name,
+                            IdentityProtocolRejectionKind::PolicyDenied,
+                            "role capability source is not current for active summary maintenance",
+                        ),
+                    };
+                    let outcome = self.save_replayable_rejected_outcome(
+                        &command_name,
+                        &request,
+                        &context,
+                        rejection,
+                        record,
+                        now,
+                        uow.as_ref(),
+                    )?;
+                    self.deps.unit_of_work_manager.commit(uow)?;
+                    return Ok(outcome);
+                }
+                if !source_resolution.material_marker.is_safe_marker_only() {
+                    let rejection = Self::protocol_rejection(
+                        &command_name,
+                        IdentityProtocolRejectionKind::ForbiddenBody,
+                        "role capability resolver returned forbidden material marker",
+                    );
+                    let outcome = self.save_replayable_rejected_outcome(
+                        &command_name,
+                        &request,
+                        &context,
+                        rejection,
+                        record,
+                        now,
+                        uow.as_ref(),
+                    )?;
+                    self.deps.unit_of_work_manager.commit(uow)?;
+                    return Ok(outcome);
+                }
+
+                let source_version_ref = match source_resolution.source_version_ref.clone() {
+                    Some(value) if value.belongs_to(&request.body.source_ref) => value,
+                    _ => {
+                        let rejection = Self::adapter_unavailable_rejection(
+                            &command_name,
+                            "role capability source version is missing or invalid",
+                        );
+                        let outcome = self.save_replayable_rejected_outcome(
+                            &command_name,
+                            &request,
+                            &context,
+                            rejection,
+                            record,
+                            now,
+                            uow.as_ref(),
+                        )?;
+                        self.deps.unit_of_work_manager.commit(uow)?;
+                        return Ok(outcome);
+                    }
+                };
+                let effective_safe_summary_ref = match source_resolution.safe_summary_ref.clone() {
+                    Some(value) if value.belongs_to_source(&request.body.source_ref) => value,
+                    _ => {
+                        let rejection = Self::protocol_rejection(
+                            &command_name,
+                            IdentityProtocolRejectionKind::PolicyDenied,
+                            "role capability source safe summary is missing or invalid",
+                        );
+                        let outcome = self.save_replayable_rejected_outcome(
+                            &command_name,
+                            &request,
+                            &context,
+                            rejection,
+                            record,
+                            now,
+                            uow.as_ref(),
+                        )?;
+                        self.deps.unit_of_work_manager.commit(uow)?;
+                        return Ok(outcome);
+                    }
+                };
+                if let Some(request_safe_summary_ref) = request.body.safe_summary_ref.clone() {
+                    if !request_safe_summary_ref.belongs_to_source(&request.body.source_ref)
+                        || !request_safe_summary_ref.same_safe_summary(&effective_safe_summary_ref)
+                    {
+                        let rejection = Self::protocol_rejection(
+                            &command_name,
+                            IdentityProtocolRejectionKind::PolicyDenied,
+                            "request safe summary does not match authoritative role source summary",
+                        );
+                        let outcome = self.save_replayable_rejected_outcome(
+                            &command_name,
+                            &request,
+                            &context,
+                            rejection,
+                            record,
+                            now,
+                            uow.as_ref(),
+                        )?;
+                        self.deps.unit_of_work_manager.commit(uow)?;
+                        return Ok(outcome);
+                    }
+                }
+
+                let authoritative_evidence_refs = source_resolution.evidence_refs.clone();
+                if authoritative_evidence_refs.is_empty() {
+                    let rejection = Self::protocol_rejection(
+                        &command_name,
+                        IdentityProtocolRejectionKind::PolicyDenied,
+                        "role capability source must provide authoritative evidence",
+                    );
+                    let outcome = self.save_replayable_rejected_outcome(
+                        &command_name,
+                        &request,
+                        &context,
+                        rejection,
+                        record,
+                        now,
+                        uow.as_ref(),
+                    )?;
+                    self.deps.unit_of_work_manager.commit(uow)?;
+                    return Ok(outcome);
+                }
+
+                for evidence_ref in &request.body.evidence_refs {
+                    let evidence_resolution = self
+                        .deps
+                        .external_source_resolver
+                        .resolve_capability_evidence(evidence_ref.clone())?;
+                    if !evidence_resolution.evidence_ref.same_evidence(evidence_ref) {
+                        let rejection = Self::protocol_rejection(
+                            &command_name,
+                            IdentityProtocolRejectionKind::InvalidRequest,
+                            "resolved capability evidence does not match request evidence",
+                        );
+                        let outcome = self.save_replayable_rejected_outcome(
+                            &command_name,
+                            &request,
+                            &context,
+                            rejection,
+                            record,
+                            now,
+                            uow.as_ref(),
+                        )?;
+                        self.deps.unit_of_work_manager.commit(uow)?;
+                        return Ok(outcome);
+                    }
+                    if evidence_resolution.evidence_state
+                        != identity_domain::reference_state::ReferenceResolutionStateKind::Resolved
+                    {
+                        let rejection = Self::protocol_rejection(
+                            &command_name,
+                            IdentityProtocolRejectionKind::PolicyDenied,
+                            "capability evidence must resolve before accepted role summary write",
+                        );
+                        let outcome = self.save_replayable_rejected_outcome(
+                            &command_name,
+                            &request,
+                            &context,
+                            rejection,
+                            record,
+                            now,
+                            uow.as_ref(),
+                        )?;
+                        self.deps.unit_of_work_manager.commit(uow)?;
+                        return Ok(outcome);
+                    }
+                    if !authoritative_evidence_refs
+                        .iter()
+                        .any(|candidate| candidate.same_evidence(evidence_ref))
+                    {
+                        let rejection = Self::protocol_rejection(
+                            &command_name,
+                            IdentityProtocolRejectionKind::PolicyDenied,
+                            "requested capability evidence is not authoritative for the source",
+                        );
+                        let outcome = self.save_replayable_rejected_outcome(
+                            &command_name,
+                            &request,
+                            &context,
+                            rejection,
+                            record,
+                            now,
+                            uow.as_ref(),
+                        )?;
+                        self.deps.unit_of_work_manager.commit(uow)?;
+                        return Ok(outcome);
+                    }
+                }
+
+                let snapshot_ref = match current_snapshot_v.as_ref() {
+                    Some(value) => value.value.snapshot_ref.clone(),
+                    None => identity_contracts::refs::RoleCapabilitySourceSnapshotRef::from_id(
+                        self.deps
+                            .id_generator
+                            .new_role_capability_source_snapshot_id()?,
+                    ),
+                };
+                let snapshot = RoleCapabilitySourceSnapshot::from_resolved_source(
+                    snapshot_ref.clone(),
+                    request.body.source_ref.clone(),
+                    source_version_ref,
+                    effective_safe_summary_ref.clone(),
+                    authoritative_evidence_refs.clone(),
+                    now,
+                )?;
+                let policy = RoleCapabilitySourcePolicy::for_summary_update(
+                    request.body.member_ref.clone(),
+                    snapshot.clone(),
+                    authoritative_evidence_refs.clone(),
+                    request.body.change_reason_ref.clone(),
+                    context.actor_ref.clone(),
+                    context.channel,
+                    request.body.change_material_marker.clone(),
+                );
+                if let Err(error) = policy
+                    .assert_member_exists(member_exists)
+                    .and_then(|_| policy.assert_no_forbidden_body())
+                    .and_then(|_| policy.assert_not_automatic_scoring())
+                    .and_then(|_| policy.assert_source_or_evidence_present())
+                    .and_then(|_| policy.assert_source_usable())
+                {
+                    let app_error = ApplicationError::from(error);
+                    let rejection = Self::rejection_from_error(&command_name, &app_error)
+                        .ok_or(app_error.clone())?;
+                    let outcome = self.save_replayable_rejected_outcome(
+                        &command_name,
+                        &request,
+                        &context,
+                        rejection,
+                        record,
+                        now,
+                        uow.as_ref(),
+                    )?;
+                    self.deps.unit_of_work_manager.commit(uow)?;
+                    return Ok(outcome);
+                }
+
+                let summary_ref = match current_summary_v.as_ref() {
+                    Some(value) => value.value.summary_ref.clone(),
+                    None => match request.body.requested_summary_ref.clone() {
+                        Some(value) => value,
+                        None => identity_contracts::refs::RoleCapabilitySummaryRef::from_id(
+                            self.deps.id_generator.new_role_capability_summary_id()?,
+                        ),
+                    },
+                };
+                let mut summary = if let Some(current_summary_v) = current_summary_v.as_ref() {
+                    if !current_summary_v
+                        .value
+                        .belongs_to(request.body.member_ref.clone())
+                    {
+                        let rejection = Self::protocol_rejection(
+                            &command_name,
+                            IdentityProtocolRejectionKind::Conflict,
+                            "current role capability summary belongs to a different member",
+                        );
+                        let outcome = self.save_replayable_rejected_outcome(
+                            &command_name,
+                            &request,
+                            &context,
+                            rejection,
+                            record,
+                            now,
+                            uow.as_ref(),
+                        )?;
+                        self.deps.unit_of_work_manager.commit(uow)?;
+                        return Ok(outcome);
+                    }
+                    current_summary_v.value.clone()
+                } else {
+                    RoleCapabilitySummary::create_for_member(
+                        summary_ref.clone(),
+                        request.body.member_ref.clone(),
+                        &snapshot,
+                        effective_safe_summary_ref.clone(),
+                        authoritative_evidence_refs.clone(),
+                        context.actor_ref.clone(),
+                        now,
+                    )?
+                };
+
+                if let Some(role_source_ref) = request.body.role_source_ref.clone() {
+                    if !role_source_ref
+                        .canonical_source()
+                        .same_source(&request.body.source_ref)
+                    {
+                        let rejection = Self::protocol_rejection(
+                            &command_name,
+                            IdentityProtocolRejectionKind::InvalidRequest,
+                            "role source ref does not match the requested role capability source",
+                        );
+                        let outcome = self.save_replayable_rejected_outcome(
+                            &command_name,
+                            &request,
+                            &context,
+                            rejection,
+                            record,
+                            now,
+                            uow.as_ref(),
+                        )?;
+                        self.deps.unit_of_work_manager.commit(uow)?;
+                        return Ok(outcome);
+                    }
+                    summary.attach_role_source(
+                        role_source_ref,
+                        &snapshot,
+                        context.actor_ref.clone(),
+                        now,
+                    )?;
+                }
+                summary.update_capability_summary(
+                    request.body.capability_source_refs.clone(),
+                    authoritative_evidence_refs.clone(),
+                    effective_safe_summary_ref.clone(),
+                    context.actor_ref.clone(),
+                    now,
+                )?;
+
+                self.deps.role_capability_repository.save_source_snapshot(
+                    snapshot.clone(),
+                    current_snapshot_v.as_ref().map(|value| value.version),
+                    uow.as_ref(),
+                )?;
+                self.deps.role_capability_repository.save_summary(
+                    summary.clone(),
+                    current_summary_v.as_ref().map(|value| value.version),
+                    uow.as_ref(),
+                )?;
+
+                let accepted_cursor_ref = self
+                    .deps
+                    .cursor_assigner
+                    .assign_truth_change_cursor(uow.as_ref())?;
+                let subjects = self
+                    .deps
+                    .truth_change_subject_mapper
+                    .role_capability_subjects(summary_ref.clone());
+                let change_kind_ref = IdentityChangeKindRef::new(
+                    IdentityChangeKind::RoleCapabilitySummaryChanged,
+                    Some(request.body.source_ref.source_ref.clone()),
+                );
+                let trace = self.command_trace_record(
+                    request.body.member_ref.clone(),
+                    &subjects,
+                    change_kind_ref.clone(),
+                    accepted_cursor_ref.clone(),
+                    Some(Self::accepted_change_reason(
+                        &request.body.change_reason_ref.source_ref,
+                    )),
+                    Some(request.body.source_ref.source_ref.clone()),
+                    None,
+                    context.actor_ref.clone(),
+                    now,
+                )?;
+                self.deps
+                    .trace_record_repository
+                    .append_trace_record(trace.clone(), uow.as_ref())?;
+                let audit_trail_ref = self.append_accepted_audit(
+                    &context,
+                    Some(request.body.member_ref.clone()),
+                    &subjects,
+                    &change_kind_ref,
+                    &accepted_cursor_ref,
+                    &trace,
+                    now,
+                    uow.as_ref(),
+                )?;
+
+                let summary_outbox = self.outbox_record(
+                    request.body.member_ref.clone(),
+                    subjects.outbox_subject_ref.clone(),
+                    change_kind_ref.clone(),
+                    "identity.role-capability.summary.changed.v1",
+                    "identity.role-capability.summary.changed.v1",
+                    trace.trace_record_ref.clone(),
+                    now,
+                )?;
+                let summary_outbox_ref = summary_outbox.outbox_record_ref.clone();
+                self.deps.outbox_repository.save_outbox_record(
+                    summary_outbox,
+                    None,
+                    uow.as_ref(),
+                )?;
+                let source_subjects = self
+                    .deps
+                    .truth_change_subject_mapper
+                    .role_capability_source_snapshot_subjects(snapshot_ref.clone());
+                let source_outbox = self.outbox_record(
+                    request.body.member_ref.clone(),
+                    source_subjects.outbox_subject_ref.clone(),
+                    change_kind_ref.clone(),
+                    "identity.role-capability.source-state.changed.v1",
+                    "identity.role-capability.source-state.changed.v1",
+                    trace.trace_record_ref.clone(),
+                    now,
+                )?;
+                let source_outbox_ref = source_outbox.outbox_record_ref.clone();
+                self.deps.outbox_repository.save_outbox_record(
+                    source_outbox,
+                    None,
+                    uow.as_ref(),
+                )?;
+
+                let stale_projection_refs =
+                    self.save_projection_stale_marks(&subjects, now, uow.as_ref())?;
+                let stored_result_ref = self.deps.id_generator.new_identity_stored_result_ref()?;
+                let surface_marker_ref = self
+                    .deps
+                    .id_generator
+                    .new_identity_stored_surface_marker_ref()?;
+                let effect_summary_ref = self
+                    .deps
+                    .id_generator
+                    .new_identity_command_effect_summary_ref()?;
+                let summary_effect = IdentityCommandEffectSummary::from_accepted_change(
+                    effect_summary_ref,
+                    context.context_ref.clone(),
+                    IdentityAcceptedEffectKind::RoleCapabilityCommandResult,
+                    IdentityTruthRef::RoleCapabilitySummary(summary_ref.clone()),
+                    accepted_cursor_ref.clone(),
+                    vec![trace.trace_record_ref.clone()],
+                    Some(audit_trail_ref),
+                    vec![summary_outbox_ref, source_outbox_ref],
+                    stale_projection_refs,
+                    stored_result_ref.clone(),
+                );
+                let result = RoleCapabilityCommandResult {
+                    member_ref: request.body.member_ref.clone(),
+                    summary_ref: summary_ref.clone(),
+                    source_snapshot_ref: snapshot_ref,
+                    summary_state_kind: Self::map_public_role_summary_state(summary.summary_state),
+                    source_state_kind: Self::map_public_role_source_state(snapshot.source_state),
+                    role_source_ref: summary.role_source_ref.clone(),
+                    capability_source_refs: summary.capability_source_refs.clone(),
+                    evidence_refs: summary.evidence_refs.clone(),
+                    safe_summary_ref: Some(effective_safe_summary_ref),
+                };
+                let effect = Self::public_effect_from_summary(
+                    &summary_effect,
+                    vec![subjects.audit_subject_ref.clone()],
+                );
+                let stored = StoredIdentityOperationResult::command_accepted(
+                    stored_result_ref.clone(),
+                    context.context_ref.clone(),
+                    surface_marker_ref.clone(),
+                    now,
+                );
+                self.deps
+                    .stored_result_repository
+                    .save_command_accepted_result(stored, uow.as_ref())?;
+                self.deps
+                    .effect_summary_repository
+                    .save_effect_summary(summary_effect, uow.as_ref())?;
+                self.deps
+                    .stored_result_repository
+                    .save_command_accepted_envelope(
+                        IdentityCommandAcceptedResultEnvelope::new(
+                            stored_result_ref.clone(),
+                            context.context_ref.clone(),
+                            command_name.clone(),
+                            surface_marker_ref,
+                            IdentityCommandTypedResult::RoleCapability(result.clone()),
+                            effect.clone(),
+                            now,
+                        ),
+                        uow.as_ref(),
+                    )?;
+                self.deps
+                    .idempotency_repository
+                    .complete_with_stored_result(
+                        record.value,
+                        stored_result_ref.clone(),
+                        now,
+                        record.version,
+                        uow.as_ref(),
+                    )?;
+                self.deps.unit_of_work_manager.commit(uow)?;
+                Ok(IdentityCommandOutcome::Accepted(Self::accepted_response(
+                    command_name,
+                    stored_result_ref,
+                    result,
+                    effect,
+                )))
+            }
+        }
+    }
+
+    /// Shared skeleton for the career append command vertical slice.
+    pub fn append_career_record(
+        &self,
+        request: IdentityCommandRequest<AppendCareerRecordRequest>,
+        context: IdentityOperationContext,
+    ) -> Result<IdentityCommandOutcome<CareerRecordCommandResult>, ApplicationError> {
+        Self::assert_command_context(&request, &context)?;
+        let command_name = request.command_name.clone();
+        let now = self.deps.clock.now()?;
+        let uow = self.deps.unit_of_work_manager.begin()?;
+        let reserve = match self.reserve_idempotency(&context, now, uow.as_ref()) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.rollback_quietly(uow);
+                return self
+                    .map_runtime_unavailable(&command_name, error)
+                    .map(IdentityCommandOutcome::Rejected);
+            }
+        };
+
+        match reserve {
+            IdempotencyReserveOutcome::ReplayAvailable {
+                stored_result_ref, ..
+            } => {
+                self.rollback_quietly(uow);
+                self.load_replayed_command_outcome(command_name, stored_result_ref, |typed| {
+                    match typed {
+                        IdentityCommandTypedResult::CareerRecord(result) => Some(result),
+                        _ => None,
+                    }
+                })
+            }
+            IdempotencyReserveOutcome::Conflict(record) => {
+                let rejection = Self::protocol_rejection(
+                    &command_name,
+                    IdentityProtocolRejectionKind::DuplicateConflict,
+                    "same idempotency key is already bound to different canonical material",
+                );
+                self.deps.idempotency_repository.mark_conflict(
+                    record.value,
+                    now,
+                    record.version,
+                    uow.as_ref(),
+                )?;
+                self.deps.unit_of_work_manager.commit(uow)?;
+                Ok(IdentityCommandOutcome::Rejected(rejection))
+            }
+            IdempotencyReserveOutcome::InFlight(_) => {
+                self.rollback_quietly(uow);
+                Ok(IdentityCommandOutcome::Rejected(
+                    Self::adapter_unavailable_rejection(
+                        &command_name,
+                        "same command idempotency key and digest is still in flight",
+                    ),
+                ))
+            }
+            IdempotencyReserveOutcome::Reserved(record) => {
+                let member_exists = self
+                    .deps
+                    .member_repository
+                    .get_member_with_version(request.body.member_ref.clone())?
+                    .is_some();
+                if !member_exists {
+                    let rejection =
+                        self.command_not_found_rejection(&command_name, "member does not exist");
+                    let outcome = self.save_replayable_rejected_outcome(
+                        &command_name,
+                        &request,
+                        &context,
+                        rejection,
+                        record,
+                        now,
+                        uow.as_ref(),
+                    )?;
+                    self.deps.unit_of_work_manager.commit(uow)?;
+                    return Ok(outcome);
+                }
+
+                let source_summary = self
+                    .deps
+                    .external_source_resolver
+                    .resolve_work_participation(request.body.work_source_ref.clone())?;
+                if !source_summary
+                    .work_source_ref
+                    .same_source(&request.body.work_source_ref)
+                    || !source_summary
+                        .source_marker_ref
+                        .same_marker(&request.body.source_marker_ref)
+                {
+                    let rejection = Self::protocol_rejection(
+                        &command_name,
+                        IdentityProtocolRejectionKind::InvalidRequest,
+                        "resolved work participation source does not match request markers",
+                    );
+                    let outcome = self.save_replayable_rejected_outcome(
+                        &command_name,
+                        &request,
+                        &context,
+                        rejection,
+                        record,
+                        now,
+                        uow.as_ref(),
+                    )?;
+                    self.deps.unit_of_work_manager.commit(uow)?;
+                    return Ok(outcome);
+                }
+
+                let duplicate_ref = self
+                    .deps
+                    .career_record_repository
+                    .find_duplicate_source_record(request.body.source_marker_ref.clone())?;
+                let duplicate_refs = duplicate_ref.clone().into_iter().collect::<Vec<_>>();
+
+                let original_record_v = match request.body.original_record_ref.clone() {
+                    Some(record_ref) => self
+                        .deps
+                        .career_record_repository
+                        .get_career_record(record_ref)?,
+                    None => None,
+                };
+
+                let policy = if request.body.change_intent
+                    == identity_contracts::refs::CareerRecordChangeIntent::AppendCorrection
+                {
+                    CareerAppendPolicy::for_correction(
+                        request.body.member_ref.clone(),
+                        member_exists,
+                        source_summary.clone(),
+                        Vec::new(),
+                        request.body.append_reason_ref.clone(),
+                        context.actor_ref.clone(),
+                        context.channel,
+                        request.body.append_material_marker.clone(),
+                    )
+                } else {
+                    CareerAppendPolicy::for_append(
+                        request.body.member_ref.clone(),
+                        member_exists,
+                        source_summary.clone(),
+                        duplicate_refs,
+                        request.body.append_reason_ref.clone(),
+                        context.actor_ref.clone(),
+                        context.channel,
+                        request.body.change_intent,
+                        request.body.append_material_marker.clone(),
+                    )
+                };
+
+                if let Err(error) = policy
+                    .assert_member_exists()
+                    .and_then(|_| policy.assert_not_work_truth_write())
+                    .and_then(|_| policy.assert_allowed_write_channel())
+                    .and_then(|_| policy.assert_append_only())
+                {
+                    let app_error = ApplicationError::from(error);
+                    let rejection = Self::rejection_from_error(&command_name, &app_error)
+                        .ok_or(app_error.clone())?;
+                    let outcome = self.save_replayable_rejected_outcome(
+                        &command_name,
+                        &request,
+                        &context,
+                        rejection,
+                        record,
+                        now,
+                        uow.as_ref(),
+                    )?;
+                    self.deps.unit_of_work_manager.commit(uow)?;
+                    return Ok(outcome);
+                }
+
+                if duplicate_ref.is_some()
+                    && request.body.change_intent
+                        != identity_contracts::refs::CareerRecordChangeIntent::AppendCorrection
+                {
+                    let rejection = Self::protocol_rejection(
+                        &command_name,
+                        IdentityProtocolRejectionKind::Conflict,
+                        "duplicate career source marker must not create a second career record",
+                    );
+                    let outcome = self.save_replayable_rejected_outcome(
+                        &command_name,
+                        &request,
+                        &context,
+                        rejection,
+                        record,
+                        now,
+                        uow.as_ref(),
+                    )?;
+                    self.deps.unit_of_work_manager.commit(uow)?;
+                    return Ok(outcome);
+                }
+
+                let record_ref = match request.body.requested_career_record_ref.clone() {
+                    Some(value) => value,
+                    None => identity_contracts::refs::CareerRecordRef::from_id(
+                        self.deps.id_generator.new_career_record_id()?,
+                    ),
+                };
+                let (career_record, superseded_record_ref, create_outbox) = match request
+                    .body
+                    .change_intent
+                {
+                    identity_contracts::refs::CareerRecordChangeIntent::AppendNew => {
+                        policy.assert_not_duplicate()?;
+                        policy.assert_source_trusted()?;
+                        (
+                            CareerRecord::append_from_work_source(
+                                record_ref.clone(),
+                                request.body.member_ref.clone(),
+                                source_summary.clone(),
+                                request.body.append_reason_ref.clone(),
+                                context.actor_ref.clone(),
+                                now,
+                            )?,
+                            None,
+                            Some("identity.career.record.appended.v1"),
+                        )
+                    }
+                    identity_contracts::refs::CareerRecordChangeIntent::AppendCorrection => {
+                        policy.assert_source_trusted()?;
+                        let mut original_record = match original_record_v.clone() {
+                            Some(value) => value,
+                            None => {
+                                let rejection = self.command_not_found_rejection(
+                                    &command_name,
+                                    "original career record does not exist",
+                                );
+                                let outcome = self.save_replayable_rejected_outcome(
+                                    &command_name,
+                                    &request,
+                                    &context,
+                                    rejection,
+                                    record,
+                                    now,
+                                    uow.as_ref(),
+                                )?;
+                                self.deps.unit_of_work_manager.commit(uow)?;
+                                return Ok(outcome);
+                            }
+                        };
+                        if !original_record
+                            .value
+                            .member_ref
+                            .same_member(&request.body.member_ref)
+                        {
+                            let rejection = Self::protocol_rejection(
+                                &command_name,
+                                IdentityProtocolRejectionKind::PolicyDenied,
+                                "original career record belongs to a different member",
+                            );
+                            let outcome = self.save_replayable_rejected_outcome(
+                                &command_name,
+                                &request,
+                                &context,
+                                rejection,
+                                record,
+                                now,
+                                uow.as_ref(),
+                            )?;
+                            self.deps.unit_of_work_manager.commit(uow)?;
+                            return Ok(outcome);
+                        }
+                        let correction_record = CareerRecord::correction_for_record(
+                            record_ref.clone(),
+                            original_record.value.career_record_ref.clone(),
+                            request.body.member_ref.clone(),
+                            source_summary.clone(),
+                            request.body.append_reason_ref.clone(),
+                            context.actor_ref.clone(),
+                            now,
+                        )?;
+                        original_record.value.mark_superseded_by_correction(
+                            record_ref.clone(),
+                            context.actor_ref.clone(),
+                            now,
+                        )?;
+                        self.deps
+                            .career_record_repository
+                            .save_career_record_state(
+                                original_record.value.clone(),
+                                original_record.version,
+                                uow.as_ref(),
+                            )?;
+                        (
+                            correction_record,
+                            request.body.original_record_ref.clone(),
+                            Some("identity.career.correction.appended.v1"),
+                        )
+                    }
+                    identity_contracts::refs::CareerRecordChangeIntent::MarkSourcePendingReview => {
+                        if !source_summary.requires_review() {
+                            let rejection = Self::protocol_rejection(
+                                &command_name,
+                                IdentityProtocolRejectionKind::PolicyDenied,
+                                "pending review intent requires a reviewable work source state",
+                            );
+                            let outcome = self.save_replayable_rejected_outcome(
+                                &command_name,
+                                &request,
+                                &context,
+                                rejection,
+                                record,
+                                now,
+                                uow.as_ref(),
+                            )?;
+                            self.deps.unit_of_work_manager.commit(uow)?;
+                            return Ok(outcome);
+                        }
+                        (
+                            CareerRecord::pending_review(
+                                record_ref.clone(),
+                                request.body.member_ref.clone(),
+                                source_summary.clone(),
+                                request.body.append_reason_ref.clone(),
+                                context.actor_ref.clone(),
+                                now,
+                            )?,
+                            None,
+                            None,
+                        )
+                    }
+                    _ => {
+                        let rejection = Self::protocol_rejection(
+                            &command_name,
+                            IdentityProtocolRejectionKind::PolicyDenied,
+                            "career history is append-only",
+                        );
+                        let outcome = self.save_replayable_rejected_outcome(
+                            &command_name,
+                            &request,
+                            &context,
+                            rejection,
+                            record,
+                            now,
+                            uow.as_ref(),
+                        )?;
+                        self.deps.unit_of_work_manager.commit(uow)?;
+                        return Ok(outcome);
+                    }
+                };
+
+                self.deps
+                    .career_record_repository
+                    .append_career_record(career_record.clone(), uow.as_ref())?;
+                let accepted_cursor_ref = self
+                    .deps
+                    .cursor_assigner
+                    .assign_truth_change_cursor(uow.as_ref())?;
+                let subjects = self
+                    .deps
+                    .truth_change_subject_mapper
+                    .career_record_subjects(career_record.career_record_ref.clone());
+                let change_kind_ref = IdentityChangeKindRef::new(
+                    IdentityChangeKind::CareerRecordChanged,
+                    Some(request.body.work_source_ref.source_ref.clone()),
+                );
+                let trace = self.command_trace_record(
+                    request.body.member_ref.clone(),
+                    &subjects,
+                    change_kind_ref.clone(),
+                    accepted_cursor_ref.clone(),
+                    Some(Self::accepted_change_reason(
+                        &request.body.append_reason_ref.source_ref,
+                    )),
+                    Some(request.body.work_source_ref.source_ref.clone()),
+                    None,
+                    context.actor_ref.clone(),
+                    now,
+                )?;
+                self.deps
+                    .trace_record_repository
+                    .append_trace_record(trace.clone(), uow.as_ref())?;
+                let audit_trail_ref = self.append_accepted_audit(
+                    &context,
+                    Some(request.body.member_ref.clone()),
+                    &subjects,
+                    &change_kind_ref,
+                    &accepted_cursor_ref,
+                    &trace,
+                    now,
+                    uow.as_ref(),
+                )?;
+
+                let mut outbox_refs = Vec::new();
+                if let Some(topic) = create_outbox {
+                    let outbox = self.outbox_record(
+                        request.body.member_ref.clone(),
+                        subjects.outbox_subject_ref.clone(),
+                        change_kind_ref.clone(),
+                        topic,
+                        topic,
+                        trace.trace_record_ref.clone(),
+                        now,
+                    )?;
+                    let outbox_ref = outbox.outbox_record_ref.clone();
+                    self.deps
+                        .outbox_repository
+                        .save_outbox_record(outbox, None, uow.as_ref())?;
+                    outbox_refs.push(outbox_ref);
+                }
+
+                let stale_projection_refs =
+                    self.save_projection_stale_marks(&subjects, now, uow.as_ref())?;
+                let stored_result_ref = self.deps.id_generator.new_identity_stored_result_ref()?;
+                let surface_marker_ref = self
+                    .deps
+                    .id_generator
+                    .new_identity_stored_surface_marker_ref()?;
+                let effect_summary_ref = self
+                    .deps
+                    .id_generator
+                    .new_identity_command_effect_summary_ref()?;
+                let effect_summary = IdentityCommandEffectSummary::from_accepted_change(
+                    effect_summary_ref,
+                    context.context_ref.clone(),
+                    IdentityAcceptedEffectKind::CareerRecordCommandResult,
+                    IdentityTruthRef::CareerRecord(career_record.career_record_ref.clone()),
+                    accepted_cursor_ref.clone(),
+                    vec![trace.trace_record_ref.clone()],
+                    Some(audit_trail_ref),
+                    outbox_refs,
+                    stale_projection_refs,
+                    stored_result_ref.clone(),
+                );
+                let result = CareerRecordCommandResult {
+                    member_ref: request.body.member_ref.clone(),
+                    career_record_ref: career_record.career_record_ref.clone(),
+                    record_state_kind: Self::map_public_career_record_state(
+                        career_record.record_state,
+                    ),
+                    project_participation_ref: career_record.project_participation_ref.clone(),
+                    work_source_ref: career_record.work_source_ref.clone(),
+                    source_marker_ref: career_record.source_marker_ref.clone(),
+                    career_summary_ref: career_record.career_summary_ref.clone(),
+                    correction_of_ref: career_record.correction_of_ref.clone(),
+                    superseded_record_ref: superseded_record_ref,
+                };
+                let effect = Self::public_effect_from_summary(
+                    &effect_summary,
+                    vec![subjects.audit_subject_ref.clone()],
+                );
+                let stored = StoredIdentityOperationResult::command_accepted(
+                    stored_result_ref.clone(),
+                    context.context_ref.clone(),
+                    surface_marker_ref.clone(),
+                    now,
+                );
+                self.deps
+                    .stored_result_repository
+                    .save_command_accepted_result(stored, uow.as_ref())?;
+                self.deps
+                    .effect_summary_repository
+                    .save_effect_summary(effect_summary, uow.as_ref())?;
+                self.deps
+                    .stored_result_repository
+                    .save_command_accepted_envelope(
+                        IdentityCommandAcceptedResultEnvelope::new(
+                            stored_result_ref.clone(),
+                            context.context_ref.clone(),
+                            command_name.clone(),
+                            surface_marker_ref,
+                            IdentityCommandTypedResult::CareerRecord(result.clone()),
+                            effect.clone(),
+                            now,
+                        ),
+                        uow.as_ref(),
+                    )?;
+                self.deps
+                    .idempotency_repository
+                    .complete_with_stored_result(
+                        record.value,
+                        stored_result_ref.clone(),
+                        now,
+                        record.version,
+                        uow.as_ref(),
+                    )?;
+                self.deps.unit_of_work_manager.commit(uow)?;
+                Ok(IdentityCommandOutcome::Accepted(Self::accepted_response(
+                    command_name,
+                    stored_result_ref,
+                    result,
+                    effect,
+                )))
+            }
+        }
+    }
+
+    /// Shared skeleton for the memory reference command vertical slice.
+    pub fn maintain_memory_reference(
+        &self,
+        request: IdentityCommandRequest<MaintainMemoryReferenceRequest>,
+        context: IdentityOperationContext,
+    ) -> Result<IdentityCommandOutcome<MemoryReferenceCommandResult>, ApplicationError> {
+        Self::assert_command_context(&request, &context)?;
+        let command_name = request.command_name.clone();
+        let now = self.deps.clock.now()?;
+        let uow = self.deps.unit_of_work_manager.begin()?;
+        let reserve = match self.reserve_idempotency(&context, now, uow.as_ref()) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.rollback_quietly(uow);
+                return self
+                    .map_runtime_unavailable(&command_name, error)
+                    .map(IdentityCommandOutcome::Rejected);
+            }
+        };
+
+        match reserve {
+            IdempotencyReserveOutcome::ReplayAvailable {
+                stored_result_ref, ..
+            } => {
+                self.rollback_quietly(uow);
+                self.load_replayed_command_outcome(command_name, stored_result_ref, |typed| {
+                    match typed {
+                        IdentityCommandTypedResult::MemoryReference(result) => Some(result),
+                        _ => None,
+                    }
+                })
+            }
+            IdempotencyReserveOutcome::Conflict(record) => {
+                let rejection = Self::protocol_rejection(
+                    &command_name,
+                    IdentityProtocolRejectionKind::DuplicateConflict,
+                    "same idempotency key is already bound to different canonical material",
+                );
+                self.deps.idempotency_repository.mark_conflict(
+                    record.value,
+                    now,
+                    record.version,
+                    uow.as_ref(),
+                )?;
+                self.deps.unit_of_work_manager.commit(uow)?;
+                Ok(IdentityCommandOutcome::Rejected(rejection))
+            }
+            IdempotencyReserveOutcome::InFlight(_) => {
+                self.rollback_quietly(uow);
+                Ok(IdentityCommandOutcome::Rejected(
+                    Self::adapter_unavailable_rejection(
+                        &command_name,
+                        "same command idempotency key and digest is still in flight",
+                    ),
+                ))
+            }
+            IdempotencyReserveOutcome::Reserved(record) => {
+                let member_exists = self
+                    .deps
+                    .member_repository
+                    .get_member_with_version(request.body.member_ref.clone())?
+                    .is_some();
+                if !member_exists {
+                    let rejection =
+                        self.command_not_found_rejection(&command_name, "member does not exist");
+                    let outcome = self.save_replayable_rejected_outcome(
+                        &command_name,
+                        &request,
+                        &context,
+                        rejection,
+                        record,
+                        now,
+                        uow.as_ref(),
+                    )?;
+                    self.deps.unit_of_work_manager.commit(uow)?;
+                    return Ok(outcome);
+                }
+
+                let source_summary = if request.body.change_intent
+                    == identity_contracts::refs::MemoryReferenceChangeIntent::RecordArchiveHandoffResult
+                    && request.body.archive_handoff_ref.is_some()
+                {
+                    self.deps.external_source_resolver.resolve_archive_handoff_source(
+                        request
+                            .body
+                            .archive_handoff_ref
+                            .clone()
+                            .expect("checked is_some"),
+                    )?
+                } else {
+                    self.deps
+                        .external_source_resolver
+                        .resolve_memory_reference_source(request.body.source_ref.clone())?
+                };
+                if source_summary.source_ref != request.body.source_ref {
+                    let rejection = Self::protocol_rejection(
+                        &command_name,
+                        IdentityProtocolRejectionKind::InvalidRequest,
+                        "resolved memory reference source does not match request source",
+                    );
+                    let outcome = self.save_replayable_rejected_outcome(
+                        &command_name,
+                        &request,
+                        &context,
+                        rejection,
+                        record,
+                        now,
+                        uow.as_ref(),
+                    )?;
+                    self.deps.unit_of_work_manager.commit(uow)?;
+                    return Ok(outcome);
+                }
+                if !source_summary.has_reference() {
+                    let rejection = Self::protocol_rejection(
+                        &command_name,
+                        IdentityProtocolRejectionKind::InvalidRequest,
+                        "memory reference change requires at least one formal marker",
+                    );
+                    let outcome = self.save_replayable_rejected_outcome(
+                        &command_name,
+                        &request,
+                        &context,
+                        rejection,
+                        record,
+                        now,
+                        uow.as_ref(),
+                    )?;
+                    self.deps.unit_of_work_manager.commit(uow)?;
+                    return Ok(outcome);
+                }
+
+                let existing_reference_v = if let Some(reference_ref) =
+                    request.body.requested_memory_reference_ref.clone()
+                {
+                    self.deps
+                        .memory_reference_repository
+                        .get_memory_reference_with_version(reference_ref)?
+                } else if let Some(memory_ref) = request.body.memory_ref.clone() {
+                    self.deps
+                        .memory_reference_repository
+                        .find_reference_by_memory(request.body.member_ref.clone(), memory_ref)?
+                } else if let Some(archive_ref) = request.body.archive_ref.clone() {
+                    self.deps
+                        .memory_reference_repository
+                        .find_reference_by_archive(request.body.member_ref.clone(), archive_ref)?
+                } else if let Some(handoff_ref) = request.body.archive_handoff_ref.clone() {
+                    self.deps
+                        .memory_reference_repository
+                        .find_reference_by_handoff(handoff_ref)?
+                } else {
+                    None
+                };
+
+                let policy = match request.body.change_intent {
+                    identity_contracts::refs::MemoryReferenceChangeIntent::LinkMemory => {
+                        MemoryReferencePolicy::for_link(
+                            request.body.member_ref.clone(),
+                            member_exists,
+                            source_summary.clone(),
+                            request.body.reason_ref.clone(),
+                            context.actor_ref.clone(),
+                            context.channel,
+                            request.body.change_material_marker.clone(),
+                        )
+                    }
+                    identity_contracts::refs::MemoryReferenceChangeIntent::RefreshState
+                        => {
+                        MemoryReferencePolicy::for_refresh(
+                            request.body.member_ref.clone(),
+                            member_exists,
+                            source_summary.clone(),
+                            request.body.reason_ref.clone(),
+                            context.actor_ref.clone(),
+                            context.channel,
+                            request.body.change_material_marker.clone(),
+                        )
+                    }
+                    identity_contracts::refs::MemoryReferenceChangeIntent::MarkPendingVerification => {
+                        MemoryReferencePolicy {
+                            member_ref: request.body.member_ref.clone(),
+                            member_exists,
+                            source_summary: source_summary.clone(),
+                            reason_ref: request.body.reason_ref.clone(),
+                            actor_ref: context.actor_ref.clone(),
+                            operation_channel: context.channel,
+                            change_intent: identity_contracts::refs::MemoryReferenceChangeIntent::MarkPendingVerification,
+                            change_material_marker: request.body.change_material_marker.clone(),
+                        }
+                    }
+                    identity_contracts::refs::MemoryReferenceChangeIntent::AttachArchive => {
+                        MemoryReferencePolicy {
+                            member_ref: request.body.member_ref.clone(),
+                            member_exists,
+                            source_summary: source_summary.clone(),
+                            reason_ref: request.body.reason_ref.clone(),
+                            actor_ref: context.actor_ref.clone(),
+                            operation_channel: context.channel,
+                            change_intent: identity_contracts::refs::MemoryReferenceChangeIntent::AttachArchive,
+                            change_material_marker: request.body.change_material_marker.clone(),
+                        }
+                    }
+                    _ => MemoryReferencePolicy::for_archive_handoff(
+                        request.body.member_ref.clone(),
+                        member_exists,
+                        source_summary.clone(),
+                        request.body.reason_ref.clone(),
+                        context.actor_ref.clone(),
+                        context.channel,
+                        request.body.change_material_marker.clone(),
+                    ),
+                };
+                if let Err(error) = policy
+                    .assert_member_exists()
+                    .and_then(|_| policy.assert_reference_present())
+                    .and_then(|_| policy.assert_body_free())
+                    .and_then(|_| policy.assert_handoff_marker_body_free())
+                    .and_then(|_| policy.assert_not_external_owner_write())
+                    .and_then(|_| policy.assert_allowed_write_channel())
+                    .and_then(|_| policy.assert_source_trusted())
+                {
+                    let app_error = ApplicationError::from(error);
+                    let rejection = Self::rejection_from_error(&command_name, &app_error)
+                        .ok_or(app_error.clone())?;
+                    let outcome = self.save_replayable_rejected_outcome(
+                        &command_name,
+                        &request,
+                        &context,
+                        rejection,
+                        record,
+                        now,
+                        uow.as_ref(),
+                    )?;
+                    self.deps.unit_of_work_manager.commit(uow)?;
+                    return Ok(outcome);
+                }
+
+                let reference_ref = match existing_reference_v.as_ref() {
+                    Some(value) => value.value.memory_reference_ref.clone(),
+                    None => match request.body.requested_memory_reference_ref.clone() {
+                        Some(value) => value,
+                        None => identity_contracts::refs::MemoryReferenceRef::from_id(
+                            self.deps.id_generator.new_memory_reference_id()?,
+                        ),
+                    },
+                };
+
+                let memory_reference = match request.body.change_intent {
+                    identity_contracts::refs::MemoryReferenceChangeIntent::LinkMemory => {
+                        if let Some(existing_reference_v) = existing_reference_v.as_ref() {
+                            let mut updated = existing_reference_v.value.clone();
+                            let memory_ref = source_summary
+                                .memory_ref
+                                .clone()
+                                .ok_or_else(|| {
+                                    ApplicationError::invalid_request(
+                                        "trusted memory link requires memory ref",
+                                    )
+                                })?;
+                            updated.update_reference_state(
+                                MemoryReferenceState::linked(
+                                    memory_ref,
+                                    request.body.reason_ref.clone(),
+                                    now,
+                                ),
+                                request.body.reason_ref.clone(),
+                                context.actor_ref.clone(),
+                                now,
+                            )?;
+                            updated
+                        } else {
+                            MemoryReference::link_for_member(
+                                reference_ref.clone(),
+                                request.body.member_ref.clone(),
+                                source_summary.clone(),
+                                request.body.reason_ref.clone(),
+                                context.actor_ref.clone(),
+                                now,
+                            )?
+                        }
+                    }
+                    identity_contracts::refs::MemoryReferenceChangeIntent::RefreshState => {
+                        let mut updated = match existing_reference_v.as_ref() {
+                            Some(value) => value.value.clone(),
+                            None => {
+                                let rejection = self.command_not_found_rejection(
+                                    &command_name,
+                                    "memory reference relation does not exist for refresh",
+                                );
+                                let outcome = self.save_replayable_rejected_outcome(
+                                    &command_name,
+                                    &request,
+                                    &context,
+                                    rejection,
+                                    record,
+                                    now,
+                                    uow.as_ref(),
+                                )?;
+                                self.deps.unit_of_work_manager.commit(uow)?;
+                                return Ok(outcome);
+                            }
+                        };
+                        let next_state = match source_summary.source_state {
+                            MemoryReferenceSourceState::Stale => {
+                                let mut state = updated.reference_state.clone();
+                                state.mark_stale(request.body.reason_ref.clone(), now)?;
+                                state
+                            }
+                            MemoryReferenceSourceState::Unavailable => {
+                                let mut state = updated.reference_state.clone();
+                                state.mark_unavailable(request.body.reason_ref.clone(), now)?;
+                                state
+                            }
+                            MemoryReferenceSourceState::PendingVerification
+                            | MemoryReferenceSourceState::Untrusted => {
+                                MemoryReferenceState::pending_verification(
+                                    source_summary.memory_ref.clone(),
+                                    source_summary.archive_ref.clone(),
+                                    source_summary.archive_handoff_ref.clone(),
+                                    request.body.reason_ref.clone(),
+                                    now,
+                                )
+                            }
+                            _ => {
+                                return Err(ApplicationError::domain_rejected(
+                                    "refresh state requires stale, unavailable, or verification source state",
+                                ));
+                            }
+                        };
+                        updated.update_reference_state(
+                            next_state,
+                            request.body.reason_ref.clone(),
+                            context.actor_ref.clone(),
+                            now,
+                        )?;
+                        updated
+                    }
+                    identity_contracts::refs::MemoryReferenceChangeIntent::AttachArchive
+                    | identity_contracts::refs::MemoryReferenceChangeIntent::RecordArchiveHandoffResult => {
+                        if let Some(existing_reference_v) = existing_reference_v.as_ref() {
+                            let mut updated = existing_reference_v.value.clone();
+                            let next_state = match source_summary.source_state {
+                                MemoryReferenceSourceState::HandoffResultAccepted => {
+                                    if let (Some(archive_ref), Some(handoff_ref)) = (
+                                        source_summary.archive_ref.clone(),
+                                        source_summary.archive_handoff_ref.clone(),
+                                    ) {
+                                        MemoryReferenceState::archived(
+                                            archive_ref,
+                                            handoff_ref,
+                                            request.body.reason_ref.clone(),
+                                            now,
+                                        )
+                                    } else {
+                                        MemoryReferenceState::pending_verification(
+                                            source_summary.memory_ref.clone(),
+                                            source_summary.archive_ref.clone(),
+                                            source_summary.archive_handoff_ref.clone(),
+                                            request.body.reason_ref.clone(),
+                                            now,
+                                        )
+                                    }
+                                }
+                                MemoryReferenceSourceState::HandoffResultFailed => {
+                                    MemoryReferenceState::handoff_failed(
+                                        source_summary
+                                            .archive_handoff_ref
+                                            .clone()
+                                            .ok_or_else(|| {
+                                                ApplicationError::invalid_request(
+                                                    "handoff failed state requires handoff marker",
+                                                )
+                                            })?,
+                                        request.body.reason_ref.clone(),
+                                        now,
+                                    )
+                                }
+                                _ => {
+                                    return Err(ApplicationError::domain_rejected(
+                                        "archive handoff update requires accepted or failed handoff source state",
+                                    ));
+                                }
+                            };
+                            updated.update_reference_state(
+                                next_state,
+                                request.body.reason_ref.clone(),
+                                context.actor_ref.clone(),
+                                now,
+                            )?;
+                            updated
+                        } else {
+                            MemoryReference::from_archive_handoff(
+                                reference_ref.clone(),
+                                request.body.member_ref.clone(),
+                                source_summary.clone(),
+                                request.body.reason_ref.clone(),
+                                context.actor_ref.clone(),
+                                now,
+                            )?
+                        }
+                    }
+                    identity_contracts::refs::MemoryReferenceChangeIntent::MarkPendingVerification => {
+                        if let Some(existing_reference_v) = existing_reference_v.as_ref() {
+                            let mut updated = existing_reference_v.value.clone();
+                            updated.update_reference_state(
+                                MemoryReferenceState::pending_verification(
+                                    source_summary.memory_ref.clone(),
+                                    source_summary.archive_ref.clone(),
+                                    source_summary.archive_handoff_ref.clone(),
+                                    request.body.reason_ref.clone(),
+                                    now,
+                                ),
+                                request.body.reason_ref.clone(),
+                                context.actor_ref.clone(),
+                                now,
+                            )?;
+                            updated
+                        } else {
+                            MemoryReference::link_for_member(
+                                reference_ref.clone(),
+                                request.body.member_ref.clone(),
+                                identity_contracts::refs::MemoryReferenceSourceSummary::from_resolver(
+                                    source_summary.source_ref.clone(),
+                                    source_summary.memory_ref.clone(),
+                                    source_summary.archive_ref.clone(),
+                                    source_summary.archive_handoff_ref.clone(),
+                                    source_summary.safe_summary_ref.clone(),
+                                    MemoryReferenceSourceState::PendingVerification,
+                                ),
+                                request.body.reason_ref.clone(),
+                                context.actor_ref.clone(),
+                                now,
+                            )?
+                        }
+                    }
+                    _ => {
+                        let rejection = Self::protocol_rejection(
+                            &command_name,
+                            IdentityProtocolRejectionKind::PolicyDenied,
+                            "memory relation must not write or delete external owner truth",
+                        );
+                        let outcome = self.save_replayable_rejected_outcome(
+                            &command_name,
+                            &request,
+                            &context,
+                            rejection,
+                            record,
+                            now,
+                            uow.as_ref(),
+                        )?;
+                        self.deps.unit_of_work_manager.commit(uow)?;
+                        return Ok(outcome);
+                    }
+                };
+
+                self.deps
+                    .memory_reference_repository
+                    .save_memory_reference(
+                        memory_reference.clone(),
+                        existing_reference_v.as_ref().map(|value| value.version),
+                        uow.as_ref(),
+                    )?;
+                let accepted_cursor_ref = self
+                    .deps
+                    .cursor_assigner
+                    .assign_truth_change_cursor(uow.as_ref())?;
+                let subjects = self
+                    .deps
+                    .truth_change_subject_mapper
+                    .memory_reference_subjects(reference_ref.clone());
+                let change_kind_ref = IdentityChangeKindRef::new(
+                    IdentityChangeKind::MemoryReferenceChanged,
+                    Some(request.body.source_ref.source_ref.clone()),
+                );
+                let trace = self.command_trace_record(
+                    request.body.member_ref.clone(),
+                    &subjects,
+                    change_kind_ref.clone(),
+                    accepted_cursor_ref.clone(),
+                    Some(Self::accepted_change_reason(
+                        &request.body.reason_ref.source_ref,
+                    )),
+                    Some(request.body.source_ref.source_ref.clone()),
+                    None,
+                    context.actor_ref.clone(),
+                    now,
+                )?;
+                self.deps
+                    .trace_record_repository
+                    .append_trace_record(trace.clone(), uow.as_ref())?;
+                let audit_trail_ref = self.append_accepted_audit(
+                    &context,
+                    Some(request.body.member_ref.clone()),
+                    &subjects,
+                    &change_kind_ref,
+                    &accepted_cursor_ref,
+                    &trace,
+                    now,
+                    uow.as_ref(),
+                )?;
+                let outbox = self.outbox_record(
+                    request.body.member_ref.clone(),
+                    subjects.outbox_subject_ref.clone(),
+                    change_kind_ref.clone(),
+                    "identity.memory.reference.changed.v1",
+                    "identity.memory.reference.changed.v1",
+                    trace.trace_record_ref.clone(),
+                    now,
+                )?;
+                let outbox_ref = outbox.outbox_record_ref.clone();
+                self.deps
+                    .outbox_repository
+                    .save_outbox_record(outbox, None, uow.as_ref())?;
+                let stale_projection_refs =
+                    self.save_projection_stale_marks(&subjects, now, uow.as_ref())?;
+                let stored_result_ref = self.deps.id_generator.new_identity_stored_result_ref()?;
+                let surface_marker_ref = self
+                    .deps
+                    .id_generator
+                    .new_identity_stored_surface_marker_ref()?;
+                let effect_summary_ref = self
+                    .deps
+                    .id_generator
+                    .new_identity_command_effect_summary_ref()?;
+                let effect_summary = IdentityCommandEffectSummary::from_accepted_change(
+                    effect_summary_ref,
+                    context.context_ref.clone(),
+                    IdentityAcceptedEffectKind::MemoryReferenceCommandResult,
+                    IdentityTruthRef::MemoryReference(reference_ref.clone()),
+                    accepted_cursor_ref,
+                    vec![trace.trace_record_ref.clone()],
+                    Some(audit_trail_ref),
+                    vec![outbox_ref],
+                    stale_projection_refs,
+                    stored_result_ref.clone(),
+                );
+                let result = MemoryReferenceCommandResult {
+                    member_ref: request.body.member_ref.clone(),
+                    memory_reference_ref: reference_ref,
+                    reference_state_kind: Self::map_public_memory_reference_state(
+                        memory_reference.reference_state.state_kind,
+                    ),
+                    memory_ref: memory_reference.memory_ref.clone(),
+                    archive_ref: memory_reference.archive_ref.clone(),
+                    archive_handoff_ref: memory_reference.archive_handoff_ref.clone(),
+                    source_ref: memory_reference.source_ref.clone(),
+                    safe_summary_ref: memory_reference.safe_summary_ref.clone(),
+                    reason_ref: memory_reference.change_reason_ref.clone(),
+                };
+                let effect = Self::public_effect_from_summary(
+                    &effect_summary,
+                    vec![subjects.audit_subject_ref.clone()],
+                );
+                let stored = StoredIdentityOperationResult::command_accepted(
+                    stored_result_ref.clone(),
+                    context.context_ref.clone(),
+                    surface_marker_ref.clone(),
+                    now,
+                );
+                self.deps
+                    .stored_result_repository
+                    .save_command_accepted_result(stored, uow.as_ref())?;
+                self.deps
+                    .effect_summary_repository
+                    .save_effect_summary(effect_summary, uow.as_ref())?;
+                self.deps
+                    .stored_result_repository
+                    .save_command_accepted_envelope(
+                        IdentityCommandAcceptedResultEnvelope::new(
+                            stored_result_ref.clone(),
+                            context.context_ref.clone(),
+                            command_name.clone(),
+                            surface_marker_ref,
+                            IdentityCommandTypedResult::MemoryReference(result.clone()),
                             effect.clone(),
                             now,
                         ),

@@ -3,7 +3,8 @@
 use core_contracts::actor::ActorRef;
 use core_contracts::metadata::IdempotencyKey;
 use identity_contracts::commands::{
-    GlobalLifecycleCommandResult, GlobalMemberCommandResult, IdentityCommandEffectPublicSummary,
+    CareerRecordCommandResult, GlobalLifecycleCommandResult, GlobalMemberCommandResult,
+    IdentityCommandEffectPublicSummary, MemoryReferenceCommandResult, RoleCapabilityCommandResult,
 };
 use identity_contracts::events::IdentityConsumerReceipt;
 use identity_contracts::jobs::IdentityJobResultKind;
@@ -806,6 +807,12 @@ pub enum IdentityCommandTypedResult {
     GlobalMember(GlobalMemberCommandResult),
     /// `UpdateGlobalLifecycleState` accepted result.
     GlobalLifecycle(GlobalLifecycleCommandResult),
+    /// `MaintainRoleCapabilitySummary` accepted result.
+    RoleCapability(RoleCapabilityCommandResult),
+    /// `AppendCareerRecord` accepted result.
+    CareerRecord(CareerRecordCommandResult),
+    /// `MaintainMemoryReference` accepted result.
+    MemoryReference(MemoryReferenceCommandResult),
 }
 
 /// Typed stored accepted command envelope used as duplicate replay source.
