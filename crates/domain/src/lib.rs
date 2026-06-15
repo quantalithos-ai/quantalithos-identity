@@ -2,6 +2,7 @@
 //!
 //! This crate holds the core truth, state, policy, and guard foundations.
 
+pub mod audit;
 pub mod career;
 pub mod errors;
 pub mod handoff;
@@ -13,3 +14,4 @@ pub mod projection_state;
 pub mod reconciliation;
 pub mod reference_state;
 pub mod role_capability;
+pub mod trace;

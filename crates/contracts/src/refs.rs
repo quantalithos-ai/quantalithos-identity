@@ -1906,6 +1906,20 @@ impl IdentityChangeKindRef {
     }
 }
 
+/// Body-free reason marker for identity trace and audit changes.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct IdentityChangeReasonRef {
+    /// Opaque reason source marker.
+    pub source_ref: IdentitySourceRef,
+}
+
+impl IdentityChangeReasonRef {
+    /// Creates a new change reason marker.
+    pub fn new(source_ref: IdentitySourceRef) -> Self {
+        Self { source_ref }
+    }
+}
+
 string_newtype!(AuditTrailRef, "Audit trail reference.");
 string_newtype!(HandoffScopeRef, "Handoff scope marker.");
 string_newtype!(HandoffTargetRef, "Handoff target marker.");
@@ -1946,6 +1960,9 @@ string_newtype!(
     IdentityApiRequestMarkerRef,
     "Body-free API request material marker."
 );
+string_newtype!(AuditCursorRef, "Audit pagination cursor marker.");
+string_newtype!(AuditScopeRef, "Audit read scope marker.");
+string_newtype!(ConsumerRef, "Identity consumer marker.");
 string_newtype!(
     IdentityAuditSubjectRef,
     "Canonical audit subject reference."
@@ -1976,6 +1993,10 @@ string_newtype!(
 string_newtype!(IdentityJobRunRef, "Operations job run reference.");
 string_newtype!(IdentityJobScopeMarkerRef, "Operations job scope marker.");
 string_newtype!(IdentityMaintenanceTargetRef, "Maintenance target marker.");
+string_newtype!(
+    MemberSummaryViewRef,
+    "Stable member summary view reference."
+);
 string_newtype!(
     IdentityOutboxPayloadMarkerRef,
     "Body-free outbound payload marker."
@@ -2016,6 +2037,7 @@ string_newtype!(
 );
 string_newtype!(ReconciliationReportRef, "Reconciliation report reference.");
 string_newtype!(TopicKeyRef, "Topic binding key marker.");
+string_newtype!(RedactionProfileRef, "Safe redaction profile marker.");
 string_newtype!(VisibilityContextRef, "Visibility context marker.");
 string_newtype!(VisibilityResultRef, "Visibility result marker.");
 string_newtype!(VisibilityScopeRef, "Visibility scope marker.");
@@ -2062,22 +2084,20 @@ impl IdentityTimestamp {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityReadSurfaceKind {
-    /// Member summary read surface.
-    Summary,
-    /// Identity trace read surface.
-    Trace,
-    /// Audit trail read surface.
-    Audit,
-    /// Projection state read surface.
-    Projection,
-    /// Reference resolution read surface.
-    Reference,
-    /// Reconciliation report read surface.
-    Report,
-    /// Outbox read surface.
-    Outbox,
-    /// Handoff read surface.
-    Handoff,
+    /// Material is found and visible.
+    Found,
+    /// Material does not exist or the backing projection is missing.
+    NotFound,
+    /// Material exists but is not visible to the requester.
+    NotVisible,
+    /// Material is returned with field redaction.
+    Redacted,
+    /// Material is returned from a stale projection.
+    Stale,
+    /// Material can only be returned in degraded form.
+    Degraded,
+    /// Result set is empty.
+    Empty,
 }
 
 /// Public projection freshness marker reused by query and job shells.

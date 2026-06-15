@@ -11,8 +11,8 @@ use identity_contracts::receipts::{MaintenanceIssueRef, TraceHandoffIntentRef};
 use identity_contracts::refs::{
     AuditTrailRef, ExternalReferenceRef, GlobalMemberRef, HandoffReceiptRef,
     IdentityApiRequestMarkerRef, IdentityConsumerBindingRef, IdentityConsumerReceiptRef,
-    IdentityDegradedMarkerRef, IdentityJobCursorRef, IdentityJobReportRef,
-    IdentityJobRunMetadataRef, IdentityJobRunRef, IdentityJobScopeMarkerRef,
+    IdentityDegradedMarkerRef, IdentityEventEnvelopeMarkerRef, IdentityJobCursorRef,
+    IdentityJobReportRef, IdentityJobRunMetadataRef, IdentityJobRunRef, IdentityJobScopeMarkerRef,
     IdentityMaintenanceTargetRef, IdentityOutboxRecordRef, IdentityProjectionRef,
     IdentityRedactionMarkerRef, IdentitySourceEventRef, IdentityStoredResultRef, IdentityTimestamp,
     IdentityTraceContextRef, IdentityTraceRecordRef, IdentityTraceSubjectRef, IdentityTruthCursor,
@@ -93,6 +93,17 @@ string_newtype!(
     "Application service dispatch target marker."
 );
 string_newtype!(IdentityApiRouteRef, "API route marker.");
+string_newtype!(IdentityRuntimeProfileRef, "Runtime profile marker.");
+string_newtype!(IdentityConfigEvidenceRef, "Runtime config evidence marker.");
+string_newtype!(
+    IdentityApiRouteCatalogRef,
+    "API route catalog binding marker."
+);
+string_newtype!(
+    IdentityConsumerBindingCatalogRef,
+    "Worker binding catalog marker."
+);
+string_newtype!(IdentityJobCatalogRef, "Job catalog binding marker.");
 string_newtype!(IdentityRuntimeAssemblyRef, "Runtime assembly identity.");
 string_newtype!(IdentityApiEntryRef, "API entry identity.");
 string_newtype!(IdentityEntryDispatchRef, "API dispatch attempt identity.");
@@ -1168,6 +1179,559 @@ impl IdentityJobRunReport {
         self.finished_at = Some(finished_at);
         self
     }
+}
+
+/// Validation state of a body-free runtime config shell.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityConfigValidationStateKind {
+    /// Config has been validated and is ready for assembly.
+    Validated,
+    /// Config is degraded but may still assemble in a controlled mode.
+    Degraded,
+    /// Config is invalid and must not assemble.
+    Invalid,
+}
+
+/// Validated runtime config shell used by runtime assembly and fake runtime tests.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityRuntimeConfigShell {
+    /// Formal runtime profile marker.
+    pub profile_ref: IdentityRuntimeProfileRef,
+    /// Body-free config evidence marker.
+    pub config_evidence_ref: IdentityConfigEvidenceRef,
+    /// Configured adapter modes.
+    pub adapter_mode_refs: Vec<IdentityAdapterModeRef>,
+    /// Optional API binding catalog marker.
+    pub api_binding_ref: Option<IdentityApiRouteCatalogRef>,
+    /// Optional worker binding catalog marker.
+    pub worker_binding_ref: Option<IdentityConsumerBindingCatalogRef>,
+    /// Optional job binding catalog marker.
+    pub job_binding_ref: Option<IdentityJobCatalogRef>,
+    /// Safe config issue refs.
+    pub issue_refs: Vec<IdentityConfigIssueRef>,
+    /// Validation state.
+    pub validation_state: IdentityConfigValidationStateKind,
+}
+
+impl IdentityRuntimeConfigShell {
+    /// Creates a validated config shell.
+    pub fn validated(
+        profile_ref: IdentityRuntimeProfileRef,
+        config_evidence_ref: IdentityConfigEvidenceRef,
+        adapter_mode_refs: Vec<IdentityAdapterModeRef>,
+        api_binding_ref: Option<IdentityApiRouteCatalogRef>,
+        worker_binding_ref: Option<IdentityConsumerBindingCatalogRef>,
+        job_binding_ref: Option<IdentityJobCatalogRef>,
+    ) -> Self {
+        Self {
+            profile_ref,
+            config_evidence_ref,
+            adapter_mode_refs,
+            api_binding_ref,
+            worker_binding_ref,
+            job_binding_ref,
+            issue_refs: Vec::new(),
+            validation_state: IdentityConfigValidationStateKind::Validated,
+        }
+    }
+
+    /// Creates a degraded config shell.
+    pub fn degraded(
+        profile_ref: IdentityRuntimeProfileRef,
+        config_evidence_ref: IdentityConfigEvidenceRef,
+        adapter_mode_refs: Vec<IdentityAdapterModeRef>,
+        api_binding_ref: Option<IdentityApiRouteCatalogRef>,
+        worker_binding_ref: Option<IdentityConsumerBindingCatalogRef>,
+        job_binding_ref: Option<IdentityJobCatalogRef>,
+        issue_refs: Vec<IdentityConfigIssueRef>,
+    ) -> Self {
+        Self {
+            profile_ref,
+            config_evidence_ref,
+            adapter_mode_refs,
+            api_binding_ref,
+            worker_binding_ref,
+            job_binding_ref,
+            issue_refs,
+            validation_state: IdentityConfigValidationStateKind::Degraded,
+        }
+    }
+
+    /// Creates an invalid config shell.
+    pub fn invalid(
+        profile_ref: IdentityRuntimeProfileRef,
+        config_evidence_ref: IdentityConfigEvidenceRef,
+        issue_refs: Vec<IdentityConfigIssueRef>,
+    ) -> Self {
+        Self {
+            profile_ref,
+            config_evidence_ref,
+            adapter_mode_refs: Vec::new(),
+            api_binding_ref: None,
+            worker_binding_ref: None,
+            job_binding_ref: None,
+            issue_refs,
+            validation_state: IdentityConfigValidationStateKind::Invalid,
+        }
+    }
+
+    /// Returns whether the shell allows the given entry surface to be wired.
+    pub fn allows_entry(&self, surface_kind: IdentityEntrySurfaceKind) -> bool {
+        if self.validation_state == IdentityConfigValidationStateKind::Invalid {
+            return false;
+        }
+
+        match surface_kind {
+            IdentityEntrySurfaceKind::ApiCommand | IdentityEntrySurfaceKind::ApiQuery => {
+                self.api_binding_ref.is_some()
+            }
+            IdentityEntrySurfaceKind::WorkerConsumer | IdentityEntrySurfaceKind::WorkerCallback => {
+                self.worker_binding_ref.is_some()
+            }
+            IdentityEntrySurfaceKind::OperationsJob => self.job_binding_ref.is_some(),
+        }
+    }
+}
+
+/// Runtime assembly state kind for entry readiness and fake runtime wiring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityRuntimeAssemblyStateKind {
+    /// Runtime has not started assembly.
+    NotStarted,
+    /// Config has been validated but ports are not wired yet.
+    ConfigValidated,
+    /// Runtime is assembled and ready for dispatch.
+    Assembled,
+    /// Runtime is assembled but degraded.
+    Degraded,
+    /// Runtime assembly failed.
+    Failed,
+}
+
+/// Body-free runtime assembly state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityRuntimeAssemblyState {
+    /// Stable runtime assembly ref.
+    pub assembly_ref: IdentityRuntimeAssemblyRef,
+    /// Runtime profile marker.
+    pub profile_ref: IdentityRuntimeProfileRef,
+    /// Assembly lifecycle state.
+    pub state_kind: IdentityRuntimeAssemblyStateKind,
+    /// Adapter refs checked during assembly.
+    pub adapter_availability_refs: Vec<IdentityAdapterRef>,
+    /// Safe issue refs.
+    pub issue_refs: Vec<IdentityConfigIssueRef>,
+    /// Optional assembly timestamp.
+    pub assembled_at: Option<IdentityTimestamp>,
+}
+
+impl IdentityRuntimeAssemblyState {
+    /// Creates a not-started runtime state.
+    pub fn not_started(
+        assembly_ref: IdentityRuntimeAssemblyRef,
+        profile_ref: IdentityRuntimeProfileRef,
+    ) -> Self {
+        Self {
+            assembly_ref,
+            profile_ref,
+            state_kind: IdentityRuntimeAssemblyStateKind::NotStarted,
+            adapter_availability_refs: Vec::new(),
+            issue_refs: Vec::new(),
+            assembled_at: None,
+        }
+    }
+
+    /// Creates a config-validated runtime state.
+    pub fn config_validated(
+        assembly_ref: IdentityRuntimeAssemblyRef,
+        config_shell: &IdentityRuntimeConfigShell,
+    ) -> Self {
+        Self {
+            assembly_ref,
+            profile_ref: config_shell.profile_ref.clone(),
+            state_kind: IdentityRuntimeAssemblyStateKind::ConfigValidated,
+            adapter_availability_refs: Vec::new(),
+            issue_refs: config_shell.issue_refs.clone(),
+            assembled_at: None,
+        }
+    }
+
+    /// Creates an assembled runtime state.
+    pub fn assembled(
+        assembly_ref: IdentityRuntimeAssemblyRef,
+        config_shell: &IdentityRuntimeConfigShell,
+        adapter_refs: Vec<IdentityAdapterRef>,
+        assembled_at: IdentityTimestamp,
+    ) -> Self {
+        Self {
+            assembly_ref,
+            profile_ref: config_shell.profile_ref.clone(),
+            state_kind: IdentityRuntimeAssemblyStateKind::Assembled,
+            adapter_availability_refs: adapter_refs,
+            issue_refs: Vec::new(),
+            assembled_at: Some(assembled_at),
+        }
+    }
+
+    /// Creates a degraded runtime state.
+    pub fn degraded(
+        assembly_ref: IdentityRuntimeAssemblyRef,
+        config_shell: &IdentityRuntimeConfigShell,
+        adapter_refs: Vec<IdentityAdapterRef>,
+        issue_refs: Vec<IdentityConfigIssueRef>,
+        assembled_at: IdentityTimestamp,
+    ) -> Self {
+        Self {
+            assembly_ref,
+            profile_ref: config_shell.profile_ref.clone(),
+            state_kind: IdentityRuntimeAssemblyStateKind::Degraded,
+            adapter_availability_refs: adapter_refs,
+            issue_refs,
+            assembled_at: Some(assembled_at),
+        }
+    }
+
+    /// Creates a failed runtime state.
+    pub fn failed(
+        assembly_ref: IdentityRuntimeAssemblyRef,
+        config_shell: &IdentityRuntimeConfigShell,
+        issue_refs: Vec<IdentityConfigIssueRef>,
+    ) -> Self {
+        Self {
+            assembly_ref,
+            profile_ref: config_shell.profile_ref.clone(),
+            state_kind: IdentityRuntimeAssemblyStateKind::Failed,
+            adapter_availability_refs: Vec::new(),
+            issue_refs,
+            assembled_at: None,
+        }
+    }
+
+    /// Returns whether the runtime may attempt dispatch for an entry surface.
+    pub fn can_dispatch(&self, _surface_kind: IdentityEntrySurfaceKind) -> bool {
+        matches!(
+            self.state_kind,
+            IdentityRuntimeAssemblyStateKind::Assembled
+                | IdentityRuntimeAssemblyStateKind::Degraded
+        )
+    }
+}
+
+/// Adapter availability kind for runtime assembly and controlled/fake wiring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityAdapterAvailabilityKind {
+    /// Adapter is available.
+    Available,
+    /// Adapter is degraded but still visible to callers.
+    Degraded,
+    /// Adapter is unavailable.
+    Unavailable,
+    /// Adapter is disabled by configuration.
+    Disabled,
+}
+
+/// Body-free adapter availability snapshot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityAdapterAvailability {
+    /// Adapter identity marker.
+    pub adapter_ref: IdentityAdapterRef,
+    /// Adapter mode marker.
+    pub adapter_mode_ref: IdentityAdapterModeRef,
+    /// Availability kind.
+    pub availability_kind: IdentityAdapterAvailabilityKind,
+    /// Optional availability issue marker.
+    pub issue_ref: Option<IdentityAdapterAvailabilityIssueRef>,
+    /// Availability check timestamp.
+    pub checked_at: IdentityTimestamp,
+}
+
+impl IdentityAdapterAvailability {
+    /// Creates an available adapter snapshot.
+    pub fn available(
+        adapter_ref: IdentityAdapterRef,
+        adapter_mode_ref: IdentityAdapterModeRef,
+        checked_at: IdentityTimestamp,
+    ) -> Self {
+        Self {
+            adapter_ref,
+            adapter_mode_ref,
+            availability_kind: IdentityAdapterAvailabilityKind::Available,
+            issue_ref: None,
+            checked_at,
+        }
+    }
+
+    /// Creates a degraded adapter snapshot.
+    pub fn degraded(
+        adapter_ref: IdentityAdapterRef,
+        adapter_mode_ref: IdentityAdapterModeRef,
+        issue_ref: IdentityAdapterAvailabilityIssueRef,
+        checked_at: IdentityTimestamp,
+    ) -> Self {
+        Self {
+            adapter_ref,
+            adapter_mode_ref,
+            availability_kind: IdentityAdapterAvailabilityKind::Degraded,
+            issue_ref: Some(issue_ref),
+            checked_at,
+        }
+    }
+
+    /// Creates an unavailable adapter snapshot.
+    pub fn unavailable(
+        adapter_ref: IdentityAdapterRef,
+        adapter_mode_ref: IdentityAdapterModeRef,
+        issue_ref: IdentityAdapterAvailabilityIssueRef,
+        checked_at: IdentityTimestamp,
+    ) -> Self {
+        Self {
+            adapter_ref,
+            adapter_mode_ref,
+            availability_kind: IdentityAdapterAvailabilityKind::Unavailable,
+            issue_ref: Some(issue_ref),
+            checked_at,
+        }
+    }
+
+    /// Creates a disabled adapter snapshot.
+    pub fn disabled(
+        adapter_ref: IdentityAdapterRef,
+        adapter_mode_ref: IdentityAdapterModeRef,
+        issue_ref: IdentityAdapterAvailabilityIssueRef,
+        checked_at: IdentityTimestamp,
+    ) -> Self {
+        Self {
+            adapter_ref,
+            adapter_mode_ref,
+            availability_kind: IdentityAdapterAvailabilityKind::Disabled,
+            issue_ref: Some(issue_ref),
+            checked_at,
+        }
+    }
+
+    /// Returns whether the runtime may attempt this adapter.
+    pub fn allows_attempt(&self) -> bool {
+        matches!(
+            self.availability_kind,
+            IdentityAdapterAvailabilityKind::Available | IdentityAdapterAvailabilityKind::Degraded
+        )
+    }
+}
+
+/// Entry validation kind shared by API, worker, and job entry shells.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityEntryValidationKind {
+    /// Entry is dispatchable.
+    Dispatchable,
+    /// Entry is rejected before application dispatch.
+    RejectedAtEntry,
+    /// Entry is not routable.
+    NotRoutable,
+    /// Runtime is unavailable.
+    RuntimeUnavailable,
+}
+
+/// Entry dispatch attempt kind shared by API, worker, and job entry shells.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityEntryDispatchKind {
+    /// Entry has been dispatched to the application facade.
+    Dispatched,
+    /// Entry was skipped because it was rejected at the entry boundary.
+    SkippedRejectedAtEntry,
+    /// Entry was skipped because runtime was unavailable.
+    SkippedRuntimeUnavailable,
+    /// Dispatch failed before the application facade was called.
+    FailedBeforeApplication,
+}
+
+/// Body-free API entry context.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityApiEntryContext {
+    /// Stable API entry ref.
+    pub api_entry_ref: IdentityApiEntryRef,
+    /// Formal route ref.
+    pub route_ref: IdentityApiRouteRef,
+    /// Entry surface kind.
+    pub surface_kind: IdentityEntrySurfaceKind,
+    /// Body-free request marker.
+    pub request_marker_ref: IdentityApiRequestMarkerRef,
+    /// Actor extracted at the boundary.
+    pub actor_ref: ActorRef,
+    /// Body-free request metadata marker.
+    pub request_metadata_ref: IdentityRequestMetadataRef,
+    /// Optional idempotency key for mutation routes.
+    pub idempotency_key: Option<IdentityIdempotencyKey>,
+    /// Optional visibility context for query routes.
+    pub visibility_context_ref: Option<VisibilityContextRef>,
+    /// Entry receive timestamp.
+    pub received_at: IdentityTimestamp,
+}
+
+/// Body-free API entry validation result.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityApiEntryValidation {
+    /// API entry ref.
+    pub api_entry_ref: IdentityApiEntryRef,
+    /// Formal route ref.
+    pub route_ref: IdentityApiRouteRef,
+    /// Validation kind.
+    pub validation_kind: IdentityEntryValidationKind,
+    /// Safe issue refs.
+    pub issue_refs: Vec<IdentityEntryValidationIssueRef>,
+}
+
+/// Body-free API dispatch result.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityApiDispatchResult {
+    /// Dispatch attempt ref.
+    pub dispatch_ref: IdentityEntryDispatchRef,
+    /// API entry ref.
+    pub api_entry_ref: IdentityApiEntryRef,
+    /// Application dispatch target ref.
+    pub target_ref: IdentityDispatchTargetRef,
+    /// Dispatch attempt kind.
+    pub dispatch_kind: IdentityEntryDispatchKind,
+    /// Safe issue refs.
+    pub issue_refs: Vec<IdentityEntryValidationIssueRef>,
+}
+
+/// Worker entry validation kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityWorkerEntryValidationKind {
+    /// Entry is dispatchable.
+    Dispatchable,
+    /// Consumer binding is unrecognized.
+    UnrecognizedBinding,
+    /// Dedupe key is missing.
+    MissingDedupeKey,
+    /// Envelope marker is invalid.
+    InvalidEnvelopeMarker,
+    /// Runtime is unavailable.
+    RuntimeUnavailable,
+}
+
+/// Body-free worker entry context.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityWorkerEntryContext {
+    /// Stable worker entry ref.
+    pub worker_entry_ref: IdentityWorkerEntryRef,
+    /// Entry surface kind.
+    pub surface_kind: IdentityEntrySurfaceKind,
+    /// Consumer binding ref.
+    pub consumer_binding_ref: IdentityConsumerBindingRef,
+    /// Body-free envelope marker.
+    pub envelope_marker_ref: IdentityEventEnvelopeMarkerRef,
+    /// Upstream source event ref.
+    pub source_event_ref: IdentitySourceEventRef,
+    /// Formal idempotency key.
+    pub idempotency_key: IdentityIdempotencyKey,
+    /// Optional propagated trace context marker.
+    pub trace_context_ref: Option<IdentityTraceContextRef>,
+    /// Entry receive timestamp.
+    pub received_at: IdentityTimestamp,
+}
+
+/// Body-free worker entry validation result.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityWorkerEntryValidation {
+    /// Worker entry ref.
+    pub worker_entry_ref: IdentityWorkerEntryRef,
+    /// Consumer binding ref.
+    pub consumer_binding_ref: IdentityConsumerBindingRef,
+    /// Validation kind.
+    pub validation_kind: IdentityWorkerEntryValidationKind,
+    /// Safe issue refs.
+    pub issue_refs: Vec<IdentityEntryValidationIssueRef>,
+}
+
+/// Body-free worker dispatch result.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityWorkerDispatchResult {
+    /// Dispatch attempt ref.
+    pub dispatch_ref: IdentityWorkerDispatchRef,
+    /// Worker entry ref.
+    pub worker_entry_ref: IdentityWorkerEntryRef,
+    /// Application dispatch target ref.
+    pub target_ref: IdentityDispatchTargetRef,
+    /// Dispatch attempt kind.
+    pub dispatch_kind: IdentityEntryDispatchKind,
+    /// Safe issue refs.
+    pub issue_refs: Vec<IdentityEntryValidationIssueRef>,
+}
+
+/// Job entry validation kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityJobEntryValidationKind {
+    /// Entry is dispatchable.
+    Dispatchable,
+    /// Job name is unknown.
+    UnknownJob,
+    /// Scope marker is invalid.
+    InvalidScope,
+    /// Cursor marker is invalid.
+    InvalidCursor,
+    /// Idempotency key is missing.
+    MissingIdempotencyKey,
+    /// Runtime is unavailable.
+    RuntimeUnavailable,
+}
+
+/// Body-free job entry context.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityJobEntryContext {
+    /// Stable job entry ref.
+    pub job_entry_ref: IdentityJobEntryRef,
+    /// Formal job name.
+    pub job_name: IdentityJobName,
+    /// Formal job run ref.
+    pub job_run_ref: IdentityJobRunRef,
+    /// Body-free job run metadata marker.
+    pub run_metadata_ref: IdentityJobRunMetadataRef,
+    /// Body-free job scope marker.
+    pub scope_marker_ref: IdentityJobScopeMarkerRef,
+    /// Optional input cursor marker.
+    pub input_cursor_ref: Option<IdentityJobCursorRef>,
+    /// System actor for the run.
+    pub system_actor_ref: ActorRef,
+    /// Formal idempotency key.
+    pub idempotency_key: IdentityIdempotencyKey,
+    /// Job start timestamp.
+    pub started_at: IdentityTimestamp,
+}
+
+/// Body-free job entry validation result.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityJobEntryValidation {
+    /// Job entry ref.
+    pub job_entry_ref: IdentityJobEntryRef,
+    /// Formal job name.
+    pub job_name: IdentityJobName,
+    /// Validation kind.
+    pub validation_kind: IdentityJobEntryValidationKind,
+    /// Safe issue refs.
+    pub issue_refs: Vec<IdentityEntryValidationIssueRef>,
+}
+
+/// Body-free job dispatch result.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityJobDispatchResult {
+    /// Dispatch attempt ref.
+    pub dispatch_ref: IdentityJobDispatchRef,
+    /// Job entry ref.
+    pub job_entry_ref: IdentityJobEntryRef,
+    /// Application dispatch target ref.
+    pub target_ref: IdentityDispatchTargetRef,
+    /// Dispatch attempt kind.
+    pub dispatch_kind: IdentityEntryDispatchKind,
+    /// Safe issue refs.
+    pub issue_refs: Vec<IdentityEntryValidationIssueRef>,
 }
 
 /// Convenience alias for API request markers that already exist in shared contracts.
