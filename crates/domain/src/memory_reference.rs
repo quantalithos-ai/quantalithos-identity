@@ -556,8 +556,8 @@ impl MemoryReferencePolicy {
 
     /// Rejects non-body-free handoff markers.
     pub fn assert_handoff_marker_body_free(&self) -> Result<(), IdentityDomainError> {
-        if self.source_summary.archive_handoff_ref.is_some()
-            && self.change_material_marker.material_kind
+        if self.source_summary.archive_handoff_ref.is_none()
+            || self.change_material_marker.material_kind
                 != MemoryReferenceChangeMaterialKind::ForbiddenExternalBody
         {
             return Ok(());

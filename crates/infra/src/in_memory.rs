@@ -8,17 +8,18 @@ use identity_application::mapper::{
     DefaultIdentityAcceptedAuditTrailMarkerMapper, DefaultIdentityTruthChangeSubjectMapper,
 };
 use identity_application::ports::{
-    ExternalReferenceTypedSidecarRefs, GlobalLifecycleRepository, GlobalMemberRepository,
-    HandoffDeliveryOutcome, HandoffReceiptResolution, HandoffTargetResolution,
-    IdentityAcceptedAuditTrailMarkerMapper, IdentityAdapterAvailabilityPort,
-    IdentityAuditTrailRepository, IdentityClockPort, IdentityCommandEffectSummaryRepository,
-    IdentityCursorAssignerPort, IdentityExternalSourceResolverPort, IdentityHandoffDeliveryPort,
-    IdentityHandoffTargetPort, IdentityIdGeneratorPort, IdentityIdempotencyRepository,
-    IdentityJobReportRepository, IdentityOperationContextFactoryPort, IdentityOutboxRepository,
-    IdentityProjectionRepository, IdentityReadVisibilityRepository,
-    IdentityReferenceStateRepository, IdentityStoredResultRepository,
-    IdentityTraceRecordRepository, IdentityTruthChangeSubjectMapper, IdentityUnitOfWork,
-    IdentityUnitOfWorkManagerPort, TraceHandoffIntentRepository,
+    CareerRecordRepository, ExternalReferenceTypedSidecarRefs, GlobalLifecycleRepository,
+    GlobalMemberRepository, HandoffDeliveryOutcome, HandoffReceiptResolution,
+    HandoffTargetResolution, IdentityAcceptedAuditTrailMarkerMapper,
+    IdentityAdapterAvailabilityPort, IdentityAuditTrailRepository, IdentityClockPort,
+    IdentityCommandEffectSummaryRepository, IdentityCursorAssignerPort,
+    IdentityExternalSourceResolverPort, IdentityHandoffDeliveryPort, IdentityHandoffTargetPort,
+    IdentityIdGeneratorPort, IdentityIdempotencyRepository, IdentityJobReportRepository,
+    IdentityOperationContextFactoryPort, IdentityOutboxRepository, IdentityProjectionRepository,
+    IdentityReadVisibilityRepository, IdentityReferenceStateRepository,
+    IdentityStoredResultRepository, IdentityTraceRecordRepository,
+    IdentityTruthChangeSubjectMapper, IdentityUnitOfWork, IdentityUnitOfWorkManagerPort,
+    MemoryReferenceRepository, RoleCapabilityRepository, TraceHandoffIntentRepository,
 };
 use identity_application::support::{
     AuditTrailId, IdempotencyReserveOutcome, IdentityAcceptedAuditTrailMarkers,
@@ -37,7 +38,8 @@ use identity_contracts::jobs::IdentityJobResultKind;
 use identity_contracts::protocol::IdentityJobName;
 use identity_contracts::receipts::TraceHandoffIntentRef;
 use identity_contracts::refs::{
-    AuditCursorRef, AuditScopeRef, AuditTrailRef, ConsumerRef, ExternalReferenceKind,
+    ArchiveHandoffRef, ArchiveRef, AuditCursorRef, AuditScopeRef, AuditTrailRef, CareerRecordId,
+    CareerRecordRef, CareerSourceMarkerRef, ConsumerRef, ExternalReferenceKind,
     ExternalReferenceRef, ExternalSourceRef, ExternalSourceVersionRef, GlobalMemberId,
     GlobalMemberRef, GovernanceBasisRef, GovernanceBasisState, GovernanceBasisSummary,
     HandoffIssueRef, HandoffReceiptRef, HandoffScopeRef, HandoffTargetRef, IdentityAuditSubjectRef,
@@ -45,17 +47,23 @@ use identity_contracts::refs::{
     IdentityProjectionCursorRef, IdentityProjectionRef, IdentityReferenceOwnerRef,
     IdentitySourceOwner, IdentitySourceRef, IdentityTimestamp, IdentityTraceRecordRef,
     IdentityTraceSubjectRef, IdentityTruthCursor, LifecycleRiskRef, MemberSummaryViewRef,
-    ProjectionStateRef, ReferenceResolutionStateRef, TopicKeyRef, TraceHandoffSafeMaterialRef,
-    VisibilityContextRef, VisibilityResultRef, VisibilityScopeRef,
+    MemoryRef, MemoryReferenceId, MemoryReferenceRef, MemoryReferenceSourceState,
+    ProjectParticipationRef, ProjectionStateRef, ReferenceResolutionStateRef,
+    RoleCapabilitySourceRef, RoleCapabilitySourceSnapshotRef, RoleCapabilitySummaryRef,
+    TopicKeyRef, TraceHandoffSafeMaterialRef, VisibilityContextRef, VisibilityResultRef,
+    VisibilityScopeRef, WorkParticipationSourceState, WorkParticipationSourceSummary,
 };
 use identity_contracts::views::{IdentityVisibilityAccessSummary, MemberSummaryView};
 use identity_domain::audit::{AuditTrail, AuditTrailEntry};
+use identity_domain::career::CareerRecord;
 use identity_domain::handoff::{HandoffStateKind, TraceHandoffIntent};
 use identity_domain::lifecycle::GlobalLifecycleState;
 use identity_domain::member_identity::GlobalMember;
+use identity_domain::memory_reference::MemoryReference;
 use identity_domain::outbox::{IdentityOutboxRecord, OutboxStateKind};
 use identity_domain::projection_state::{ProjectionState, ProjectionStateKind};
 use identity_domain::reference_state::{ReferenceResolutionState, ReferenceResolutionStateKind};
+use identity_domain::role_capability::{RoleCapabilitySourceSnapshot, RoleCapabilitySummary};
 use identity_domain::trace::IdentityTraceRecord;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -101,6 +109,101 @@ impl IdentityInMemoryRuntimeBuilder {
                 version,
             },
         );
+        self
+    }
+
+    pub fn seed_role_capability_summary(
+        mut self,
+        summary: RoleCapabilitySummary,
+        version: IdentityVersion,
+    ) -> Self {
+        self.store.role_capability_summary_by_member.insert(
+            member_key(&summary.member_ref),
+            summary.summary_ref.summary_id.as_str().to_owned(),
+        );
+        self.store
+            .role_capability_summaries_by_member
+            .entry(member_key(&summary.member_ref))
+            .or_default()
+            .push(summary.summary_ref.summary_id.as_str().to_owned());
+        self.store.role_capability_summaries.insert(
+            role_capability_summary_key(&summary.summary_ref),
+            StoredRoleCapabilitySummary { summary, version },
+        );
+        self
+    }
+
+    pub fn seed_role_capability_source_snapshot(
+        mut self,
+        snapshot: RoleCapabilitySourceSnapshot,
+        version: IdentityVersion,
+    ) -> Self {
+        self.store.role_capability_snapshot_by_source.insert(
+            role_capability_source_key(&snapshot.source_ref),
+            snapshot.snapshot_ref.snapshot_id.as_str().to_owned(),
+        );
+        self.store.role_capability_source_snapshots.insert(
+            role_capability_snapshot_key(&snapshot.snapshot_ref),
+            StoredRoleCapabilitySourceSnapshot { snapshot, version },
+        );
+        self
+    }
+
+    pub fn seed_career_record(mut self, record: CareerRecord, version: IdentityVersion) -> Self {
+        let record_key = career_record_key(&record.career_record_ref);
+        self.store
+            .career_records_by_member
+            .entry(member_key(&record.member_ref))
+            .or_default()
+            .push(record_key.clone());
+        self.store.career_records_by_source_marker.insert(
+            career_source_marker_key(&record.source_marker_ref),
+            record_key.clone(),
+        );
+        if let Some(original_ref) = record.correction_of_ref.clone() {
+            self.store
+                .career_corrections_by_original
+                .entry(career_record_key(&original_ref))
+                .or_default()
+                .push(record_key.clone());
+        }
+        self.store
+            .career_records
+            .insert(record_key, StoredCareerRecord { record, version });
+        self
+    }
+
+    pub fn seed_memory_reference(
+        mut self,
+        reference: MemoryReference,
+        version: IdentityVersion,
+    ) -> Self {
+        let reference_key = memory_reference_key(&reference.memory_reference_ref);
+        self.store
+            .memory_references_by_member
+            .entry(member_key(&reference.member_ref))
+            .or_default()
+            .push(reference_key.clone());
+        if let Some(memory_ref) = reference.memory_ref.clone() {
+            self.store.memory_reference_by_memory.insert(
+                memory_reference_member_memory_key(&reference.member_ref, &memory_ref),
+                reference_key.clone(),
+            );
+        }
+        if let Some(archive_ref) = reference.archive_ref.clone() {
+            self.store.memory_reference_by_archive.insert(
+                memory_reference_member_archive_key(&reference.member_ref, &archive_ref),
+                reference_key.clone(),
+            );
+        }
+        if let Some(handoff_ref) = reference.archive_handoff_ref.clone() {
+            self.store
+                .memory_reference_by_handoff
+                .insert(archive_handoff_key(&handoff_ref), reference_key.clone());
+        }
+        self.store
+            .memory_references
+            .insert(reference_key, StoredMemoryReference { reference, version });
         self
     }
 
@@ -473,6 +576,78 @@ impl IdentityInMemoryRuntime {
         ))
     }
 
+    fn predicted_role_capability_summary_version(
+        &self,
+        summary_ref: &RoleCapabilitySummaryRef,
+    ) -> Result<IdentityVersion, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(IdentityVersion::new(
+            store
+                .role_capability_summaries
+                .get(&role_capability_summary_key(summary_ref))
+                .map(|stored| stored.version.get() + 1)
+                .unwrap_or(1),
+        ))
+    }
+
+    fn predicted_role_capability_snapshot_version(
+        &self,
+        snapshot_ref: &RoleCapabilitySourceSnapshotRef,
+    ) -> Result<IdentityVersion, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(IdentityVersion::new(
+            store
+                .role_capability_source_snapshots
+                .get(&role_capability_snapshot_key(snapshot_ref))
+                .map(|stored| stored.version.get() + 1)
+                .unwrap_or(1),
+        ))
+    }
+
+    fn predicted_career_record_version(
+        &self,
+        record_ref: &CareerRecordRef,
+    ) -> Result<IdentityVersion, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(IdentityVersion::new(
+            store
+                .career_records
+                .get(&career_record_key(record_ref))
+                .map(|stored| stored.version.get() + 1)
+                .unwrap_or(1),
+        ))
+    }
+
+    fn predicted_memory_reference_version(
+        &self,
+        reference_ref: &MemoryReferenceRef,
+    ) -> Result<IdentityVersion, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(IdentityVersion::new(
+            store
+                .memory_references
+                .get(&memory_reference_key(reference_ref))
+                .map(|stored| stored.version.get() + 1)
+                .unwrap_or(1),
+        ))
+    }
+
     fn predicted_trace_version(
         &self,
         trace_record_ref: &IdentityTraceRecordRef,
@@ -612,6 +787,20 @@ struct SharedRuntime {
 struct RuntimeStore {
     members: HashMap<String, StoredMember>,
     lifecycles: HashMap<String, StoredLifecycle>,
+    role_capability_summaries: HashMap<String, StoredRoleCapabilitySummary>,
+    role_capability_summaries_by_member: HashMap<String, Vec<String>>,
+    role_capability_summary_by_member: HashMap<String, String>,
+    role_capability_source_snapshots: HashMap<String, StoredRoleCapabilitySourceSnapshot>,
+    role_capability_snapshot_by_source: HashMap<String, String>,
+    career_records: HashMap<String, StoredCareerRecord>,
+    career_records_by_member: HashMap<String, Vec<String>>,
+    career_records_by_source_marker: HashMap<String, String>,
+    career_corrections_by_original: HashMap<String, Vec<String>>,
+    memory_references: HashMap<String, StoredMemoryReference>,
+    memory_references_by_member: HashMap<String, Vec<String>>,
+    memory_reference_by_memory: HashMap<String, String>,
+    memory_reference_by_archive: HashMap<String, String>,
+    memory_reference_by_handoff: HashMap<String, String>,
     trace_records: HashMap<String, StoredTraceRecord>,
     trace_subject_index: HashMap<String, Vec<String>>,
     trace_member_index: HashMap<String, Vec<String>>,
@@ -662,6 +851,30 @@ struct StoredMember {
 struct StoredLifecycle {
     member_ref: GlobalMemberRef,
     lifecycle: GlobalLifecycleState,
+    version: IdentityVersion,
+}
+
+#[derive(Clone, Debug)]
+struct StoredRoleCapabilitySummary {
+    summary: RoleCapabilitySummary,
+    version: IdentityVersion,
+}
+
+#[derive(Clone, Debug)]
+struct StoredRoleCapabilitySourceSnapshot {
+    snapshot: RoleCapabilitySourceSnapshot,
+    version: IdentityVersion,
+}
+
+#[derive(Clone, Debug)]
+struct StoredCareerRecord {
+    record: CareerRecord,
+    version: IdentityVersion,
+}
+
+#[derive(Clone, Debug)]
+struct StoredMemoryReference {
+    reference: MemoryReference,
     version: IdentityVersion,
 }
 
@@ -723,6 +936,25 @@ enum StagedOp {
     SaveLifecycle {
         member_ref: GlobalMemberRef,
         lifecycle: GlobalLifecycleState,
+        expected_version: Option<IdentityVersion>,
+    },
+    SaveRoleCapabilitySourceSnapshot {
+        snapshot: RoleCapabilitySourceSnapshot,
+        expected_version: Option<IdentityVersion>,
+    },
+    SaveRoleCapabilitySummary {
+        summary: RoleCapabilitySummary,
+        expected_version: Option<IdentityVersion>,
+    },
+    AppendCareerRecord {
+        record: CareerRecord,
+    },
+    SaveCareerRecordState {
+        record: CareerRecord,
+        expected_version: IdentityVersion,
+    },
+    SaveMemoryReference {
+        reference: MemoryReference,
         expected_version: Option<IdentityVersion>,
     },
     AppendTraceRecord {
@@ -975,6 +1207,22 @@ impl IdentityIdGeneratorPort for IdentityInMemoryRuntime {
             .fetch_add(1, Ordering::SeqCst);
         identity_contracts::refs::RoleCapabilitySourceSnapshotId::new(format!("snapshot-{next}"))
             .map_err(ApplicationError::from)
+    }
+
+    fn new_career_record_id(&self) -> Result<CareerRecordId, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        CareerRecordId::new(format!("career-{next}")).map_err(ApplicationError::from)
+    }
+
+    fn new_memory_reference_id(&self) -> Result<MemoryReferenceId, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        MemoryReferenceId::new(format!("memory-reference-{next}")).map_err(ApplicationError::from)
     }
 
     fn new_member_summary_view_id(
@@ -1500,6 +1748,495 @@ impl GlobalLifecycleRepository for IdentityInMemoryRuntime {
     }
 }
 
+impl RoleCapabilityRepository for IdentityInMemoryRuntime {
+    fn get_summary_with_version(
+        &self,
+        summary_ref: RoleCapabilitySummaryRef,
+    ) -> Result<Option<Versioned<RoleCapabilitySummary>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .role_capability_summaries
+            .get(&role_capability_summary_key(&summary_ref))
+            .map(|stored| Versioned {
+                value: stored.summary.clone(),
+                version: stored.version,
+            }))
+    }
+
+    fn find_current_summary_by_member(
+        &self,
+        member_ref: GlobalMemberRef,
+    ) -> Result<Option<Versioned<RoleCapabilitySummary>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let Some(summary_key) = store
+            .role_capability_summary_by_member
+            .get(&member_key(&member_ref))
+        else {
+            return Ok(None);
+        };
+        Ok(store
+            .role_capability_summaries
+            .get(summary_key)
+            .map(|stored| Versioned {
+                value: stored.summary.clone(),
+                version: stored.version,
+            }))
+    }
+
+    fn list_summaries_by_member(
+        &self,
+        member_ref: GlobalMemberRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<RoleCapabilitySummaryRef>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let keys = store
+            .role_capability_summaries_by_member
+            .get(&member_key(&member_ref))
+            .cloned()
+            .unwrap_or_default();
+        let mut items: Vec<_> = keys
+            .into_iter()
+            .filter_map(|key| store.role_capability_summaries.get(&key))
+            .map(|stored| IdentityVersionedRef {
+                value_ref: stored.summary.summary_ref.clone(),
+                version: stored.version,
+            })
+            .collect();
+        items.sort_by(|left, right| {
+            left.value_ref
+                .summary_id
+                .as_str()
+                .cmp(right.value_ref.summary_id.as_str())
+        });
+        let (items, next_cursor) = paged(items, page, "role-summary");
+        Ok(Page { items, next_cursor })
+    }
+
+    fn get_source_snapshot_with_version(
+        &self,
+        snapshot_ref: RoleCapabilitySourceSnapshotRef,
+    ) -> Result<Option<Versioned<RoleCapabilitySourceSnapshot>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .role_capability_source_snapshots
+            .get(&role_capability_snapshot_key(&snapshot_ref))
+            .map(|stored| Versioned {
+                value: stored.snapshot.clone(),
+                version: stored.version,
+            }))
+    }
+
+    fn find_source_snapshot_by_source(
+        &self,
+        source_ref: RoleCapabilitySourceRef,
+    ) -> Result<Option<Versioned<RoleCapabilitySourceSnapshot>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let Some(snapshot_key) = store
+            .role_capability_snapshot_by_source
+            .get(&role_capability_source_key(&source_ref))
+        else {
+            return Ok(None);
+        };
+        Ok(store
+            .role_capability_source_snapshots
+            .get(snapshot_key)
+            .map(|stored| Versioned {
+                value: stored.snapshot.clone(),
+                version: stored.version,
+            }))
+    }
+
+    fn save_source_snapshot(
+        &self,
+        snapshot: RoleCapabilitySourceSnapshot,
+        expected_version: Option<IdentityVersion>,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<RoleCapabilitySourceSnapshotRef>, ApplicationError> {
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveRoleCapabilitySourceSnapshot {
+                snapshot: snapshot.clone(),
+                expected_version,
+            },
+        )?;
+        Ok(IdentityVersionedRef {
+            value_ref: snapshot.snapshot_ref.clone(),
+            version: self.predicted_role_capability_snapshot_version(&snapshot.snapshot_ref)?,
+        })
+    }
+
+    fn save_summary(
+        &self,
+        summary: RoleCapabilitySummary,
+        expected_version: Option<IdentityVersion>,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<RoleCapabilitySummaryRef>, ApplicationError> {
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveRoleCapabilitySummary {
+                summary: summary.clone(),
+                expected_version,
+            },
+        )?;
+        Ok(IdentityVersionedRef {
+            value_ref: summary.summary_ref.clone(),
+            version: self.predicted_role_capability_summary_version(&summary.summary_ref)?,
+        })
+    }
+}
+
+impl CareerRecordRepository for IdentityInMemoryRuntime {
+    fn get_career_record(
+        &self,
+        record_ref: CareerRecordRef,
+    ) -> Result<Option<Versioned<CareerRecord>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .career_records
+            .get(&career_record_key(&record_ref))
+            .map(|stored| Versioned {
+                value: stored.record.clone(),
+                version: stored.version,
+            }))
+    }
+
+    fn list_records_by_member(
+        &self,
+        member_ref: GlobalMemberRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<CareerRecordRef>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let keys = store
+            .career_records_by_member
+            .get(&member_key(&member_ref))
+            .cloned()
+            .unwrap_or_default();
+        let mut items: Vec<_> = keys
+            .into_iter()
+            .filter_map(|key| store.career_records.get(&key))
+            .map(|stored| IdentityVersionedRef {
+                value_ref: stored.record.career_record_ref.clone(),
+                version: stored.version,
+            })
+            .collect();
+        items.sort_by(|left, right| {
+            left.value_ref
+                .record_id
+                .as_str()
+                .cmp(right.value_ref.record_id.as_str())
+        });
+        let (items, next_cursor) = paged(items, page, "career-member");
+        Ok(Page { items, next_cursor })
+    }
+
+    fn find_records_by_source_marker(
+        &self,
+        source_marker_ref: CareerSourceMarkerRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<CareerRecordRef>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let mut items: Vec<_> = store
+            .career_records_by_source_marker
+            .get(&career_source_marker_key(&source_marker_ref))
+            .and_then(|key| store.career_records.get(key))
+            .map(|stored| {
+                vec![IdentityVersionedRef {
+                    value_ref: stored.record.career_record_ref.clone(),
+                    version: stored.version,
+                }]
+            })
+            .unwrap_or_default();
+        items.sort_by(|left, right| {
+            left.value_ref
+                .record_id
+                .as_str()
+                .cmp(right.value_ref.record_id.as_str())
+        });
+        let (items, next_cursor) = paged(items, page, "career-source");
+        Ok(Page { items, next_cursor })
+    }
+
+    fn find_duplicate_source_record(
+        &self,
+        source_marker_ref: CareerSourceMarkerRef,
+    ) -> Result<Option<CareerRecordRef>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .career_records_by_source_marker
+            .get(&career_source_marker_key(&source_marker_ref))
+            .and_then(|key| store.career_records.get(key))
+            .map(|stored| stored.record.career_record_ref.clone()))
+    }
+
+    fn list_corrections_for_record(
+        &self,
+        original_record_ref: CareerRecordRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<CareerRecordRef>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let keys = store
+            .career_corrections_by_original
+            .get(&career_record_key(&original_record_ref))
+            .cloned()
+            .unwrap_or_default();
+        let mut items: Vec<_> = keys
+            .into_iter()
+            .filter_map(|key| store.career_records.get(&key))
+            .map(|stored| IdentityVersionedRef {
+                value_ref: stored.record.career_record_ref.clone(),
+                version: stored.version,
+            })
+            .collect();
+        items.sort_by(|left, right| {
+            left.value_ref
+                .record_id
+                .as_str()
+                .cmp(right.value_ref.record_id.as_str())
+        });
+        let (items, next_cursor) = paged(items, page, "career-correction");
+        Ok(Page { items, next_cursor })
+    }
+
+    fn append_career_record(
+        &self,
+        record: CareerRecord,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<CareerRecordRef>, ApplicationError> {
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::AppendCareerRecord {
+                record: record.clone(),
+            },
+        )?;
+        Ok(IdentityVersionedRef {
+            value_ref: record.career_record_ref.clone(),
+            version: self.predicted_career_record_version(&record.career_record_ref)?,
+        })
+    }
+
+    fn save_career_record_state(
+        &self,
+        record: CareerRecord,
+        expected_version: IdentityVersion,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<CareerRecordRef>, ApplicationError> {
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveCareerRecordState {
+                record: record.clone(),
+                expected_version,
+            },
+        )?;
+        Ok(IdentityVersionedRef {
+            value_ref: record.career_record_ref.clone(),
+            version: IdentityVersion::new(expected_version.get() + 1),
+        })
+    }
+}
+
+impl MemoryReferenceRepository for IdentityInMemoryRuntime {
+    fn get_memory_reference_with_version(
+        &self,
+        reference_ref: MemoryReferenceRef,
+    ) -> Result<Option<Versioned<MemoryReference>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .memory_references
+            .get(&memory_reference_key(&reference_ref))
+            .map(|stored| Versioned {
+                value: stored.reference.clone(),
+                version: stored.version,
+            }))
+    }
+
+    fn list_references_by_member(
+        &self,
+        member_ref: GlobalMemberRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<MemoryReferenceRef>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let keys = store
+            .memory_references_by_member
+            .get(&member_key(&member_ref))
+            .cloned()
+            .unwrap_or_default();
+        let mut items: Vec<_> = keys
+            .into_iter()
+            .filter_map(|key| store.memory_references.get(&key))
+            .map(|stored| IdentityVersionedRef {
+                value_ref: stored.reference.memory_reference_ref.clone(),
+                version: stored.version,
+            })
+            .collect();
+        items.sort_by(|left, right| {
+            left.value_ref
+                .reference_id
+                .as_str()
+                .cmp(right.value_ref.reference_id.as_str())
+        });
+        let (items, next_cursor) = paged(items, page, "memory-member");
+        Ok(Page { items, next_cursor })
+    }
+
+    fn find_reference_by_memory(
+        &self,
+        member_ref: GlobalMemberRef,
+        memory_ref: MemoryRef,
+    ) -> Result<Option<Versioned<MemoryReference>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let Some(reference_key) =
+            store
+                .memory_reference_by_memory
+                .get(&memory_reference_member_memory_key(
+                    &member_ref,
+                    &memory_ref,
+                ))
+        else {
+            return Ok(None);
+        };
+        Ok(store
+            .memory_references
+            .get(reference_key)
+            .map(|stored| Versioned {
+                value: stored.reference.clone(),
+                version: stored.version,
+            }))
+    }
+
+    fn find_reference_by_archive(
+        &self,
+        member_ref: GlobalMemberRef,
+        archive_ref: ArchiveRef,
+    ) -> Result<Option<Versioned<MemoryReference>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let Some(reference_key) =
+            store
+                .memory_reference_by_archive
+                .get(&memory_reference_member_archive_key(
+                    &member_ref,
+                    &archive_ref,
+                ))
+        else {
+            return Ok(None);
+        };
+        Ok(store
+            .memory_references
+            .get(reference_key)
+            .map(|stored| Versioned {
+                value: stored.reference.clone(),
+                version: stored.version,
+            }))
+    }
+
+    fn find_reference_by_handoff(
+        &self,
+        handoff_ref: ArchiveHandoffRef,
+    ) -> Result<Option<Versioned<MemoryReference>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let Some(reference_key) = store
+            .memory_reference_by_handoff
+            .get(&archive_handoff_key(&handoff_ref))
+        else {
+            return Ok(None);
+        };
+        Ok(store
+            .memory_references
+            .get(reference_key)
+            .map(|stored| Versioned {
+                value: stored.reference.clone(),
+                version: stored.version,
+            }))
+    }
+
+    fn find_callback_target_by_handoff(
+        &self,
+        handoff_ref: ArchiveHandoffRef,
+    ) -> Result<Option<MemoryReferenceRef>, ApplicationError> {
+        Ok(self
+            .find_reference_by_handoff(handoff_ref)?
+            .map(|versioned| versioned.value.memory_reference_ref))
+    }
+
+    fn save_memory_reference(
+        &self,
+        reference: MemoryReference,
+        expected_version: Option<IdentityVersion>,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<MemoryReferenceRef>, ApplicationError> {
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveMemoryReference {
+                reference: reference.clone(),
+                expected_version,
+            },
+        )?;
+        Ok(IdentityVersionedRef {
+            value_ref: reference.memory_reference_ref.clone(),
+            version: self.predicted_memory_reference_version(&reference.memory_reference_ref)?,
+        })
+    }
+}
+
 impl IdentityTraceRecordRepository for IdentityInMemoryRuntime {
     fn get_trace_record(
         &self,
@@ -1870,6 +2607,10 @@ impl IdentityExternalSourceResolverPort for IdentityInMemoryRuntime {
         &self,
         source_ref: identity_contracts::refs::RoleCapabilitySourceRef,
     ) -> Result<identity_application::ports::RoleCapabilitySourceResolution, ApplicationError> {
+        let evidence_ref = identity_contracts::refs::CapabilityEvidenceRef::new(
+            identity_contracts::refs::CapabilityEvidenceKind::MethodArtifact,
+            source_ref.source_ref.clone(),
+        )?;
         Ok(
             identity_application::ports::RoleCapabilitySourceResolution {
                 source_ref: source_ref.clone(),
@@ -1887,7 +2628,7 @@ impl IdentityExternalSourceResolverPort for IdentityInMemoryRuntime {
                         "safe-summary-1",
                     )?,
                 ),
-                evidence_refs: Vec::new(),
+                evidence_refs: vec![evidence_ref],
                 material_marker: identity_contracts::refs::RoleCapabilityChangeMaterialMarker::new(
                     identity_contracts::refs::RoleCapabilityChangeMaterialKind::SafeSummaryMarker,
                     Some(source_ref.source_ref.clone()),
@@ -1920,10 +2661,68 @@ impl IdentityExternalSourceResolverPort for IdentityInMemoryRuntime {
 
     fn resolve_work_participation(
         &self,
-        _source_ref: identity_contracts::refs::WorkSourceRef,
+        source_ref: identity_contracts::refs::WorkSourceRef,
     ) -> Result<identity_contracts::refs::WorkParticipationSourceSummary, ApplicationError> {
-        Err(ApplicationError::consistency_defect(
-            "work participation resolver is not implemented in this fake runtime",
+        let source_token = source_ref.source_ref.external_ref.as_str();
+        let member_token = source_token
+            .split("::")
+            .next()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("member-1");
+        let marker_token = format!("marker-{source_token}");
+        let safe_summary_token = format!("safe-{source_token}");
+        let state = if source_ref
+            .source_ref
+            .external_ref
+            .as_str()
+            .contains("unavailable")
+        {
+            WorkParticipationSourceState::Unavailable
+        } else if source_ref
+            .source_ref
+            .external_ref
+            .as_str()
+            .contains("unresolved")
+        {
+            WorkParticipationSourceState::Unresolved
+        } else if source_ref
+            .source_ref
+            .external_ref
+            .as_str()
+            .contains("untrusted")
+        {
+            WorkParticipationSourceState::Untrusted
+        } else if source_ref.is_pending_review_marker()
+            || source_ref
+                .source_ref
+                .external_ref
+                .as_str()
+                .contains("pending-review")
+        {
+            WorkParticipationSourceState::PendingReview
+        } else {
+            WorkParticipationSourceState::Trusted
+        };
+        let project_participation_ref =
+            ProjectParticipationRef::from_work_source(source_ref.source_ref.clone())?;
+        let member_ref = GlobalMemberRef::from_id(GlobalMemberId::new(member_token.to_owned())?);
+        let source_marker_ref =
+            CareerSourceMarkerRef::new(member_ref, source_ref.clone(), marker_token)?;
+        let safe_summary_ref = match state {
+            WorkParticipationSourceState::Trusted | WorkParticipationSourceState::PendingReview => {
+                Some(identity_contracts::refs::CareerSafeSummaryRef::new(
+                    source_ref.clone(),
+                    safe_summary_token,
+                )?)
+            }
+            _ => None,
+        };
+        Ok(WorkParticipationSourceSummary::from_resolver(
+            project_participation_ref,
+            source_ref,
+            source_marker_ref,
+            safe_summary_ref,
+            state,
         ))
     }
 
@@ -1931,14 +2730,46 @@ impl IdentityExternalSourceResolverPort for IdentityInMemoryRuntime {
         &self,
         source_ref: identity_contracts::refs::MemoryReferenceSourceRef,
     ) -> Result<identity_contracts::refs::MemoryReferenceSourceSummary, ApplicationError> {
+        let token = source_ref.source_ref.external_ref.as_str();
+        let memory_ref = if token.contains("archive-only") {
+            None
+        } else {
+            Some(MemoryRef::from_source(identity_source_ref(
+                IdentitySourceOwner::MemoryArchive,
+                &format!("memory-{token}"),
+            ))?)
+        };
+        let archive_ref = if token.contains("archive") || source_ref.is_handoff_result() {
+            Some(ArchiveRef::from_source(identity_source_ref(
+                IdentitySourceOwner::MemoryArchive,
+                &format!("archive-{token}"),
+            ))?)
+        } else {
+            None
+        };
+        let safe_summary_ref = Some(identity_contracts::refs::MemorySafeSummaryRef::new(
+            source_ref.clone(),
+            format!("safe-{token}"),
+        )?);
+        let state = if token.contains("stale") {
+            MemoryReferenceSourceState::Stale
+        } else if token.contains("unavailable") {
+            MemoryReferenceSourceState::Unavailable
+        } else if token.contains("pending") {
+            MemoryReferenceSourceState::PendingVerification
+        } else if token.contains("untrusted") {
+            MemoryReferenceSourceState::Untrusted
+        } else {
+            MemoryReferenceSourceState::Trusted
+        };
         Ok(
             identity_contracts::refs::MemoryReferenceSourceSummary::from_resolver(
                 source_ref,
+                memory_ref,
+                archive_ref,
                 None,
-                None,
-                None,
-                None,
-                identity_contracts::refs::MemoryReferenceSourceState::Trusted,
+                safe_summary_ref,
+                state,
             ),
         )
     }
@@ -1951,14 +2782,37 @@ impl IdentityExternalSourceResolverPort for IdentityInMemoryRuntime {
             identity_contracts::refs::MemoryReferenceSourceKind::ArchiveHandoffResult,
             handoff_ref.source_ref.clone(),
         )?;
+        let archive_ref = if handoff_ref
+            .source_ref
+            .external_ref
+            .as_str()
+            .contains("failed")
+        {
+            None
+        } else {
+            Some(ArchiveRef::from_source(identity_source_ref(
+                IdentitySourceOwner::MemoryArchive,
+                &format!("archive-{}", handoff_ref.handoff_token),
+            ))?)
+        };
+        let state = if handoff_ref
+            .source_ref
+            .external_ref
+            .as_str()
+            .contains("failed")
+        {
+            MemoryReferenceSourceState::HandoffResultFailed
+        } else {
+            MemoryReferenceSourceState::HandoffResultAccepted
+        };
         Ok(
             identity_contracts::refs::MemoryReferenceSourceSummary::from_resolver(
                 source_ref,
                 None,
-                None,
+                archive_ref,
                 Some(handoff_ref),
                 None,
-                identity_contracts::refs::MemoryReferenceSourceState::HandoffResultAccepted,
+                state,
             ),
         )
     }
@@ -3401,6 +4255,23 @@ fn apply_op(
             lifecycle,
             expected_version,
         } => apply_save_lifecycle(store, member_ref, lifecycle, expected_version),
+        StagedOp::SaveRoleCapabilitySourceSnapshot {
+            snapshot,
+            expected_version,
+        } => apply_save_role_capability_source_snapshot(store, snapshot, expected_version),
+        StagedOp::SaveRoleCapabilitySummary {
+            summary,
+            expected_version,
+        } => apply_save_role_capability_summary(store, summary, expected_version),
+        StagedOp::AppendCareerRecord { record } => apply_append_career_record(store, record),
+        StagedOp::SaveCareerRecordState {
+            record,
+            expected_version,
+        } => apply_save_career_record_state(store, record, expected_version),
+        StagedOp::SaveMemoryReference {
+            reference,
+            expected_version,
+        } => apply_save_memory_reference(store, reference, expected_version),
         StagedOp::AppendTraceRecord { trace_record } => {
             apply_append_trace_record(store, trace_record)
         }
@@ -3541,6 +4412,271 @@ fn apply_save_lifecycle(
         )),
         _ => Err(ApplicationError::optimistic_version_conflict(
             "lifecycle truth version mismatch",
+        )),
+    }
+}
+
+fn apply_save_role_capability_source_snapshot(
+    store: &mut RuntimeStore,
+    snapshot: RoleCapabilitySourceSnapshot,
+    expected_version: Option<IdentityVersion>,
+) -> Result<(), ApplicationError> {
+    let key = role_capability_snapshot_key(&snapshot.snapshot_ref);
+    match (
+        store.role_capability_source_snapshots.get(&key),
+        expected_version,
+    ) {
+        (None, None) => {
+            store.role_capability_snapshot_by_source.insert(
+                role_capability_source_key(&snapshot.source_ref),
+                key.clone(),
+            );
+            store.role_capability_source_snapshots.insert(
+                key,
+                StoredRoleCapabilitySourceSnapshot {
+                    snapshot,
+                    version: IdentityVersion::new(1),
+                },
+            );
+            Ok(())
+        }
+        (Some(existing), Some(expected)) if existing.version == expected => {
+            store.role_capability_snapshot_by_source.insert(
+                role_capability_source_key(&snapshot.source_ref),
+                key.clone(),
+            );
+            store.role_capability_source_snapshots.insert(
+                key,
+                StoredRoleCapabilitySourceSnapshot {
+                    snapshot,
+                    version: IdentityVersion::new(expected.get() + 1),
+                },
+            );
+            Ok(())
+        }
+        (None, Some(_)) => Err(ApplicationError::not_found(
+            "role capability source snapshot not found for update",
+        )),
+        _ => Err(ApplicationError::optimistic_version_conflict(
+            "role capability source snapshot version mismatch",
+        )),
+    }
+}
+
+fn apply_save_role_capability_summary(
+    store: &mut RuntimeStore,
+    summary: RoleCapabilitySummary,
+    expected_version: Option<IdentityVersion>,
+) -> Result<(), ApplicationError> {
+    let key = role_capability_summary_key(&summary.summary_ref);
+    match (store.role_capability_summaries.get(&key), expected_version) {
+        (None, None) => {
+            store
+                .role_capability_summary_by_member
+                .insert(member_key(&summary.member_ref), key.clone());
+            store
+                .role_capability_summaries_by_member
+                .entry(member_key(&summary.member_ref))
+                .or_default()
+                .push(key.clone());
+            store.role_capability_summaries.insert(
+                key,
+                StoredRoleCapabilitySummary {
+                    summary,
+                    version: IdentityVersion::new(1),
+                },
+            );
+            Ok(())
+        }
+        (Some(existing), Some(expected)) if existing.version == expected => {
+            store
+                .role_capability_summary_by_member
+                .insert(member_key(&summary.member_ref), key.clone());
+            let member_entries = store
+                .role_capability_summaries_by_member
+                .entry(member_key(&summary.member_ref))
+                .or_default();
+            if !member_entries.contains(&key) {
+                member_entries.push(key.clone());
+            }
+            store.role_capability_summaries.insert(
+                key,
+                StoredRoleCapabilitySummary {
+                    summary,
+                    version: IdentityVersion::new(expected.get() + 1),
+                },
+            );
+            Ok(())
+        }
+        (None, Some(_)) => Err(ApplicationError::not_found(
+            "role capability summary not found for update",
+        )),
+        _ => Err(ApplicationError::optimistic_version_conflict(
+            "role capability summary version mismatch",
+        )),
+    }
+}
+
+fn apply_append_career_record(
+    store: &mut RuntimeStore,
+    record: CareerRecord,
+) -> Result<(), ApplicationError> {
+    let key = career_record_key(&record.career_record_ref);
+    if store.career_records.contains_key(&key) {
+        return Err(ApplicationError::new(
+            ApplicationErrorKind::FormalUniqueConflict,
+            "career record already exists",
+        ));
+    }
+    if store
+        .career_records_by_source_marker
+        .contains_key(&career_source_marker_key(&record.source_marker_ref))
+        && record.correction_of_ref.is_none()
+    {
+        return Err(ApplicationError::new(
+            ApplicationErrorKind::FormalUniqueConflict,
+            "career source marker already exists",
+        ));
+    }
+    store
+        .career_records_by_member
+        .entry(member_key(&record.member_ref))
+        .or_default()
+        .push(key.clone());
+    store.career_records_by_source_marker.insert(
+        career_source_marker_key(&record.source_marker_ref),
+        key.clone(),
+    );
+    if let Some(original_ref) = record.correction_of_ref.clone() {
+        store
+            .career_corrections_by_original
+            .entry(career_record_key(&original_ref))
+            .or_default()
+            .push(key.clone());
+    }
+    store.career_records.insert(
+        key,
+        StoredCareerRecord {
+            record,
+            version: IdentityVersion::new(1),
+        },
+    );
+    Ok(())
+}
+
+fn apply_save_career_record_state(
+    store: &mut RuntimeStore,
+    record: CareerRecord,
+    expected_version: IdentityVersion,
+) -> Result<(), ApplicationError> {
+    let key = career_record_key(&record.career_record_ref);
+    let Some(existing) = store.career_records.get(&key) else {
+        return Err(ApplicationError::not_found(
+            "career record not found for update",
+        ));
+    };
+    if existing.version != expected_version {
+        return Err(ApplicationError::optimistic_version_conflict(
+            "career record version mismatch",
+        ));
+    }
+    store.career_records.insert(
+        key,
+        StoredCareerRecord {
+            record,
+            version: IdentityVersion::new(expected_version.get() + 1),
+        },
+    );
+    Ok(())
+}
+
+fn apply_save_memory_reference(
+    store: &mut RuntimeStore,
+    reference: MemoryReference,
+    expected_version: Option<IdentityVersion>,
+) -> Result<(), ApplicationError> {
+    let key = memory_reference_key(&reference.memory_reference_ref);
+    match (store.memory_references.get(&key), expected_version) {
+        (None, None) => {
+            store
+                .memory_references_by_member
+                .entry(member_key(&reference.member_ref))
+                .or_default()
+                .push(key.clone());
+            if let Some(memory_ref) = reference.memory_ref.clone() {
+                store.memory_reference_by_memory.insert(
+                    memory_reference_member_memory_key(&reference.member_ref, &memory_ref),
+                    key.clone(),
+                );
+            }
+            if let Some(archive_ref) = reference.archive_ref.clone() {
+                store.memory_reference_by_archive.insert(
+                    memory_reference_member_archive_key(&reference.member_ref, &archive_ref),
+                    key.clone(),
+                );
+            }
+            if let Some(handoff_ref) = reference.archive_handoff_ref.clone() {
+                store
+                    .memory_reference_by_handoff
+                    .insert(archive_handoff_key(&handoff_ref), key.clone());
+            }
+            store.memory_references.insert(
+                key,
+                StoredMemoryReference {
+                    reference,
+                    version: IdentityVersion::new(1),
+                },
+            );
+            Ok(())
+        }
+        (Some(existing), Some(expected)) if existing.version == expected => {
+            store
+                .memory_reference_by_memory
+                .retain(|_, value| value != &key);
+            store
+                .memory_reference_by_archive
+                .retain(|_, value| value != &key);
+            store
+                .memory_reference_by_handoff
+                .retain(|_, value| value != &key);
+            if let Some(memory_ref) = reference.memory_ref.clone() {
+                store.memory_reference_by_memory.insert(
+                    memory_reference_member_memory_key(&reference.member_ref, &memory_ref),
+                    key.clone(),
+                );
+            }
+            if let Some(archive_ref) = reference.archive_ref.clone() {
+                store.memory_reference_by_archive.insert(
+                    memory_reference_member_archive_key(&reference.member_ref, &archive_ref),
+                    key.clone(),
+                );
+            }
+            if let Some(handoff_ref) = reference.archive_handoff_ref.clone() {
+                store
+                    .memory_reference_by_handoff
+                    .insert(archive_handoff_key(&handoff_ref), key.clone());
+            }
+            let member_entries = store
+                .memory_references_by_member
+                .entry(member_key(&reference.member_ref))
+                .or_default();
+            if !member_entries.contains(&key) {
+                member_entries.push(key.clone());
+            }
+            store.memory_references.insert(
+                key,
+                StoredMemoryReference {
+                    reference,
+                    version: IdentityVersion::new(expected.get() + 1),
+                },
+            );
+            Ok(())
+        }
+        (None, Some(_)) => Err(ApplicationError::not_found(
+            "memory reference not found for update",
+        )),
+        _ => Err(ApplicationError::optimistic_version_conflict(
+            "memory reference version mismatch",
         )),
     }
 }
@@ -4462,6 +5598,75 @@ fn member_scope_key(member_ref: &GlobalMemberRef, scope_ref: &VisibilityScopeRef
     format!("{}::{}", member_ref.id().as_str(), scope_ref.as_str())
 }
 
+fn role_capability_summary_key(summary_ref: &RoleCapabilitySummaryRef) -> String {
+    summary_ref.summary_id.as_str().to_owned()
+}
+
+fn role_capability_snapshot_key(snapshot_ref: &RoleCapabilitySourceSnapshotRef) -> String {
+    snapshot_ref.snapshot_id.as_str().to_owned()
+}
+
+fn role_capability_source_key(source_ref: &RoleCapabilitySourceRef) -> String {
+    format!(
+        "{:?}::{}",
+        source_ref.source_kind,
+        source_ref.source_ref.external_ref.as_str()
+    )
+}
+
+fn career_record_key(record_ref: &CareerRecordRef) -> String {
+    record_ref.record_id.as_str().to_owned()
+}
+
+fn career_source_marker_key(source_marker_ref: &CareerSourceMarkerRef) -> String {
+    format!(
+        "{}::{}::{:?}::{}::{}",
+        source_marker_ref.member_ref.id().as_str(),
+        source_marker_ref.work_source_ref.source_ref.owner() as u8,
+        source_marker_ref.work_source_ref.source_kind,
+        source_marker_ref
+            .work_source_ref
+            .source_ref
+            .external_ref
+            .as_str(),
+        source_marker_ref.marker_token
+    )
+}
+
+fn memory_reference_key(reference_ref: &MemoryReferenceRef) -> String {
+    reference_ref.reference_id.as_str().to_owned()
+}
+
+fn memory_reference_member_memory_key(
+    member_ref: &GlobalMemberRef,
+    memory_ref: &MemoryRef,
+) -> String {
+    format!(
+        "{}::memory::{}",
+        member_ref.id().as_str(),
+        memory_ref.source_ref.external_ref.as_str()
+    )
+}
+
+fn memory_reference_member_archive_key(
+    member_ref: &GlobalMemberRef,
+    archive_ref: &ArchiveRef,
+) -> String {
+    format!(
+        "{}::archive::{}",
+        member_ref.id().as_str(),
+        archive_ref.source_ref.external_ref.as_str()
+    )
+}
+
+fn archive_handoff_key(handoff_ref: &ArchiveHandoffRef) -> String {
+    format!(
+        "{}::{}",
+        handoff_ref.source_ref.external_ref.as_str(),
+        handoff_ref.handoff_token
+    )
+}
+
 fn outbox_subject_key(
     subject_ref: &IdentityOutboxSubjectRef,
     outbox_ref: &IdentityOutboxRecordRef,
@@ -4608,8 +5813,9 @@ mod tests {
     use core_contracts::actor::{ActorKind, ActorRef};
     use identity_application::command::{IdentityCommandService, IdentityCommandServiceDeps};
     use identity_contracts::commands::{
-        EstablishGlobalMemberRequest, IdentityCommandOutcome, IdentityCommandRequest,
-        UpdateGlobalLifecycleStateRequest,
+        AppendCareerRecordRequest, EstablishGlobalMemberRequest, IdentityCommandOutcome,
+        IdentityCommandRequest, MaintainMemoryReferenceRequest,
+        MaintainRoleCapabilitySummaryRequest, UpdateGlobalLifecycleStateRequest,
     };
     use identity_contracts::events::{IdentityConsumerOutcome, IdentityConsumerReceipt};
     use identity_contracts::metadata::{IdentityCommandMetadata, IdentityRequestDigestMarker};
@@ -4619,13 +5825,24 @@ mod tests {
     };
     use identity_contracts::receipts::MaintenanceIssueRef;
     use identity_contracts::refs::{
-        ExternalReferenceSafeSummaryRef, ExternalSourceVersionRef,
-        GlobalLifecycleStateKind as PublicLifecycleStateKind, HandoffAttemptRef,
-        IdentityApiRequestMarkerRef, IdentityCanonicalRequestMarkerRef, IdentityChangeKind,
-        IdentityConsumerReceiptRef, IdentityJobReportRef, IdentityJobRunRef,
+        ArchiveHandoffRef, ArchiveRef, CapabilityEvidenceKind, CapabilityEvidenceRef,
+        CapabilitySourceRef, CareerAppendMaterialKind, CareerAppendMaterialMarker,
+        CareerAppendReasonKind, CareerAppendReasonRef, CareerRecordChangeIntent,
+        CareerRecordStateKind as PublicCareerRecordStateKind, ExternalReferenceSafeSummaryRef,
+        ExternalSourceVersionRef, GlobalLifecycleStateKind as PublicLifecycleStateKind,
+        HandoffAttemptRef, IdentityApiRequestMarkerRef, IdentityCanonicalRequestMarkerRef,
+        IdentityChangeKind, IdentityConsumerReceiptRef, IdentityJobReportRef, IdentityJobRunRef,
         IdentityJobScopeMarkerRef, IdentityOperationChannel, IdentityOutboxPayloadMarkerRef,
         IdentityRequestDigestValue, IdentityStoredResultRef, IdentityTimestamp,
-        LifecycleReasonKind, LifecycleReasonRef, TopicKeyRef,
+        LifecycleReasonKind, LifecycleReasonRef, MemoryRef, MemoryReferenceChangeIntent,
+        MemoryReferenceChangeMaterialKind, MemoryReferenceChangeMaterialMarker,
+        MemoryReferenceReasonKind, MemoryReferenceReasonRef, MemoryReferenceSourceKind,
+        MemoryReferenceSourceRef, MemoryReferenceStateKind as PublicMemoryReferenceStateKind,
+        ProjectParticipationRef, RoleCapabilityChangeMaterialKind,
+        RoleCapabilityChangeMaterialMarker, RoleCapabilityChangeReasonKind,
+        RoleCapabilityChangeReasonRef, RoleCapabilitySourceKind,
+        RoleCapabilitySummaryStateKind as PublicRoleCapabilitySummaryStateKind, RoleSourceRef,
+        TopicKeyRef, WorkSourceKind, WorkSourceRef,
     };
     use identity_contracts::views::{
         IdentityReadMaterialKind, IdentityReadMaterialMarker, MemberSummarySliceKind,
@@ -4811,6 +6028,9 @@ mod tests {
             accepted_audit_trail_marker_mapper: runtime,
             member_repository: runtime,
             lifecycle_repository: runtime,
+            role_capability_repository: runtime,
+            career_record_repository: runtime,
+            memory_reference_repository: runtime,
             trace_record_repository: runtime,
             audit_trail_repository: runtime,
             outbox_repository: runtime,
@@ -4926,6 +6146,78 @@ mod tests {
         )
     }
 
+    fn role_capability_source_ref(
+        token: &str,
+    ) -> identity_contracts::refs::RoleCapabilitySourceRef {
+        identity_contracts::refs::RoleCapabilitySourceRef::new(
+            RoleCapabilitySourceKind::RoleCapabilityBundle,
+            identity_source_ref(IdentitySourceOwner::MethodLibrary, token),
+        )
+        .expect("role capability source")
+    }
+
+    fn role_change_reason(token: &str) -> RoleCapabilityChangeReasonRef {
+        RoleCapabilityChangeReasonRef::new(
+            RoleCapabilityChangeReasonKind::ManualSummaryMaintenance,
+            identity_source_ref(IdentitySourceOwner::Identity, token),
+        )
+        .expect("role change reason")
+    }
+
+    fn career_append_reason(token: &str, kind: CareerAppendReasonKind) -> CareerAppendReasonRef {
+        CareerAppendReasonRef::new(
+            kind,
+            identity_source_ref(IdentitySourceOwner::Identity, token),
+        )
+        .expect("career append reason")
+    }
+
+    fn work_source(token: &str, kind: WorkSourceKind) -> WorkSourceRef {
+        WorkSourceRef::new(kind, identity_source_ref(IdentitySourceOwner::Work, token))
+            .expect("work source")
+    }
+
+    fn project_participation(token: &str) -> ProjectParticipationRef {
+        ProjectParticipationRef::from_work_source(identity_source_ref(
+            IdentitySourceOwner::Work,
+            token,
+        ))
+        .expect("project participation")
+    }
+
+    fn career_source_marker(
+        member_ref: &GlobalMemberRef,
+        work_source_ref: &WorkSourceRef,
+        token: &str,
+    ) -> identity_contracts::refs::CareerSourceMarkerRef {
+        identity_contracts::refs::CareerSourceMarkerRef::new(
+            member_ref.clone(),
+            work_source_ref.clone(),
+            token.to_owned(),
+        )
+        .expect("career source marker")
+    }
+
+    fn memory_source_ref(token: &str, kind: MemoryReferenceSourceKind) -> MemoryReferenceSourceRef {
+        let owner = match kind {
+            MemoryReferenceSourceKind::ManualCommand
+            | MemoryReferenceSourceKind::ReferenceRefreshMarker => IdentitySourceOwner::Identity,
+            MemoryReferenceSourceKind::MemorySourceEvent
+            | MemoryReferenceSourceKind::MigrationImport
+            | MemoryReferenceSourceKind::ArchiveHandoffResult => IdentitySourceOwner::MemoryArchive,
+        };
+        MemoryReferenceSourceRef::new(kind, identity_source_ref(owner, token))
+            .expect("memory source ref")
+    }
+
+    fn memory_reason(token: &str, kind: MemoryReferenceReasonKind) -> MemoryReferenceReasonRef {
+        MemoryReferenceReasonRef::new(
+            kind,
+            identity_source_ref(IdentitySourceOwner::Identity, token),
+        )
+        .expect("memory reason")
+    }
+
     fn job_context(
         operation_name: &str,
         idempotency_key: &str,
@@ -4963,6 +6255,210 @@ mod tests {
             )),
             timestamp(2),
         )
+    }
+
+    fn maintain_role_request(
+        token: &str,
+        member_ref: GlobalMemberRef,
+        source_token: &str,
+    ) -> IdentityCommandRequest<MaintainRoleCapabilitySummaryRequest> {
+        let source_ref = role_capability_source_ref(source_token);
+        let evidence_ref = CapabilityEvidenceRef::new(
+            CapabilityEvidenceKind::MethodArtifact,
+            source_ref.source_ref.clone(),
+        )
+        .expect("evidence ref");
+        IdentityCommandRequest {
+            actor_ref: ActorRef::new("actor-1", ActorKind::Human),
+            command_name: IdentityCommandName::new("MaintainRoleCapabilitySummary"),
+            metadata: IdentityCommandMetadata {
+                idempotency_key: format!("idem-role-{token}").into(),
+                request_marker_ref: IdentityApiRequestMarkerRef::new(format!(
+                    "request-role-{token}"
+                )),
+                schema_version_ref: IdentityProtocolSchemaVersionRef::new("identity.command.v1"),
+                trace_context_ref: None,
+            },
+            digest: request_digest_marker(&format!("role-{token}")),
+            body: MaintainRoleCapabilitySummaryRequest {
+                member_ref,
+                requested_summary_ref: None,
+                source_ref: source_ref.clone(),
+                role_source_ref: Some(
+                    RoleSourceRef::from_source(source_ref.clone()).expect("role source"),
+                ),
+                capability_source_refs: vec![
+                    CapabilitySourceRef::from_source(source_ref.clone())
+                        .expect("capability source"),
+                ],
+                evidence_refs: vec![evidence_ref],
+                safe_summary_ref: Some(
+                    identity_contracts::refs::RoleCapabilitySafeSummaryRef::new(
+                        source_ref.clone(),
+                        "safe-summary-1",
+                    )
+                    .expect("safe summary"),
+                ),
+                change_reason_ref: role_change_reason("role-change-1"),
+                change_material_marker: RoleCapabilityChangeMaterialMarker::new(
+                    RoleCapabilityChangeMaterialKind::SafeSummaryMarker,
+                    Some(source_ref.source_ref.clone()),
+                ),
+            },
+        }
+    }
+
+    fn append_career_request(
+        token: &str,
+        member_ref: GlobalMemberRef,
+        work_token: &str,
+        work_kind: WorkSourceKind,
+        change_intent: CareerRecordChangeIntent,
+        original_record_ref: Option<CareerRecordRef>,
+    ) -> IdentityCommandRequest<AppendCareerRecordRequest> {
+        let resolver_token = format!("{}::{work_token}", member_ref.id().as_str());
+        let work_source_ref = work_source(&resolver_token, work_kind);
+        let source_marker_token = format!("marker-{resolver_token}");
+        IdentityCommandRequest {
+            actor_ref: ActorRef::new("actor-1", ActorKind::Human),
+            command_name: IdentityCommandName::new("AppendCareerRecord"),
+            metadata: IdentityCommandMetadata {
+                idempotency_key: format!("idem-career-{token}").into(),
+                request_marker_ref: IdentityApiRequestMarkerRef::new(format!(
+                    "request-career-{token}"
+                )),
+                schema_version_ref: IdentityProtocolSchemaVersionRef::new("identity.command.v1"),
+                trace_context_ref: None,
+            },
+            digest: request_digest_marker(&format!("career-{token}")),
+            body: AppendCareerRecordRequest {
+                member_ref: member_ref.clone(),
+                requested_career_record_ref: None,
+                change_intent,
+                project_participation_ref: project_participation(&resolver_token),
+                work_source_ref: work_source_ref.clone(),
+                source_marker_ref: career_source_marker(
+                    &member_ref,
+                    &work_source_ref,
+                    &source_marker_token,
+                ),
+                career_summary_ref: Some(
+                    identity_contracts::refs::CareerSafeSummaryRef::new(
+                        work_source_ref.clone(),
+                        format!("safe-{work_token}"),
+                    )
+                    .expect("career safe summary"),
+                ),
+                append_reason_ref: career_append_reason(
+                    "career-reason-1",
+                    match change_intent {
+                        CareerRecordChangeIntent::AppendCorrection => {
+                            CareerAppendReasonKind::CorrectionAppend
+                        }
+                        CareerRecordChangeIntent::MarkSourcePendingReview => {
+                            CareerAppendReasonKind::SourcePendingReview
+                        }
+                        _ => CareerAppendReasonKind::ManualAppend,
+                    },
+                ),
+                original_record_ref,
+                append_material_marker: CareerAppendMaterialMarker {
+                    material_kind: match change_intent {
+                        CareerRecordChangeIntent::AppendCorrection => {
+                            CareerAppendMaterialKind::CorrectionMarkerOnly
+                        }
+                        CareerRecordChangeIntent::MarkSourcePendingReview => {
+                            CareerAppendMaterialKind::SourceMarkerOnly
+                        }
+                        _ => CareerAppendMaterialKind::SafeSummaryMarker,
+                    },
+                    source_ref: Some(work_source_ref.source_ref.clone()),
+                },
+            },
+        }
+    }
+
+    fn maintain_memory_request(
+        token: &str,
+        member_ref: GlobalMemberRef,
+        source_token: &str,
+        source_kind: MemoryReferenceSourceKind,
+        change_intent: MemoryReferenceChangeIntent,
+        archive_handoff_ref: Option<ArchiveHandoffRef>,
+    ) -> IdentityCommandRequest<MaintainMemoryReferenceRequest> {
+        let source_ref = memory_source_ref(source_token, source_kind);
+        let memory_ref = Some(
+            MemoryRef::from_source(identity_source_ref(
+                IdentitySourceOwner::MemoryArchive,
+                &format!("memory-{source_token}"),
+            ))
+            .expect("memory ref"),
+        );
+        let archive_ref = if matches!(
+            change_intent,
+            MemoryReferenceChangeIntent::AttachArchive
+                | MemoryReferenceChangeIntent::RecordArchiveHandoffResult
+        ) {
+            Some(
+                ArchiveRef::from_source(identity_source_ref(
+                    IdentitySourceOwner::MemoryArchive,
+                    &format!("archive-{source_token}"),
+                ))
+                .expect("archive ref"),
+            )
+        } else {
+            None
+        };
+        IdentityCommandRequest {
+            actor_ref: ActorRef::new("actor-1", ActorKind::Human),
+            command_name: IdentityCommandName::new("MaintainMemoryReference"),
+            metadata: IdentityCommandMetadata {
+                idempotency_key: format!("idem-memory-{token}").into(),
+                request_marker_ref: IdentityApiRequestMarkerRef::new(format!(
+                    "request-memory-{token}"
+                )),
+                schema_version_ref: IdentityProtocolSchemaVersionRef::new("identity.command.v1"),
+                trace_context_ref: None,
+            },
+            digest: request_digest_marker(&format!("memory-{token}")),
+            body: MaintainMemoryReferenceRequest {
+                member_ref,
+                requested_memory_reference_ref: None,
+                change_intent,
+                memory_ref,
+                archive_ref,
+                archive_handoff_ref,
+                source_ref: source_ref.clone(),
+                safe_summary_ref: Some(
+                    identity_contracts::refs::MemorySafeSummaryRef::new(
+                        source_ref.clone(),
+                        format!("safe-{source_token}"),
+                    )
+                    .expect("memory safe summary"),
+                ),
+                reason_ref: memory_reason(
+                    "memory-reason-1",
+                    match change_intent {
+                        MemoryReferenceChangeIntent::RecordArchiveHandoffResult => {
+                            MemoryReferenceReasonKind::ArchiveHandoffResult
+                        }
+                        MemoryReferenceChangeIntent::MarkPendingVerification => {
+                            MemoryReferenceReasonKind::SourcePendingVerification
+                        }
+                        _ => MemoryReferenceReasonKind::ManualMaintain,
+                    },
+                ),
+                change_material_marker: MemoryReferenceChangeMaterialMarker {
+                    material_kind: match change_intent {
+                        MemoryReferenceChangeIntent::RecordArchiveHandoffResult => {
+                            MemoryReferenceChangeMaterialKind::HandoffMarkerOnly
+                        }
+                        _ => MemoryReferenceChangeMaterialKind::ReferenceMarkersOnly,
+                    },
+                    source_ref: Some(source_ref.source_ref.clone()),
+                },
+            },
+        }
     }
 
     fn consumer_receipt_envelope(
@@ -5828,5 +7324,321 @@ mod tests {
             other => panic!("unexpected replay outcome: {other:?}"),
         };
         assert_eq!(replay_response.result_ref, accepted_response.result_ref);
+    }
+
+    #[test]
+    fn maintain_role_capability_summary_accepts_and_replays() {
+        let member = GlobalMember::establish(
+            member_ref("member-role-1"),
+            identity_source_ref(IdentitySourceOwner::Identity, "member-source-role-1"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member, IdentityVersion::new(1))
+            .build();
+        let service = command_service(&runtime);
+
+        let accepted = service
+            .maintain_role_capability_summary(
+                maintain_role_request("accept-1", member_ref("member-role-1"), "role-source-1"),
+                command_context(
+                    "MaintainRoleCapabilitySummary",
+                    "idem-role-accept-1",
+                    "role-accept-1",
+                ),
+            )
+            .expect("accepted");
+        let accepted_response = match accepted {
+            IdentityCommandOutcome::Accepted(response) => response,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(
+            accepted_response.result.summary_state_kind,
+            PublicRoleCapabilitySummaryStateKind::Active
+        );
+        assert_eq!(accepted_response.effect.outbox_refs.len(), 2);
+
+        let persisted = runtime
+            .find_current_summary_by_member(member_ref("member-role-1"))
+            .expect("load summary")
+            .expect("summary");
+        assert_eq!(
+            persisted.value.summary_ref,
+            accepted_response.result.summary_ref
+        );
+
+        let replay = service
+            .maintain_role_capability_summary(
+                maintain_role_request("accept-1", member_ref("member-role-1"), "role-source-1"),
+                command_context(
+                    "MaintainRoleCapabilitySummary",
+                    "idem-role-accept-1",
+                    "role-accept-1",
+                ),
+            )
+            .expect("replay");
+        let replay_response = match replay {
+            IdentityCommandOutcome::Accepted(response) => response,
+            other => panic!("unexpected replay outcome: {other:?}"),
+        };
+        assert_eq!(replay_response.result_ref, accepted_response.result_ref);
+        assert_eq!(replay_response.effect, accepted_response.effect);
+    }
+
+    #[test]
+    fn append_career_record_handles_append_correction_and_duplicate_conflict() {
+        let member = GlobalMember::establish(
+            member_ref("member-career-1"),
+            identity_source_ref(IdentitySourceOwner::Identity, "member-source-career-1"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member, IdentityVersion::new(1))
+            .build();
+        let service = command_service(&runtime);
+
+        let append = service
+            .append_career_record(
+                append_career_request(
+                    "append-1",
+                    member_ref("member-career-1"),
+                    "work-source-1",
+                    WorkSourceKind::ProjectParticipationAccepted,
+                    CareerRecordChangeIntent::AppendNew,
+                    None,
+                ),
+                command_context(
+                    "AppendCareerRecord",
+                    "idem-career-append-1",
+                    "career-append-1",
+                ),
+            )
+            .expect("append");
+        let appended = match append {
+            IdentityCommandOutcome::Accepted(response) => response,
+            other => panic!("unexpected append outcome: {other:?}"),
+        };
+        assert_eq!(
+            appended.result.record_state_kind,
+            PublicCareerRecordStateKind::Appended
+        );
+
+        let duplicate = service
+            .append_career_record(
+                append_career_request(
+                    "duplicate-1",
+                    member_ref("member-career-1"),
+                    "work-source-1",
+                    WorkSourceKind::ProjectParticipationAccepted,
+                    CareerRecordChangeIntent::AppendNew,
+                    None,
+                ),
+                command_context(
+                    "AppendCareerRecord",
+                    "idem-career-duplicate-1",
+                    "career-duplicate-1",
+                ),
+            )
+            .expect("duplicate outcome");
+        assert!(matches!(
+            duplicate,
+            IdentityCommandOutcome::Rejected(rejection)
+                if rejection.rejection_kind == identity_contracts::metadata::IdentityProtocolRejectionKind::Conflict
+        ));
+
+        let correction = service
+            .append_career_record(
+                append_career_request(
+                    "correction-1",
+                    member_ref("member-career-1"),
+                    "work-source-2",
+                    WorkSourceKind::WorkCorrection,
+                    CareerRecordChangeIntent::AppendCorrection,
+                    Some(appended.result.career_record_ref.clone()),
+                ),
+                command_context(
+                    "AppendCareerRecord",
+                    "idem-career-correction-1",
+                    "career-correction-1",
+                ),
+            )
+            .expect("correction");
+        let corrected = match correction {
+            IdentityCommandOutcome::Accepted(response) => response,
+            other => panic!("unexpected correction outcome: {other:?}"),
+        };
+        assert_eq!(
+            corrected.result.record_state_kind,
+            PublicCareerRecordStateKind::CorrectionAppended
+        );
+        let original = runtime
+            .get_career_record(appended.result.career_record_ref.clone())
+            .expect("load original")
+            .expect("original");
+        assert_eq!(
+            original.value.record_state,
+            identity_domain::career::CareerRecordStateKind::SupersededByCorrection
+        );
+    }
+
+    #[test]
+    fn append_career_record_pending_review_accepts_without_outbox() {
+        let member = GlobalMember::establish(
+            member_ref("member-career-review-1"),
+            identity_source_ref(
+                IdentitySourceOwner::Identity,
+                "member-source-career-review-1",
+            ),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member, IdentityVersion::new(1))
+            .build();
+        let service = command_service(&runtime);
+
+        let accepted = service
+            .append_career_record(
+                append_career_request(
+                    "review-1",
+                    member_ref("member-career-review-1"),
+                    "pending-review-source-1",
+                    WorkSourceKind::PendingReviewMarker,
+                    CareerRecordChangeIntent::MarkSourcePendingReview,
+                    None,
+                ),
+                command_context(
+                    "AppendCareerRecord",
+                    "idem-career-review-1",
+                    "career-review-1",
+                ),
+            )
+            .expect("pending review");
+        let response = match accepted {
+            IdentityCommandOutcome::Accepted(response) => response,
+            other => panic!("unexpected review outcome: {other:?}"),
+        };
+        assert_eq!(
+            response.result.record_state_kind,
+            PublicCareerRecordStateKind::SourcePendingReview
+        );
+        assert!(response.effect.outbox_refs.is_empty());
+    }
+
+    #[test]
+    fn maintain_memory_reference_link_archive_handoff_and_replay() {
+        let member = GlobalMember::establish(
+            member_ref("member-memory-1"),
+            identity_source_ref(IdentitySourceOwner::Identity, "member-source-memory-1"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member, IdentityVersion::new(1))
+            .build();
+        let service = command_service(&runtime);
+
+        let linked = service
+            .maintain_memory_reference(
+                maintain_memory_request(
+                    "link-1",
+                    member_ref("member-memory-1"),
+                    "memory-source-1",
+                    MemoryReferenceSourceKind::MemorySourceEvent,
+                    MemoryReferenceChangeIntent::LinkMemory,
+                    None,
+                ),
+                command_context(
+                    "MaintainMemoryReference",
+                    "idem-memory-link-1",
+                    "memory-link-1",
+                ),
+            )
+            .expect("linked");
+        let linked_response = match linked {
+            IdentityCommandOutcome::Accepted(response) => response,
+            other => panic!("unexpected memory link outcome: {other:?}"),
+        };
+        assert_eq!(
+            linked_response.result.reference_state_kind,
+            PublicMemoryReferenceStateKind::Linked
+        );
+
+        let handoff_ref = ArchiveHandoffRef::new(
+            identity_source_ref(IdentitySourceOwner::MemoryArchive, "handoff-source-1"),
+            "handoff-1",
+        )
+        .expect("handoff ref");
+        let archived = service
+            .maintain_memory_reference(
+                maintain_memory_request(
+                    "handoff-1",
+                    member_ref("member-memory-1"),
+                    "handoff-source-1",
+                    MemoryReferenceSourceKind::ArchiveHandoffResult,
+                    MemoryReferenceChangeIntent::RecordArchiveHandoffResult,
+                    Some(handoff_ref.clone()),
+                ),
+                command_context(
+                    "MaintainMemoryReference",
+                    "idem-memory-handoff-1",
+                    "memory-handoff-1",
+                ),
+            )
+            .expect("archived");
+        let archived_response = match archived {
+            IdentityCommandOutcome::Accepted(response) => response,
+            other => panic!("unexpected memory handoff outcome: {other:?}"),
+        };
+        assert_eq!(
+            archived_response.result.reference_state_kind,
+            PublicMemoryReferenceStateKind::Archived
+        );
+        let persisted = runtime
+            .find_reference_by_handoff(handoff_ref)
+            .expect("lookup by handoff")
+            .expect("reference");
+        assert_eq!(
+            persisted.value.memory_reference_ref,
+            archived_response.result.memory_reference_ref
+        );
+
+        let replay = service
+            .maintain_memory_reference(
+                maintain_memory_request(
+                    "handoff-1",
+                    member_ref("member-memory-1"),
+                    "handoff-source-1",
+                    MemoryReferenceSourceKind::ArchiveHandoffResult,
+                    MemoryReferenceChangeIntent::RecordArchiveHandoffResult,
+                    Some(
+                        ArchiveHandoffRef::new(
+                            identity_source_ref(
+                                IdentitySourceOwner::MemoryArchive,
+                                "handoff-source-1",
+                            ),
+                            "handoff-1",
+                        )
+                        .expect("handoff ref"),
+                    ),
+                ),
+                command_context(
+                    "MaintainMemoryReference",
+                    "idem-memory-handoff-1",
+                    "memory-handoff-1",
+                ),
+            )
+            .expect("replay");
+        let replay_response = match replay {
+            IdentityCommandOutcome::Accepted(response) => response,
+            other => panic!("unexpected memory replay outcome: {other:?}"),
+        };
+        assert_eq!(replay_response.result_ref, archived_response.result_ref);
     }
 }
