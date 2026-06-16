@@ -13,8 +13,9 @@ use identity_application::ports::{
     HandoffTargetResolution, IdentityAcceptedAuditTrailMarkerMapper,
     IdentityAdapterAvailabilityPort, IdentityAuditTrailRepository, IdentityClockPort,
     IdentityCommandEffectSummaryRepository, IdentityCursorAssignerPort,
-    IdentityExternalSourceResolverPort, IdentityHandoffDeliveryPort, IdentityHandoffTargetPort,
-    IdentityIdGeneratorPort, IdentityIdempotencyRepository, IdentityJobReportRepository,
+    IdentityExternalReferenceResolverPort, IdentityExternalSourceResolverPort,
+    IdentityHandoffDeliveryPort, IdentityHandoffTargetPort, IdentityIdGeneratorPort,
+    IdentityIdempotencyRepository, IdentityJobReportRepository,
     IdentityOperationContextFactoryPort, IdentityOutboxRepository, IdentityProjectionRepository,
     IdentityReadVisibilityRepository, IdentityReconciliationReportRepository,
     IdentityReferenceStateRepository, IdentityStoredResultRepository,
@@ -37,7 +38,7 @@ use identity_application::support::{
 };
 use identity_contracts::jobs::IdentityJobResultKind;
 use identity_contracts::protocol::IdentityJobName;
-use identity_contracts::receipts::TraceHandoffIntentRef;
+use identity_contracts::receipts::{MaintenanceIssueRef, TraceHandoffIntentRef};
 use identity_contracts::refs::{
     ArchiveHandoffRef, ArchiveRef, AuditCursorRef, AuditScopeRef, AuditTrailRef, CareerRecordId,
     CareerRecordRef, CareerSourceMarkerRef, ConsumerRef, ExternalReferenceKind,
@@ -46,14 +47,15 @@ use identity_contracts::refs::{
     HandoffIssueRef, HandoffReceiptRef, HandoffScopeRef, HandoffTargetRef, IdentityAuditSubjectRef,
     IdentityChangeKindRef, IdentityJobRunRef, IdentityMaintenanceTargetRef,
     IdentityOutboxRecordRef, IdentityOutboxSubjectRef, IdentityProjectionCursorRef,
-    IdentityProjectionRef, IdentityReferenceOwnerRef, IdentitySourceOwner, IdentitySourceRef,
-    IdentityTimestamp, IdentityTraceRecordRef, IdentityTraceSubjectRef, IdentityTruthCursor,
-    LifecycleRiskRef, MaintenanceScopeRef, MemberSummaryViewRef, MemoryRef, MemoryReferenceId,
-    MemoryReferenceRef, MemoryReferenceSourceState, ProjectParticipationRef, ProjectionStateRef,
-    ReconciliationReportRef, ReferenceResolutionStateRef, RoleCapabilitySourceRef,
-    RoleCapabilitySourceSnapshotRef, RoleCapabilitySummaryRef, TopicKeyRef,
-    TraceHandoffSafeMaterialRef, VisibilityContextRef, VisibilityResultRef, VisibilityScopeRef,
-    WorkParticipationSourceState, WorkParticipationSourceSummary,
+    IdentityProjectionRef, IdentityReferenceOwnerKind, IdentityReferenceOwnerRef,
+    IdentitySourceOwner, IdentitySourceRef, IdentityTimestamp, IdentityTraceRecordRef,
+    IdentityTraceSubjectRef, IdentityTruthCursor, LifecycleRiskRef, MaintenanceScopeRef,
+    MemberSummaryViewRef, MemoryRef, MemoryReferenceId, MemoryReferenceRef,
+    MemoryReferenceSourceState, ProjectParticipationRef, ProjectionStateRef,
+    ReconciliationReportRef, ReferenceResolutionStateId, ReferenceResolutionStateRef,
+    RoleCapabilitySourceRef, RoleCapabilitySourceSnapshotRef, RoleCapabilitySummaryRef,
+    TopicKeyRef, TraceHandoffSafeMaterialRef, VisibilityContextRef, VisibilityResultRef,
+    VisibilityScopeRef, WorkParticipationSourceState, WorkParticipationSourceSummary,
 };
 use identity_contracts::views::{IdentityVisibilityAccessSummary, MemberSummaryView};
 use identity_domain::audit::{AuditTrail, AuditTrailEntry};
@@ -701,6 +703,57 @@ impl IdentityInMemoryRuntime {
         })?;
         staged.entry(tx_key(transaction_ref)).or_default().push(op);
         Ok(())
+    }
+
+    fn staged_reference_bundle_state(
+        &self,
+        transaction_ref: &IdentityTransactionRef,
+        reference_ref: &ExternalReferenceRef,
+    ) -> Result<Option<(ReferenceResolutionStateRef, IdentityVersion)>, ApplicationError> {
+        let committed = {
+            let store =
+                self.shared.store.lock().map_err(|_| {
+                    ApplicationError::consistency_defect("runtime store lock poisoned")
+                })?;
+            store
+                .reference_states
+                .get(&external_reference_key(reference_ref))
+                .map(|stored| (stored.state.resolution_state_ref.clone(), stored.version))
+        };
+        let staged = self.shared.staged_by_tx.lock().map_err(|_| {
+            ApplicationError::consistency_defect("staged transaction map lock poisoned")
+        })?;
+        let mut current = committed;
+        if let Some(ops) = staged.get(&tx_key(transaction_ref)) {
+            for op in ops {
+                match op {
+                    StagedOp::SaveReferenceState {
+                        state,
+                        expected_version,
+                    } if state.external_reference_ref == *reference_ref => {
+                        current = Some((
+                            state.resolution_state_ref.clone(),
+                            expected_version
+                                .map(|value| IdentityVersion::new(value.get() + 1))
+                                .unwrap_or_else(|| IdentityVersion::new(1)),
+                        ));
+                    }
+                    StagedOp::SaveTypedSidecars {
+                        reference_ref: staged_reference_ref,
+                        expected_version,
+                        ..
+                    } if staged_reference_ref == reference_ref => {
+                        let state_ref = current.as_ref().map(|(value_ref, _)| value_ref.clone());
+                        if let Some(state_ref) = state_ref {
+                            current =
+                                Some((state_ref, IdentityVersion::new(expected_version.get() + 1)));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(current)
     }
 
     fn predicted_view_version(
@@ -3253,6 +3306,114 @@ impl IdentityProjectionRepository for IdentityInMemoryRuntime {
     }
 }
 
+impl IdentityExternalReferenceResolverPort for IdentityInMemoryRuntime {
+    fn resolve_external_reference(
+        &self,
+        reference_ref: ExternalReferenceRef,
+        owner_ref: IdentityReferenceOwnerRef,
+    ) -> Result<ReferenceResolutionState, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        if let Some(stored) = store
+            .reference_states
+            .get(&external_reference_key(&reference_ref))
+        {
+            if stored.state.reference_owner_ref != owner_ref {
+                return Err(ApplicationError::not_found(
+                    "reference bundle owner mismatch",
+                ));
+            }
+            return Ok(stored.state.clone());
+        }
+        drop(store);
+
+        let token = reference_ref.source_ref.external_ref.as_str().to_owned();
+        let resolution_state_ref = runtime_reference_state_ref(&reference_ref)?;
+        let checked_at = runtime_timestamp(1)?;
+        if token.contains("unavailable") {
+            return Ok(ReferenceResolutionState::unavailable(
+                resolution_state_ref,
+                reference_ref,
+                owner_ref,
+                MaintenanceIssueRef::new(format!("reference-unavailable:{token}")),
+                checked_at,
+            ));
+        }
+        if token.contains("unrecognized") {
+            return Ok(ReferenceResolutionState::unrecognized(
+                resolution_state_ref,
+                reference_ref,
+                owner_ref,
+                MaintenanceIssueRef::new(format!("reference-unrecognized:{token}")),
+                checked_at,
+            ));
+        }
+
+        let source_version_ref = runtime_external_source_version_ref(&reference_ref)?;
+        let safe_summary_ref = runtime_external_reference_safe_summary_ref(&reference_ref)?;
+        Ok(ReferenceResolutionState::resolved(
+            resolution_state_ref,
+            reference_ref,
+            owner_ref,
+            source_version_ref,
+            safe_summary_ref,
+            checked_at,
+        ))
+    }
+
+    fn map_role_capability_owner(
+        &self,
+        summary_ref: RoleCapabilitySummaryRef,
+    ) -> Result<IdentityReferenceOwnerRef, ApplicationError> {
+        runtime_reference_owner_ref(
+            IdentityReferenceOwnerKind::RoleCapability,
+            format!(
+                "role-capability-summary:{}",
+                summary_ref.summary_id.as_str()
+            ),
+        )
+    }
+
+    fn map_career_owner(
+        &self,
+        record_ref: CareerRecordRef,
+    ) -> Result<IdentityReferenceOwnerRef, ApplicationError> {
+        runtime_reference_owner_ref(
+            IdentityReferenceOwnerKind::CareerRecord,
+            format!("career-record:{}", record_ref.record_id.as_str()),
+        )
+    }
+
+    fn map_memory_owner(
+        &self,
+        reference_ref: MemoryReferenceRef,
+    ) -> Result<IdentityReferenceOwnerRef, ApplicationError> {
+        runtime_reference_owner_ref(
+            IdentityReferenceOwnerKind::MemoryReference,
+            format!("memory-reference:{}", reference_ref.reference_id.as_str()),
+        )
+    }
+
+    fn map_lifecycle_basis_owner(
+        &self,
+        member_ref: GlobalMemberRef,
+        basis_ref: GovernanceBasisRef,
+    ) -> Result<IdentityReferenceOwnerRef, ApplicationError> {
+        runtime_reference_owner_ref(
+            IdentityReferenceOwnerKind::LifecycleBasis,
+            format!(
+                "lifecycle-basis:{}:{:?}:{}",
+                member_ref.id().as_str(),
+                basis_ref.basis_kind,
+                basis_ref.external_ref.as_str(),
+            ),
+        )
+    }
+}
+
 impl IdentityReferenceStateRepository for IdentityInMemoryRuntime {
     fn get_reference_state_with_version(
         &self,
@@ -3389,22 +3550,14 @@ impl IdentityReferenceStateRepository for IdentityInMemoryRuntime {
         expected_version: IdentityVersion,
         uow: &dyn IdentityUnitOfWork,
     ) -> Result<IdentityVersionedRef<ReferenceResolutionStateRef>, ApplicationError> {
-        let state = self
-            .shared
-            .store
-            .lock()
-            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
-        let stored = state
-            .reference_states
-            .get(&external_reference_key(&reference_ref))
+        let (value_ref, current_version) = self
+            .staged_reference_bundle_state(&uow.transaction_ref(), &reference_ref)?
             .ok_or_else(|| ApplicationError::not_found("reference bundle not found"))?;
-        if stored.version != expected_version {
+        if current_version != expected_version {
             return Err(ApplicationError::optimistic_version_conflict(
                 "reference bundle version mismatch",
             ));
         }
-        let value_ref = stored.state.resolution_state_ref.clone();
-        drop(state);
 
         self.stage(
             &uow.transaction_ref(),
@@ -6466,6 +6619,86 @@ fn empty_sidecars() -> ExternalReferenceTypedSidecarRefs {
     }
 }
 
+fn runtime_timestamp(ticks: u64) -> Result<IdentityTimestamp, ApplicationError> {
+    let ticks = i64::try_from(ticks)
+        .map_err(|_| ApplicationError::invalid_request("timestamp ticks overflow"))?;
+    IdentityTimestamp::from_clock(ticks).map_err(contract_error_to_application_error)
+}
+
+fn runtime_identity_source_ref(
+    owner: IdentitySourceOwner,
+    token: impl Into<String>,
+) -> Result<IdentitySourceRef, ApplicationError> {
+    let external_ref =
+        ExternalSourceRef::new(token.into()).map_err(contract_error_to_application_error)?;
+    IdentitySourceRef::new(owner, external_ref).map_err(contract_error_to_application_error)
+}
+
+fn runtime_reference_owner_ref(
+    owner_kind: IdentityReferenceOwnerKind,
+    token: impl Into<String>,
+) -> Result<IdentityReferenceOwnerRef, ApplicationError> {
+    Ok(IdentityReferenceOwnerRef::new(
+        owner_kind,
+        runtime_identity_source_ref(IdentitySourceOwner::Identity, token)?,
+    ))
+}
+
+fn runtime_reference_state_ref(
+    reference_ref: &ExternalReferenceRef,
+) -> Result<ReferenceResolutionStateRef, ApplicationError> {
+    Ok(ReferenceResolutionStateRef::from_id(
+        ReferenceResolutionStateId::new(format!(
+            "reference-state:{}:{}",
+            match reference_ref.reference_kind {
+                ExternalReferenceKind::MethodSource => "method-source",
+                ExternalReferenceKind::WorkParticipation => "work-participation",
+                ExternalReferenceKind::Memory => "memory",
+                ExternalReferenceKind::Archive => "archive",
+                ExternalReferenceKind::GovernanceBasis => "governance-basis",
+                ExternalReferenceKind::RuntimeSignal => "runtime-signal",
+            },
+            reference_ref.source_ref.external_ref.as_str(),
+        ))
+        .map_err(contract_error_to_application_error)?,
+    ))
+}
+
+fn runtime_external_source_version_ref(
+    reference_ref: &ExternalReferenceRef,
+) -> Result<ExternalSourceVersionRef, ApplicationError> {
+    Ok(ExternalSourceVersionRef::new(runtime_identity_source_ref(
+        reference_ref.source_ref.owner(),
+        format!(
+            "source-version:{}",
+            reference_ref.source_ref.external_ref.as_str()
+        ),
+    )?))
+}
+
+fn runtime_external_reference_safe_summary_ref(
+    reference_ref: &ExternalReferenceRef,
+) -> Result<identity_contracts::refs::ExternalReferenceSafeSummaryRef, ApplicationError> {
+    Ok(
+        identity_contracts::refs::ExternalReferenceSafeSummaryRef::new(
+            reference_ref.clone(),
+            runtime_identity_source_ref(
+                reference_ref.source_ref.owner(),
+                format!(
+                    "safe-summary:{}",
+                    reference_ref.source_ref.external_ref.as_str()
+                ),
+            )?,
+        ),
+    )
+}
+
+fn contract_error_to_application_error(
+    err: identity_contracts::errors::ContractError,
+) -> ApplicationError {
+    ApplicationError::invalid_request(format!("{}: {}", err.field, err.message))
+}
+
 fn identity_source_ref(owner: IdentitySourceOwner, token: &str) -> IdentitySourceRef {
     IdentitySourceRef::new(
         owner,
@@ -7517,6 +7750,130 @@ mod tests {
                 .role_capability_safe_summary_ref
                 .is_some()
         );
+    }
+
+    #[test]
+    fn save_typed_sidecars_sees_staged_reference_bundle() {
+        let runtime = IdentityInMemoryRuntime::builder().build();
+        let uow = runtime.begin().expect("uow");
+        let bundle = reference_state_resolved();
+        let staged = runtime
+            .save_reference_state(bundle.clone(), None, uow.as_ref())
+            .expect("stage reference bundle");
+
+        let updated = runtime
+            .save_typed_sidecar_refs(
+                bundle.external_reference_ref.clone(),
+                ExternalReferenceTypedSidecarRefs {
+                    role_capability_safe_summary_ref: Some(ExternalReferenceSafeSummaryRef::new(
+                        bundle.external_reference_ref.clone(),
+                        identity_source_ref(
+                            IdentitySourceOwner::MethodLibrary,
+                            "role-summary-sidecar-1",
+                        ),
+                    )),
+                    career_safe_summary_ref: None,
+                    memory_safe_summary_ref: None,
+                    governance_basis_summary_ref: None,
+                    evidence_summary_ref: None,
+                    source_version_ref: Some(ExternalSourceVersionRef::new(identity_source_ref(
+                        IdentitySourceOwner::MethodLibrary,
+                        "sidecar-version-1",
+                    ))),
+                },
+                staged.version,
+                uow.as_ref(),
+            )
+            .expect("stage sidecars");
+        assert_eq!(updated.value_ref, staged.value_ref);
+        assert_eq!(updated.version, IdentityVersion::new(2));
+
+        runtime.commit(uow).expect("commit");
+
+        let persisted = runtime
+            .get_reference_state_with_version(bundle.external_reference_ref.clone())
+            .expect("load bundle")
+            .expect("bundle present");
+        assert_eq!(persisted.version, IdentityVersion::new(2));
+        assert_eq!(
+            persisted.value.resolution_state_ref,
+            bundle.resolution_state_ref
+        );
+        assert_eq!(
+            runtime
+                .get_typed_sidecar_refs(bundle.external_reference_ref)
+                .expect("load sidecars")
+                .source_version_ref,
+            Some(ExternalSourceVersionRef::new(identity_source_ref(
+                IdentitySourceOwner::MethodLibrary,
+                "sidecar-version-1",
+            )))
+        );
+    }
+
+    #[test]
+    fn external_reference_resolver_returns_seeded_or_deterministic_state() {
+        let seeded = reference_state_resolved();
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_reference_state(seeded.clone(), empty_sidecars(), IdentityVersion::new(3))
+            .build();
+
+        let loaded = runtime
+            .resolve_external_reference(seeded.external_reference_ref.clone(), reference_owner())
+            .expect("seeded bundle");
+        assert_eq!(loaded, seeded);
+
+        let unavailable = runtime
+            .resolve_external_reference(
+                ExternalReferenceRef::new(
+                    ExternalReferenceKind::MethodSource,
+                    identity_source_ref(
+                        IdentitySourceOwner::MethodLibrary,
+                        "reference-unavailable-1",
+                    ),
+                ),
+                reference_owner(),
+            )
+            .expect("unavailable bundle");
+        assert_eq!(
+            unavailable.state_kind,
+            ReferenceResolutionStateKind::Unavailable
+        );
+        assert!(unavailable.issue_ref.is_some());
+        assert!(unavailable.source_version_ref.is_none());
+        assert!(unavailable.safe_summary_ref.is_none());
+
+        let unrecognized = runtime
+            .resolve_external_reference(
+                ExternalReferenceRef::new(
+                    ExternalReferenceKind::MethodSource,
+                    identity_source_ref(
+                        IdentitySourceOwner::MethodLibrary,
+                        "reference-unrecognized-1",
+                    ),
+                ),
+                reference_owner(),
+            )
+            .expect("unrecognized bundle");
+        assert_eq!(
+            unrecognized.state_kind,
+            ReferenceResolutionStateKind::Unrecognized
+        );
+        assert!(unrecognized.issue_ref.is_some());
+
+        let resolved = runtime
+            .resolve_external_reference(
+                ExternalReferenceRef::new(
+                    ExternalReferenceKind::MethodSource,
+                    identity_source_ref(IdentitySourceOwner::MethodLibrary, "reference-resolved-1"),
+                ),
+                reference_owner(),
+            )
+            .expect("resolved bundle");
+        assert_eq!(resolved.state_kind, ReferenceResolutionStateKind::Resolved);
+        assert_eq!(resolved.reference_owner_ref, reference_owner());
+        assert!(resolved.source_version_ref.is_some());
+        assert!(resolved.safe_summary_ref.is_some());
     }
 
     #[test]
