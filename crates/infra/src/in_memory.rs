@@ -1581,6 +1581,18 @@ impl IdentityIdGeneratorPort for IdentityInMemoryRuntime {
         )))
     }
 
+    fn new_identity_consumer_receipt_ref(
+        &self,
+    ) -> Result<identity_contracts::refs::IdentityConsumerReceiptRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(identity_contracts::refs::IdentityConsumerReceiptRef::new(
+            format!("consumer-receipt-{next}"),
+        ))
+    }
+
     fn new_identity_command_effect_summary_ref(
         &self,
     ) -> Result<IdentityCommandEffectSummaryRef, ApplicationError> {
@@ -6464,15 +6476,20 @@ fn identity_source_ref(owner: IdentitySourceOwner, token: &str) -> IdentitySourc
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use core_contracts::actor::{ActorKind, ActorRef};
     use identity_application::command::{IdentityCommandService, IdentityCommandServiceDeps};
+    use identity_application::consumer::{IdentityConsumerService, IdentityConsumerServiceDeps};
     use identity_contracts::commands::{
         AppendCareerRecordRequest, EstablishGlobalMemberRequest, IdentityCommandOutcome,
         IdentityCommandRequest, MaintainMemoryReferenceRequest,
         MaintainRoleCapabilitySummaryRequest, PrepareTraceHandoffRequest,
         UpdateGlobalLifecycleStateRequest,
     };
-    use identity_contracts::events::{IdentityConsumerOutcome, IdentityConsumerReceipt};
+    use identity_contracts::events::{
+        IdentityConsumerOutcome, IdentityConsumerReceipt, IdentityInboundEventEnvelope,
+    };
     use identity_contracts::metadata::{
         IdentityCommandMetadata, IdentityDegradedKind, IdentityQueryDisposition,
         IdentityQueryMetadata, IdentityRequestDigestMarker,
@@ -6500,10 +6517,11 @@ mod tests {
         GlobalLifecycleStateKind as PublicLifecycleStateKind, HandoffAttemptRef, HandoffReasonRef,
         HandoffScopeRef, HandoffStateKind as PublicHandoffStateKind, HandoffTargetRef,
         IdentityApiRequestMarkerRef, IdentityCanonicalRequestMarkerRef, IdentityChangeKind,
-        IdentityConsumerReceiptRef, IdentityDegradedMarkerRef, IdentityJobReportRef,
-        IdentityJobRunRef, IdentityJobScopeMarkerRef, IdentityMaintenanceTargetRef,
-        IdentityOperationChannel, IdentityOutboxPayloadMarkerRef, IdentityReadSubjectRef,
-        IdentityReadSurfaceKind, IdentityRedactionMarkerRef, IdentityRequestDigestValue,
+        IdentityConsumerBindingRef, IdentityConsumerReceiptRef, IdentityDegradedMarkerRef,
+        IdentityEventEnvelopeMarkerRef, IdentityJobReportRef, IdentityJobRunRef,
+        IdentityJobScopeMarkerRef, IdentityMaintenanceTargetRef, IdentityOperationChannel,
+        IdentityOutboxPayloadMarkerRef, IdentityReadSubjectRef, IdentityReadSurfaceKind,
+        IdentityRedactionMarkerRef, IdentityRequestDigestValue, IdentitySourceEventRef,
         IdentityStoredResultRef, IdentityTimestamp, LifecycleReasonKind, LifecycleReasonRef,
         MemoryRef, MemoryReferenceChangeIntent, MemoryReferenceChangeMaterialKind,
         MemoryReferenceChangeMaterialMarker, MemoryReferenceReasonKind, MemoryReferenceReasonRef,
@@ -6718,6 +6736,17 @@ mod tests {
             handoff_intent_repository: runtime,
             handoff_target_port: runtime,
             external_source_resolver: runtime,
+        })
+    }
+
+    fn consumer_service<'a>(runtime: &'a IdentityInMemoryRuntime) -> IdentityConsumerService<'a> {
+        IdentityConsumerService::new(IdentityConsumerServiceDeps {
+            unit_of_work_manager: runtime,
+            clock: runtime,
+            id_generator: runtime,
+            operation_context_factory: runtime,
+            idempotency_repository: runtime,
+            stored_result_repository: runtime,
         })
     }
 
@@ -7264,23 +7293,98 @@ mod tests {
         token: &str,
         context_ref: &IdentityOperationContextRef,
     ) -> IdentityConsumerReceiptEnvelope {
+        let fresh = IdentityConsumerReceipt {
+            receipt_ref: IdentityConsumerReceiptRef::new(format!("receipt-{token}")),
+            consumer_name: IdentityInboundConsumerName::new("HandleRoleCapabilitySourceChanged"),
+            outcome: IdentityConsumerOutcome::Accepted,
+            stored_result_ref: stored_result_ref(token),
+            trace_refs: vec![IdentityTraceRecordRef::new(format!("trace-{token}"))],
+            outbox_refs: vec![IdentityOutboxRecordRef::new(format!("outbox-{token}"))],
+            issue_refs: Vec::new(),
+        };
+
         IdentityConsumerReceiptEnvelope::consumer_receipt(
             context_ref.clone(),
             identity_application::support::IdentityStoredSurfaceMarkerRef::new(format!(
                 "surface-{token}"
             )),
-            IdentityConsumerReceipt {
-                receipt_ref: IdentityConsumerReceiptRef::new(format!("receipt-{token}")),
-                consumer_name: IdentityInboundConsumerName::new(
-                    "HandleRoleCapabilitySourceChanged",
-                ),
-                outcome: IdentityConsumerOutcome::Accepted,
-                stored_result_ref: stored_result_ref(token),
-                trace_refs: vec![IdentityTraceRecordRef::new(format!("trace-{token}"))],
-                outbox_refs: vec![IdentityOutboxRecordRef::new(format!("outbox-{token}"))],
-                issue_refs: Vec::new(),
-            },
+            IdentityConsumerService::duplicate_replay_receipt(&fresh),
             timestamp(2),
+        )
+    }
+
+    fn handoff_callback_receipt_envelope(
+        token: &str,
+        context_ref: &IdentityOperationContextRef,
+    ) -> IdentityConsumerReceiptEnvelope {
+        let fresh = IdentityConsumerReceipt {
+            receipt_ref: IdentityConsumerReceiptRef::new(format!("receipt-{token}")),
+            consumer_name: IdentityInboundConsumerName::new("HandleTraceHandoffResult"),
+            outcome: IdentityConsumerOutcome::Accepted,
+            stored_result_ref: stored_result_ref(token),
+            trace_refs: vec![IdentityTraceRecordRef::new(format!("trace-{token}"))],
+            outbox_refs: vec![IdentityOutboxRecordRef::new(format!("outbox-{token}"))],
+            issue_refs: Vec::new(),
+        };
+
+        IdentityConsumerReceiptEnvelope::handoff_callback_receipt(
+            context_ref.clone(),
+            identity_application::support::IdentityStoredSurfaceMarkerRef::new(format!(
+                "surface-{token}"
+            )),
+            IdentityConsumerService::duplicate_replay_receipt(&fresh),
+            timestamp(2),
+        )
+    }
+
+    fn inbound_event_envelope(
+        token: &str,
+        consumer_name: &str,
+        schema_version: &str,
+    ) -> IdentityInboundEventEnvelope<()> {
+        IdentityInboundEventEnvelope {
+            consumer_name: IdentityInboundConsumerName::new(consumer_name),
+            envelope_marker_ref: IdentityEventEnvelopeMarkerRef::new(format!("envelope-{token}")),
+            consumer_binding_ref: IdentityConsumerBindingRef::new(format!("binding-{token}")),
+            source_event_ref: IdentitySourceEventRef::new(format!("source-event-{token}")),
+            idempotency_key: format!("idem-{token}").into(),
+            schema_version_ref: IdentityProtocolSchemaVersionRef::new(schema_version),
+            occurred_at: None,
+            received_at: timestamp(1),
+            trace_context_ref: None,
+            payload: (),
+        }
+    }
+
+    fn inbound_context(token: &str, operation_name: &str) -> IdentityOperationContext {
+        IdentityOperationContext::from_inbound_event(
+            IdentityOperationContextRef::new(format!("context-{token}")),
+            IdentityOperationName::new(operation_name),
+            ActorRef::system("worker"),
+            identity_application::support::IdentityRequestMetadataRef::new(format!(
+                "metadata-{token}"
+            )),
+            IdentityIdempotencyKey::new(format!("idem-{token}")),
+            request_digest(token),
+            None,
+            IdentitySourceEventRef::new(format!("source-event-{token}")),
+            timestamp(1),
+        )
+    }
+
+    fn callback_context(token: &str, operation_name: &str) -> IdentityOperationContext {
+        IdentityOperationContext::from_handoff_callback(
+            IdentityOperationContextRef::new(format!("context-{token}")),
+            IdentityOperationName::new(operation_name),
+            ActorRef::system("worker"),
+            identity_application::support::IdentityRequestMetadataRef::new(format!(
+                "metadata-{token}"
+            )),
+            IdentityIdempotencyKey::new(format!("idem-{token}")),
+            request_digest(token),
+            None,
+            IdentitySourceEventRef::new(format!("source-event-{token}")),
+            timestamp(1),
         )
     }
 
@@ -7684,6 +7788,193 @@ mod tests {
             .expect("receipt");
         assert_eq!(replay, envelope);
         runtime.rollback(uow).expect("rollback");
+    }
+
+    #[test]
+    fn inbound_consumer_scaffold_duplicate_replays_without_running_handler() {
+        let context = inbound_context("consumer-scaffold-1", "HandleRoleCapabilitySourceChanged");
+        let stored = StoredIdentityOperationResult::consumer_receipt(
+            stored_result_ref("consumer-scaffold-1"),
+            context.context_ref.clone(),
+            identity_application::support::IdentityStoredSurfaceMarkerRef::new(
+                "surface-consumer-scaffold-1",
+            ),
+            timestamp(2),
+        );
+        let record = IdentityIdempotencyRecord {
+            record_ref: IdentityIdempotencyRecordRef::new("idem-record-consumer-scaffold-1"),
+            operation_name: context.operation_name.clone(),
+            channel: IdentityOperationChannel::Consumer,
+            idempotency_key: IdentityIdempotencyKey::new("idem-consumer-scaffold-1"),
+            request_digest: context.request_digest.clone(),
+            state: identity_application::support::IdentityIdempotencyStateKind::Completed,
+            stored_result_ref: Some(stored_result_ref("consumer-scaffold-1")),
+            reserved_at: timestamp(1),
+            completed_at: Some(timestamp(2)),
+        };
+        let stored_receipt = consumer_receipt_envelope("consumer-scaffold-1", &context.context_ref);
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_idempotency_record(record, IdentityVersion::new(2))
+            .seed_stored_result(stored)
+            .seed_consumer_receipt(stored_receipt.clone())
+            .build();
+        let service = consumer_service(&runtime);
+        let handler_calls = Cell::new(0usize);
+        let envelope = inbound_event_envelope(
+            "consumer-scaffold-1",
+            "HandleRoleCapabilitySourceChanged",
+            "identity.consumer.v1",
+        );
+
+        let receipt = service
+            .dispatch_inbound_event_scaffold(
+                context,
+                &envelope,
+                &IdentityProtocolSchemaVersionRef::new("identity.consumer.v1"),
+                |_, _, _| {
+                    handler_calls.set(handler_calls.get() + 1);
+                    unreachable!("duplicate replay must not dispatch payload handler");
+                },
+            )
+            .expect("duplicate replay");
+
+        assert_eq!(handler_calls.get(), 0);
+        assert_eq!(receipt, stored_receipt.receipt);
+        assert_eq!(receipt.outcome, IdentityConsumerOutcome::DuplicateReplayed);
+    }
+
+    #[test]
+    fn unsupported_schema_scaffold_returns_fresh_receipt_and_persists_replay_surface() {
+        let runtime = IdentityInMemoryRuntime::builder().build();
+        let service = consumer_service(&runtime);
+        let context = inbound_context("unsupported-schema-1", "HandleRoleCapabilitySourceChanged");
+        let envelope = inbound_event_envelope(
+            "unsupported-schema-1",
+            "HandleRoleCapabilitySourceChanged",
+            "identity.consumer.v0",
+        );
+        let handler_calls = Cell::new(0usize);
+
+        let first = service
+            .dispatch_inbound_event_scaffold(
+                context.clone(),
+                &envelope,
+                &IdentityProtocolSchemaVersionRef::new("identity.consumer.v1"),
+                |_, _, _| {
+                    handler_calls.set(handler_calls.get() + 1);
+                    unreachable!("unsupported schema must not dispatch payload handler");
+                },
+            )
+            .expect("unsupported receipt");
+
+        assert_eq!(handler_calls.get(), 0);
+        assert_eq!(first.outcome, IdentityConsumerOutcome::UnsupportedVersion);
+        assert_eq!(first.trace_refs, Vec::<IdentityTraceRecordRef>::new());
+        assert_eq!(first.outbox_refs, Vec::<IdentityOutboxRecordRef>::new());
+        assert_eq!(first.issue_refs.len(), 1);
+        assert_eq!(
+            first.issue_refs[0],
+            identity_contracts::metadata::IdentityProtocolValidationIssueRef::new(
+                "unsupported-schema:identity.consumer.v0",
+            )
+        );
+
+        let stored = runtime
+            .get_stored_result(first.stored_result_ref.clone())
+            .expect("load stored shell")
+            .expect("stored shell");
+        assert_eq!(
+            stored.result_kind,
+            identity_application::support::IdentityStoredResultKind::ConsumerReceipt
+        );
+
+        let replay_envelope = runtime
+            .get_consumer_receipt(first.stored_result_ref.clone())
+            .expect("load stored receipt")
+            .expect("stored receipt");
+        assert_eq!(
+            replay_envelope.receipt.outcome,
+            IdentityConsumerOutcome::DuplicateReplayed
+        );
+        assert_eq!(replay_envelope.receipt.issue_refs, first.issue_refs);
+
+        let replay = service
+            .dispatch_inbound_event_scaffold(
+                context,
+                &envelope,
+                &IdentityProtocolSchemaVersionRef::new("identity.consumer.v1"),
+                |_, _, _| {
+                    handler_calls.set(handler_calls.get() + 1);
+                    unreachable!("duplicate replay must not dispatch payload handler");
+                },
+            )
+            .expect("replayed unsupported receipt");
+
+        assert_eq!(handler_calls.get(), 0);
+        assert_eq!(replay.outcome, IdentityConsumerOutcome::DuplicateReplayed);
+        assert_eq!(replay.stored_result_ref, first.stored_result_ref);
+        assert_eq!(replay.issue_refs, first.issue_refs);
+    }
+
+    #[test]
+    fn callback_scaffold_duplicate_replays_handoff_callback_receipt_without_handler() {
+        let context = callback_context("callback-scaffold-1", "HandleTraceHandoffResult");
+        let stored = StoredIdentityOperationResult::handoff_callback_receipt(
+            stored_result_ref("callback-scaffold-1"),
+            context.context_ref.clone(),
+            identity_application::support::IdentityStoredSurfaceMarkerRef::new(
+                "surface-callback-scaffold-1",
+            ),
+            timestamp(2),
+        );
+        let record = IdentityIdempotencyRecord {
+            record_ref: IdentityIdempotencyRecordRef::new("idem-record-callback-scaffold-1"),
+            operation_name: context.operation_name.clone(),
+            channel: IdentityOperationChannel::HandoffCallback,
+            idempotency_key: IdentityIdempotencyKey::new("idem-callback-scaffold-1"),
+            request_digest: context.request_digest.clone(),
+            state: identity_application::support::IdentityIdempotencyStateKind::Completed,
+            stored_result_ref: Some(stored_result_ref("callback-scaffold-1")),
+            reserved_at: timestamp(1),
+            completed_at: Some(timestamp(2)),
+        };
+        let stored_receipt =
+            handoff_callback_receipt_envelope("callback-scaffold-1", &context.context_ref);
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_idempotency_record(record, IdentityVersion::new(2))
+            .seed_stored_result(stored)
+            .seed_handoff_callback_receipt(stored_receipt.clone())
+            .build();
+        let service = consumer_service(&runtime);
+        let handler_calls = Cell::new(0usize);
+        let envelope = inbound_event_envelope(
+            "callback-scaffold-1",
+            "HandleTraceHandoffResult",
+            "identity.consumer.v1",
+        );
+
+        let receipt = service
+            .dispatch_callback_scaffold(
+                context,
+                &envelope,
+                &IdentityProtocolSchemaVersionRef::new("identity.consumer.v1"),
+                |_, _, _| {
+                    handler_calls.set(handler_calls.get() + 1);
+                    unreachable!("duplicate callback replay must not dispatch payload handler");
+                },
+            )
+            .expect("callback duplicate replay");
+
+        assert_eq!(handler_calls.get(), 0);
+        assert_eq!(receipt, stored_receipt.receipt);
+        assert_eq!(receipt.outcome, IdentityConsumerOutcome::DuplicateReplayed);
+        assert_eq!(
+            runtime
+                .get_handoff_callback_receipt(stored_result_ref("callback-scaffold-1"))
+                .expect("load callback envelope")
+                .expect("callback envelope"),
+            stored_receipt
+        );
     }
 
     #[test]

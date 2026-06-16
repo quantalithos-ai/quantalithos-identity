@@ -154,6 +154,11 @@ pub trait IdentityIdGeneratorPort {
         &self,
     ) -> Result<IdentityStoredSurfaceMarkerRef, ApplicationError>;
 
+    /// Generates a new public consumer receipt ref.
+    fn new_identity_consumer_receipt_ref(
+        &self,
+    ) -> Result<identity_contracts::refs::IdentityConsumerReceiptRef, ApplicationError>;
+
     /// Generates a new command effect summary ref.
     fn new_identity_command_effect_summary_ref(
         &self,
