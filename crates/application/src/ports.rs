@@ -50,11 +50,12 @@ use crate::support::{
     IdentityDispatchTargetRef, IdentityEntryDispatchRef, IdentityEntrySurfaceKind,
     IdentityIdempotencyKey, IdentityIdempotencyRecordRef, IdentityJobDispatchRef,
     IdentityJobEntryRef, IdentityOperationContext, IdentityOperationContextRef,
-    IdentityOperationName, IdentityProjectionRefSet, IdentityRepositoryPage, IdentityRequestDigest,
-    IdentityRequestMetadataRef, IdentityRuntimeAssemblyRef, IdentityStoredSurfaceMarkerRef,
-    IdentityTraceRecordId, IdentityTransactionRef, IdentityVersion, IdentityVersionedRef,
-    IdentityWorkerDispatchRef, IdentityWorkerEntryRef, MemberSummaryViewId, Page,
-    ReconciliationReportId, StoredIdentityOperationResult, Versioned,
+    IdentityOperationName, IdentityProjectionRefSet, IdentityQueryMaterialDegradationSummary,
+    IdentityRepositoryPage, IdentityRequestDigest, IdentityRequestMetadataRef,
+    IdentityRuntimeAssemblyRef, IdentityStoredSurfaceMarkerRef, IdentityTraceRecordId,
+    IdentityTransactionRef, IdentityVersion, IdentityVersionedRef, IdentityWorkerDispatchRef,
+    IdentityWorkerEntryRef, MemberSummaryViewId, Page, ReconciliationReportId,
+    StoredIdentityOperationResult, Versioned,
 };
 
 /// Shared unit-of-work handle used by all write-side application flows.
@@ -157,6 +158,11 @@ pub trait IdentityIdGeneratorPort {
     fn new_identity_command_effect_summary_ref(
         &self,
     ) -> Result<IdentityCommandEffectSummaryRef, ApplicationError>;
+
+    /// Generates a new visibility decision ref.
+    fn new_identity_visibility_decision_ref(
+        &self,
+    ) -> Result<IdentityVisibilityDecisionRef, ApplicationError>;
 
     /// Generates a new public job run ref.
     fn new_identity_job_run_ref(&self) -> Result<IdentityJobRunRef, ApplicationError>;
@@ -365,6 +371,113 @@ pub trait IdentityMarkerSubjectMapper {
         &self,
         receipt_ref: HandoffReceiptRef,
     ) -> IdentityTraceSubjectRef;
+}
+
+/// Maps post-access query material integrity defects into safe degraded summaries.
+pub trait IdentityQueryMaterialDegradationMapper {
+    /// Returns a degraded summary for a missing member summary view after stable lookup.
+    fn member_summary_view_missing(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        expected_member_ref: GlobalMemberRef,
+        expected_scope_ref: VisibilityScopeRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for a member summary view loaded for the wrong member.
+    fn member_summary_view_invalid_owner(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        view_ref: MemberSummaryViewRef,
+        expected_member_ref: GlobalMemberRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for a member summary view loaded for the wrong scope.
+    fn member_summary_view_scope_mismatch(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        view_ref: MemberSummaryViewRef,
+        expected_scope_ref: VisibilityScopeRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for a stale/degraded member summary view that lacks a
+    /// persisted freshness marker.
+    fn member_summary_view_missing_freshness(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        view_ref: MemberSummaryViewRef,
+        expected_member_ref: GlobalMemberRef,
+        expected_scope_ref: VisibilityScopeRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for forbidden or unsafe body material.
+    fn forbidden_read_material(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        read_material_marker: identity_contracts::views::IdentityReadMaterialMarker,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for a missing career record after a visible list page.
+    fn career_record_item_missing_after_list(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        record_ref: CareerRecordRef,
+        expected_member_ref: GlobalMemberRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for a listed career record that belongs to another member.
+    fn career_record_item_invalid_member(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        record_ref: CareerRecordRef,
+        expected_member_ref: GlobalMemberRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for a missing memory reference after a visible list page.
+    fn memory_reference_item_missing_after_list(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        reference_ref: MemoryReferenceRef,
+        expected_member_ref: GlobalMemberRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for a listed memory reference that belongs to another member.
+    fn memory_reference_item_invalid_member(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        reference_ref: MemoryReferenceRef,
+        expected_member_ref: GlobalMemberRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for a missing trace record after a visible list page.
+    fn trace_item_missing_after_list(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        trace_ref: IdentityTraceRecordRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for a listed trace record that belongs to another member.
+    fn trace_item_invalid_member(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        trace_ref: IdentityTraceRecordRef,
+        expected_member_ref: GlobalMemberRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for a listed trace record whose subject mismatches the selector.
+    fn trace_item_subject_mismatch(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        trace_ref: IdentityTraceRecordRef,
+        expected_subject_ref: IdentityTraceSubjectRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for missing or invalid audit trail material.
+    fn audit_item_missing_or_invalid(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        audit_trail_ref: AuditTrailRef,
+        audit_scope_ref: AuditScopeRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
 }
 
 /// Maps maintenance and propagation issues into safe maintenance issue refs.
@@ -953,6 +1066,15 @@ pub trait IdentityReadVisibilityRepository {
     fn resolve_trace_read(
         &self,
         subject_ref: IdentityTraceSubjectRef,
+        consumer_ref: ConsumerRef,
+        visibility_context_ref: VisibilityContextRef,
+    ) -> Result<Option<IdentityVisibilityAccessSummary>, ApplicationError>;
+
+    /// Resolves a member-scoped trace page read request into prepared visibility input.
+    fn resolve_trace_member_page_read(
+        &self,
+        member_ref: GlobalMemberRef,
+        change_kind_ref: Option<IdentityChangeKindRef>,
         consumer_ref: ConsumerRef,
         visibility_context_ref: VisibilityContextRef,
     ) -> Result<Option<IdentityVisibilityAccessSummary>, ApplicationError>;

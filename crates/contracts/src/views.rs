@@ -4,10 +4,22 @@ use core_contracts::actor::ActorRef;
 use serde::{Deserialize, Serialize};
 
 use crate::errors::ContractError;
+use crate::metadata::IdentityDegradedKind;
 use crate::refs::{
-    ConsumerRef, GlobalMemberRef, IdentityReadSubjectRef, IdentityReadSurfaceKind,
-    IdentitySourceRef, IdentityTruthCursor, MemberSummaryViewRef, RedactionProfileRef,
-    VisibilityContextRef, VisibilityResultRef, VisibilityScopeRef,
+    ArchiveHandoffRef, ArchiveRef, AuditScopeRef, AuditTrailRef, CapabilityEvidenceRef,
+    CapabilitySourceRef, CareerAppendReasonRef, CareerRecordRef, CareerRecordStateKind,
+    CareerSafeSummaryRef, CareerSourceMarkerRef, ConsumerRef, GlobalLifecycleStateKind,
+    GlobalMemberRef, GovernanceBasisRef, IdentityAnchorReasonRef, IdentityAnchorStateKind,
+    IdentityAuditSubjectRef, IdentityChangeKindRef, IdentityChangeReasonRef,
+    IdentityDegradedMarkerRef, IdentityReadSubjectRef, IdentityReadSurfaceKind,
+    IdentityRedactionMarkerRef, IdentitySourceRef, IdentityTimestamp, IdentityTraceRecordRef,
+    IdentityTruthCursor, LifecycleReasonRef, MemberSummaryViewRef, MemoryRef,
+    MemoryReferenceReasonRef, MemoryReferenceRef, MemoryReferenceSourceRef,
+    MemoryReferenceStateKind, MemorySafeSummaryRef, ProjectParticipationRef,
+    ProjectionFreshnessMarkerRef, RedactionProfileRef, RoleCapabilitySafeSummaryRef,
+    RoleCapabilitySourceSnapshotRef, RoleCapabilitySourceStateKind, RoleCapabilitySummaryRef,
+    RoleCapabilitySummaryStateKind, RoleSourceRef, VisibilityContextRef, VisibilityResultRef,
+    VisibilityScopeRef,
 };
 
 /// Safe summary marker for the identity anchor slice.
@@ -166,8 +178,14 @@ pub struct IdentityVisibilityAccessSummary {
     pub access_state: IdentityVisibilityAccessState,
     /// Optional redaction profile marker.
     pub redaction_profile_ref: Option<RedactionProfileRef>,
+    /// Optional public redaction marker copied into query surface when needed.
+    pub redaction_marker_ref: Option<IdentityRedactionMarkerRef>,
     /// Body-free result marker.
     pub visibility_result_ref: VisibilityResultRef,
+    /// Optional body-free degraded marker copied into degraded-like public surface.
+    pub degraded_marker_ref: Option<IdentityDegradedMarkerRef>,
+    /// Optional safe degraded classifier copied into public degraded surface.
+    pub degraded_kind: Option<IdentityDegradedKind>,
 }
 
 /// Member-facing identity summary view built from body-free safe summary refs.
@@ -195,6 +213,8 @@ pub struct MemberSummaryView {
     pub read_surface_kind: IdentityReadSurfaceKind,
     /// Optional committed truth cursor covered by this projection.
     pub source_cursor_ref: Option<IdentityTruthCursor>,
+    /// Optional public freshness marker copied into stale-visible query surfaces.
+    pub projection_freshness_ref: Option<ProjectionFreshnessMarkerRef>,
     /// Read material marker used to prevent forbidden bodies.
     pub read_material_marker: IdentityReadMaterialMarker,
 }
@@ -213,6 +233,7 @@ impl MemberSummaryView {
         memory_slice_refs: Vec<MemberSummarySliceRef>,
         visibility_result_ref: VisibilityResultRef,
         source_cursor_ref: Option<IdentityTruthCursor>,
+        projection_freshness_ref: Option<ProjectionFreshnessMarkerRef>,
         read_material_marker: IdentityReadMaterialMarker,
     ) -> Result<Self, ContractError> {
         if anchor_slice_ref.member_ref != member_ref || lifecycle_slice_ref.member_ref != member_ref
@@ -235,6 +256,7 @@ impl MemberSummaryView {
             visibility_result_ref,
             read_surface_kind: IdentityReadSurfaceKind::Found,
             source_cursor_ref,
+            projection_freshness_ref,
             read_material_marker,
         })
     }
@@ -284,4 +306,177 @@ impl MemberSummaryView {
             "member summary view must remain body-free",
         ))
     }
+}
+
+/// Public view for a member anchor read.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GlobalMemberAnchorView {
+    /// Member represented by this anchor view.
+    pub member_ref: GlobalMemberRef,
+    /// Current anchor state kind.
+    pub anchor_state_kind: IdentityAnchorStateKind,
+    /// Optional body-free reason marker associated with the anchor state.
+    pub anchor_reason_ref: Option<IdentityAnchorReasonRef>,
+    /// Last anchor state change time.
+    pub anchor_changed_at: IdentityTimestamp,
+    /// Optional body-free source marker. Redaction may omit this field.
+    pub source_ref: Option<IdentitySourceRef>,
+    /// Stable summary view ref when projection lookup succeeded.
+    pub member_summary_view_ref: Option<MemberSummaryViewRef>,
+    /// Anchor safe summary slice when loaded from a projection.
+    pub anchor_slice_ref: Option<MemberSummarySliceRef>,
+}
+
+/// Public view for a member global lifecycle read.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GlobalLifecycleSummaryView {
+    /// Member represented by this lifecycle view.
+    pub member_ref: GlobalMemberRef,
+    /// Current global lifecycle state kind.
+    pub lifecycle_state_kind: GlobalLifecycleStateKind,
+    /// Optional body-free lifecycle reason marker.
+    pub reason_ref: Option<LifecycleReasonRef>,
+    /// Optional body-free governance basis marker.
+    pub basis_ref: Option<GovernanceBasisRef>,
+    /// Actor that last changed lifecycle, when visible.
+    pub changed_by_ref: Option<ActorRef>,
+    /// Last lifecycle change time.
+    pub changed_at: IdentityTimestamp,
+    /// Stable summary view ref when projection lookup succeeded.
+    pub member_summary_view_ref: Option<MemberSummaryViewRef>,
+    /// Lifecycle safe summary slice when loaded from a projection.
+    pub lifecycle_slice_ref: Option<MemberSummarySliceRef>,
+}
+
+/// Public view for a member role/capability summary read.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RoleCapabilitySummaryView {
+    /// Member represented by this summary.
+    pub member_ref: GlobalMemberRef,
+    /// Identity-owned summary ref.
+    pub summary_ref: RoleCapabilitySummaryRef,
+    /// Summary state kind.
+    pub summary_state_kind: RoleCapabilitySummaryStateKind,
+    /// Source snapshot used by the summary.
+    pub source_snapshot_ref: RoleCapabilitySourceSnapshotRef,
+    /// Source state, when the snapshot was loaded.
+    pub source_state_kind: Option<RoleCapabilitySourceStateKind>,
+    /// Optional role source wrapper, redacted when not allowed.
+    pub role_source_ref: Option<RoleSourceRef>,
+    /// Capability source wrappers allowed by visibility.
+    pub capability_source_refs: Vec<CapabilitySourceRef>,
+    /// Evidence refs allowed by visibility.
+    pub evidence_refs: Vec<CapabilityEvidenceRef>,
+    /// Body-free safe summary marker.
+    pub safe_summary_ref: Option<RoleCapabilitySafeSummaryRef>,
+    /// Stable summary view ref when projection lookup succeeded.
+    pub member_summary_view_ref: Option<MemberSummaryViewRef>,
+    /// Role/capability safe summary slices from projection.
+    pub role_capability_slice_refs: Vec<MemberSummarySliceRef>,
+}
+
+/// Public view for one append-only career record.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CareerRecordView {
+    /// Career record ref.
+    pub career_record_ref: CareerRecordRef,
+    /// Member whose career history owns this record.
+    pub member_ref: GlobalMemberRef,
+    /// Career record state kind.
+    pub record_state_kind: CareerRecordStateKind,
+    /// Work-owned participation source, when visible.
+    pub project_participation_ref: Option<ProjectParticipationRef>,
+    /// Work source marker, when visible.
+    pub work_source_ref: Option<crate::refs::WorkSourceRef>,
+    /// Duplicate source marker, when visible.
+    pub source_marker_ref: Option<CareerSourceMarkerRef>,
+    /// Redaction-safe career summary marker.
+    pub career_summary_ref: Option<CareerSafeSummaryRef>,
+    /// Body-free append reason marker, when visible.
+    pub append_reason_ref: Option<CareerAppendReasonRef>,
+    /// Append time, when visible.
+    pub appended_at: Option<IdentityTimestamp>,
+    /// Original record explained by this correction.
+    pub correction_of_ref: Option<CareerRecordRef>,
+    /// Correction record that supersedes this record in interpretation.
+    pub superseded_by_ref: Option<CareerRecordRef>,
+}
+
+/// Public view for one identity memory/archive reference relation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MemoryReferenceView {
+    /// Memory reference relation ref.
+    pub memory_reference_ref: MemoryReferenceRef,
+    /// Member whose relation owns this reference.
+    pub member_ref: GlobalMemberRef,
+    /// Current relation state kind.
+    pub reference_state_kind: MemoryReferenceStateKind,
+    /// External memory carrier ref, when visible.
+    pub memory_ref: Option<MemoryRef>,
+    /// External archive carrier ref, when visible.
+    pub archive_ref: Option<ArchiveRef>,
+    /// Archive handoff marker, when visible.
+    pub archive_handoff_ref: Option<ArchiveHandoffRef>,
+    /// Source marker for the relation state, when visible.
+    pub source_ref: Option<MemoryReferenceSourceRef>,
+    /// Redaction-safe memory/archive summary marker.
+    pub safe_summary_ref: Option<MemorySafeSummaryRef>,
+    /// Body-free change reason marker, when visible.
+    pub reason_ref: Option<MemoryReferenceReasonRef>,
+    /// Last relation change/check time, when visible.
+    pub changed_at: Option<IdentityTimestamp>,
+}
+
+/// Public redaction-aware trace record view.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityTraceRecordView {
+    /// Stable trace record ref.
+    pub trace_record_ref: IdentityTraceRecordRef,
+    /// Member associated with the change.
+    pub member_ref: GlobalMemberRef,
+    /// Canonical trace subject.
+    pub subject_ref: crate::refs::IdentityTraceSubjectRef,
+    /// Canonical audit subject.
+    pub audit_subject_ref: IdentityAuditSubjectRef,
+    /// Change kind marker.
+    pub change_kind_ref: IdentityChangeKindRef,
+    /// Committed truth cursor for the accepted change.
+    pub source_cursor_ref: IdentityTruthCursor,
+    /// Optional body-free reason marker.
+    pub reason_ref: Option<IdentityChangeReasonRef>,
+    /// Optional body-free source marker.
+    pub source_ref: Option<IdentitySourceRef>,
+    /// Optional governance basis marker.
+    pub basis_ref: Option<GovernanceBasisRef>,
+    /// Optional actor or controlled source.
+    pub actor_ref: Option<ActorRef>,
+    /// Visibility result for a read surface.
+    pub visibility_result_ref: VisibilityResultRef,
+    /// Optional correction trace that supersedes this record in interpretation.
+    pub superseded_by_trace_ref: Option<IdentityTraceRecordRef>,
+    /// Material marker used to prevent forbidden bodies.
+    pub read_material_marker: IdentityReadMaterialMarker,
+    /// Time the accepted change was recorded.
+    pub occurred_at: IdentityTimestamp,
+}
+
+/// Public redaction-aware audit trail entry view.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AuditTrailEntryView {
+    /// Stable audit trail ref.
+    pub audit_trail_ref: AuditTrailRef,
+    /// Canonical audit subject.
+    pub audit_subject_ref: IdentityAuditSubjectRef,
+    /// Audit scope marker.
+    pub audit_scope_ref: AuditScopeRef,
+    /// Optional member scope.
+    pub member_ref: Option<GlobalMemberRef>,
+    /// Trace record included by this entry.
+    pub trace_record_ref: IdentityTraceRecordRef,
+    /// Change kind marker.
+    pub change_kind_ref: IdentityChangeKindRef,
+    /// Redaction or visibility result for this entry.
+    pub visibility_result_ref: VisibilityResultRef,
+    /// Time associated with the trace.
+    pub occurred_at: IdentityTimestamp,
 }

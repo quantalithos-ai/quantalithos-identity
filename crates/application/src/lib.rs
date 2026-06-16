@@ -16,14 +16,15 @@ pub use crate::errors::{ApplicationError, ApplicationErrorKind};
 pub use crate::mapper::{
     DefaultIdentityAcceptedAuditTrailMarkerMapper, DefaultIdentityDispatchTargetCatalog,
     DefaultIdentityMaintenanceIssueMapper, DefaultIdentityMarkerSubjectMapper,
-    DefaultIdentityTruthChangeSubjectMapper,
+    DefaultIdentityQueryMaterialDegradationMapper, DefaultIdentityTruthChangeSubjectMapper,
 };
 pub use crate::ports::{
     IdentityAcceptedAuditTrailMarkerMapper, IdentityClockPort,
     IdentityCommandEffectSummaryRepository, IdentityCursorAssignerPort,
     IdentityDispatchTargetCatalogPort, IdentityIdGeneratorPort, IdentityIdempotencyRepository,
     IdentityJobReportRepository, IdentityMaintenanceIssueMapper, IdentityMarkerSubjectMapper,
-    IdentityOperationContextFactoryPort, IdentityOutboxRepository, IdentityStoredResultRepository,
+    IdentityOperationContextFactoryPort, IdentityOutboxRepository,
+    IdentityQueryMaterialDegradationMapper, IdentityStoredResultRepository,
     IdentityTruthChangeSubjectMapper, IdentityUnitOfWork, IdentityUnitOfWorkManagerPort,
 };
 pub use crate::query::{
@@ -38,10 +39,10 @@ pub use crate::support::{
     IdentityEntrySurfaceKind, IdentityIdempotencyKey, IdentityIdempotencyRecord,
     IdentityIdempotencyRecordRef, IdentityIdempotencyStateKind, IdentityJobRunReport,
     IdentityOperationContext, IdentityOperationContextRef, IdentityOperationName,
-    IdentityProjectionRefSet, IdentityReadDispositionKind, IdentityRepositoryCursor,
-    IdentityRepositoryPage, IdentityRequestDigest, IdentityRequestMetadataRef,
-    IdentityStoredResultKind, IdentityStoredSurfaceMarkerRef, IdentityTransactionRef,
-    IdentityTruthRef, IdentityVersion, IdentityVersionedRef, IdentityVisibilityDecision, Page,
-    StoredIdentityOperationResult, Versioned,
+    IdentityProjectionRefSet, IdentityQueryMaterialDegradationSummary, IdentityReadDispositionKind,
+    IdentityRepositoryCursor, IdentityRepositoryPage, IdentityRequestDigest,
+    IdentityRequestMetadataRef, IdentityStoredResultKind, IdentityStoredSurfaceMarkerRef,
+    IdentityTransactionRef, IdentityTruthRef, IdentityVersion, IdentityVersionedRef,
+    IdentityVisibilityDecision, Page, StoredIdentityOperationResult, Versioned,
 };
 pub use identity_contracts::refs::IdentityReadSubjectRef;

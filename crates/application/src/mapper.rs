@@ -2,27 +2,33 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use identity_contracts::metadata::IdentityDegradedKind;
 use identity_contracts::protocol::IdentityJobName;
 use identity_contracts::receipts::{MaintenanceIssueRef, TraceHandoffIntentRef};
 use identity_contracts::refs::{
-    AuditScopeRef, ExternalReferenceRef, GlobalMemberRef, HandoffIssueRef, HandoffReceiptRef,
-    IdentityAuditSubjectRef, IdentityConsumerBindingRef, IdentityJobRunRef,
-    IdentityOutboxRecordRef, IdentityOutboxSubjectRef, IdentityProjectionRef, IdentitySourceRef,
-    IdentityTraceSubjectRef, OutboxDeliveryIssueRef, RoleCapabilitySourceSnapshotRef,
-    RoleCapabilitySummaryRef, VisibilityResultRef,
+    AuditScopeRef, AuditTrailRef, CareerRecordRef, ExternalReferenceRef, GlobalMemberRef,
+    HandoffIssueRef, HandoffReceiptRef, IdentityAuditSubjectRef, IdentityConsumerBindingRef,
+    IdentityDegradedMarkerRef, IdentityJobRunRef, IdentityOutboxRecordRef,
+    IdentityOutboxSubjectRef, IdentityProjectionRef, IdentitySourceRef, IdentityTraceRecordRef,
+    IdentityTraceSubjectRef, MemoryReferenceRef, OutboxDeliveryIssueRef,
+    RoleCapabilitySourceSnapshotRef, RoleCapabilitySummaryRef, VisibilityResultRef,
+    VisibilityScopeRef,
 };
 use identity_contracts::refs::{
     IdentityChangeKindRef, IdentityReadSurfaceKind, IdentityTruthCursor,
 };
+use identity_contracts::views::{IdentityReadMaterialMarker, IdentityVisibilityAccessSummary};
 
 use crate::errors::ApplicationError;
 use crate::ports::{
     IdentityAcceptedAuditTrailMarkerMapper, IdentityDispatchTargetCatalogPort,
-    IdentityMaintenanceIssueMapper, IdentityMarkerSubjectMapper, IdentityTruthChangeSubjectMapper,
+    IdentityMaintenanceIssueMapper, IdentityMarkerSubjectMapper,
+    IdentityQueryMaterialDegradationMapper, IdentityTruthChangeSubjectMapper,
 };
 use crate::support::{
     IdentityAcceptedAuditTrailMarkers, IdentityAcceptedSubjectRefs, IdentityApiRouteRef,
     IdentityDispatchTargetRef, IdentityEntrySurfaceKind, IdentityOperationContext,
+    IdentityQueryMaterialDegradationSummary,
 };
 
 /// Default mapper that derives accepted trace/audit/outbox subjects from typed truth refs.
@@ -189,6 +195,267 @@ impl IdentityMarkerSubjectMapper for DefaultIdentityMarkerSubjectMapper {
         receipt_ref: HandoffReceiptRef,
     ) -> IdentityTraceSubjectRef {
         Self::marker_subject("handoff-receipt", receipt_ref.as_str())
+    }
+}
+
+/// Default mapper that derives deterministic degraded summaries from typed query material context.
+#[derive(Clone, Debug, Default)]
+pub struct DefaultIdentityQueryMaterialDegradationMapper;
+
+impl DefaultIdentityQueryMaterialDegradationMapper {
+    fn summary(
+        access: IdentityVisibilityAccessSummary,
+        marker_token: impl Into<String>,
+        degraded_kind: IdentityDegradedKind,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        IdentityQueryMaterialDegradationSummary {
+            read_subject_ref: access.read_subject_ref,
+            visibility_context_ref: access.visibility_context_ref,
+            visibility_scope_ref: access.scope_ref,
+            visibility_result_ref: access.visibility_result_ref,
+            degraded_marker_ref: IdentityDegradedMarkerRef::new(marker_token),
+            degraded_kind,
+        }
+    }
+}
+
+impl IdentityQueryMaterialDegradationMapper for DefaultIdentityQueryMaterialDegradationMapper {
+    fn member_summary_view_missing(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        expected_member_ref: GlobalMemberRef,
+        expected_scope_ref: VisibilityScopeRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:member-summary-view-missing:{}:{}",
+                expected_member_ref.member_id.as_str(),
+                expected_scope_ref.as_str()
+            ),
+            IdentityDegradedKind::PartialResult,
+        )
+    }
+
+    fn member_summary_view_invalid_owner(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        view_ref: identity_contracts::refs::MemberSummaryViewRef,
+        expected_member_ref: GlobalMemberRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:member-summary-view-invalid-owner:{}:{}",
+                view_ref.as_str(),
+                expected_member_ref.member_id.as_str()
+            ),
+            IdentityDegradedKind::MaterialUnsafe,
+        )
+    }
+
+    fn member_summary_view_scope_mismatch(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        view_ref: identity_contracts::refs::MemberSummaryViewRef,
+        expected_scope_ref: VisibilityScopeRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:member-summary-view-scope-mismatch:{}:{}",
+                view_ref.as_str(),
+                expected_scope_ref.as_str()
+            ),
+            IdentityDegradedKind::MaterialUnsafe,
+        )
+    }
+
+    fn member_summary_view_missing_freshness(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        view_ref: identity_contracts::refs::MemberSummaryViewRef,
+        expected_member_ref: GlobalMemberRef,
+        expected_scope_ref: VisibilityScopeRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:member-summary-view-missing-freshness:{}:{}:{}",
+                view_ref.as_str(),
+                expected_member_ref.member_id.as_str(),
+                expected_scope_ref.as_str()
+            ),
+            IdentityDegradedKind::MaterialUnsafe,
+        )
+    }
+
+    fn forbidden_read_material(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        read_material_marker: IdentityReadMaterialMarker,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:forbidden:{}",
+                match read_material_marker.material_kind {
+                    identity_contracts::views::IdentityReadMaterialKind::SafeSummaryRefs => {
+                        "safe-summary-refs"
+                    }
+                    identity_contracts::views::IdentityReadMaterialKind::TraceRefsOnly => {
+                        "trace-refs-only"
+                    }
+                    identity_contracts::views::IdentityReadMaterialKind::AuditRefsOnly => {
+                        "audit-refs-only"
+                    }
+                    identity_contracts::views::IdentityReadMaterialKind::RedactedSafeMaterial => {
+                        "redacted-safe-material"
+                    }
+                    identity_contracts::views::IdentityReadMaterialKind::ForbiddenExternalBody => {
+                        "forbidden-external-body"
+                    }
+                    identity_contracts::views::IdentityReadMaterialKind::ForbiddenRawDiagnostic => {
+                        "forbidden-raw-diagnostic"
+                    }
+                    identity_contracts::views::IdentityReadMaterialKind::ForbiddenSecret => {
+                        "forbidden-secret"
+                    }
+                }
+            ),
+            IdentityDegradedKind::MaterialUnsafe,
+        )
+    }
+
+    fn career_record_item_missing_after_list(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        record_ref: CareerRecordRef,
+        expected_member_ref: GlobalMemberRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:career-record-missing:{}:{}",
+                record_ref.record_id.as_str(),
+                expected_member_ref.member_id.as_str()
+            ),
+            IdentityDegradedKind::PartialResult,
+        )
+    }
+
+    fn career_record_item_invalid_member(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        record_ref: CareerRecordRef,
+        expected_member_ref: GlobalMemberRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:career-record-invalid-member:{}:{}",
+                record_ref.record_id.as_str(),
+                expected_member_ref.member_id.as_str()
+            ),
+            IdentityDegradedKind::MaterialUnsafe,
+        )
+    }
+
+    fn memory_reference_item_missing_after_list(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        reference_ref: MemoryReferenceRef,
+        expected_member_ref: GlobalMemberRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:memory-reference-missing:{}:{}",
+                reference_ref.reference_id.as_str(),
+                expected_member_ref.member_id.as_str()
+            ),
+            IdentityDegradedKind::PartialResult,
+        )
+    }
+
+    fn memory_reference_item_invalid_member(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        reference_ref: MemoryReferenceRef,
+        expected_member_ref: GlobalMemberRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:memory-reference-invalid-member:{}:{}",
+                reference_ref.reference_id.as_str(),
+                expected_member_ref.member_id.as_str()
+            ),
+            IdentityDegradedKind::MaterialUnsafe,
+        )
+    }
+
+    fn trace_item_missing_after_list(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        trace_ref: IdentityTraceRecordRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!("query-material:trace-missing:{}", trace_ref.as_str()),
+            IdentityDegradedKind::PartialResult,
+        )
+    }
+
+    fn trace_item_invalid_member(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        trace_ref: IdentityTraceRecordRef,
+        expected_member_ref: GlobalMemberRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:trace-invalid-member:{}:{}",
+                trace_ref.as_str(),
+                expected_member_ref.member_id.as_str()
+            ),
+            IdentityDegradedKind::MaterialUnsafe,
+        )
+    }
+
+    fn trace_item_subject_mismatch(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        trace_ref: IdentityTraceRecordRef,
+        expected_subject_ref: IdentityTraceSubjectRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:trace-subject-mismatch:{}:{}",
+                trace_ref.as_str(),
+                expected_subject_ref.as_str()
+            ),
+            IdentityDegradedKind::MaterialUnsafe,
+        )
+    }
+
+    fn audit_item_missing_or_invalid(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        audit_trail_ref: AuditTrailRef,
+        audit_scope_ref: AuditScopeRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:audit-invalid:{}:{}",
+                audit_trail_ref.as_str(),
+                audit_scope_ref.as_str()
+            ),
+            IdentityDegradedKind::PartialResult,
+        )
     }
 }
 

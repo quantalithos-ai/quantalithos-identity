@@ -223,6 +223,14 @@ impl IdentityInMemoryRuntimeBuilder {
             .entry(member_key(&trace_record.member_ref))
             .or_default()
             .push(key.clone());
+        self.store
+            .trace_member_change_kind_index
+            .entry(trace_member_change_kind_key(
+                &trace_record.member_ref,
+                &trace_record.change_kind_ref,
+            ))
+            .or_default()
+            .push(key.clone());
         self.store.trace_records.insert(
             key,
             StoredTraceRecord {
@@ -465,6 +473,43 @@ impl IdentityInMemoryRuntimeBuilder {
         self.store
             .member_summary_access
             .insert(member_key(&member_ref), access_summary);
+        self
+    }
+
+    pub fn seed_trace_read_access(
+        mut self,
+        subject_ref: IdentityTraceSubjectRef,
+        access_summary: IdentityVisibilityAccessSummary,
+    ) -> Self {
+        self.store
+            .trace_read_access
+            .insert(subject_ref.as_str().to_owned(), access_summary);
+        self
+    }
+
+    pub fn seed_trace_member_page_access(
+        mut self,
+        member_ref: GlobalMemberRef,
+        change_kind_ref: Option<IdentityChangeKindRef>,
+        access_summary: IdentityVisibilityAccessSummary,
+    ) -> Self {
+        self.store.trace_member_page_access.insert(
+            trace_member_page_access_key(&member_ref, change_kind_ref.as_ref()),
+            access_summary,
+        );
+        self
+    }
+
+    pub fn seed_audit_read_access(
+        mut self,
+        audit_subject_ref: IdentityAuditSubjectRef,
+        audit_scope_ref: AuditScopeRef,
+        access_summary: IdentityVisibilityAccessSummary,
+    ) -> Self {
+        self.store.audit_read_access.insert(
+            audit_access_key(&audit_subject_ref, &audit_scope_ref),
+            access_summary,
+        );
         self
     }
 
@@ -836,6 +881,7 @@ struct RuntimeStore {
     trace_records: HashMap<String, StoredTraceRecord>,
     trace_subject_index: HashMap<String, Vec<String>>,
     trace_member_index: HashMap<String, Vec<String>>,
+    trace_member_change_kind_index: HashMap<String, Vec<String>>,
     audit_trails: HashMap<String, StoredAuditTrail>,
     audit_subject_index: HashMap<String, String>,
     member_summary_views: HashMap<String, StoredMemberSummaryView>,
@@ -864,6 +910,9 @@ struct RuntimeStore {
     job_report_by_result: HashMap<String, String>,
     adapter_availability: HashMap<String, IdentityAdapterAvailability>,
     member_summary_access: HashMap<String, IdentityVisibilityAccessSummary>,
+    trace_read_access: HashMap<String, IdentityVisibilityAccessSummary>,
+    trace_member_page_access: HashMap<String, IdentityVisibilityAccessSummary>,
+    audit_read_access: HashMap<String, IdentityVisibilityAccessSummary>,
     faults: HashSet<FaultCase>,
 }
 
@@ -1402,6 +1451,20 @@ impl IdentityIdGeneratorPort for IdentityInMemoryRuntime {
         Ok(IdentityCommandEffectSummaryRef::new(format!(
             "effect-{next}"
         )))
+    }
+
+    fn new_identity_visibility_decision_ref(
+        &self,
+    ) -> Result<identity_contracts::refs::IdentityVisibilityDecisionRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(
+            identity_contracts::refs::IdentityVisibilityDecisionRef::new(format!(
+                "visibility-decision-{next}"
+            )),
+        )
     }
 
     fn new_identity_job_run_ref(&self) -> Result<IdentityJobRunRef, ApplicationError> {
@@ -2305,10 +2368,13 @@ impl IdentityTraceRecordRepository for IdentityInMemoryRuntime {
             .unwrap_or_default();
         let mut items: Vec<_> = keys
             .into_iter()
-            .filter_map(|key| store.trace_records.get(&key))
-            .map(|stored| IdentityVersionedRef {
-                value_ref: stored.trace.trace_record_ref.clone(),
-                version: stored.version,
+            .map(|key| IdentityVersionedRef {
+                value_ref: IdentityTraceRecordRef::new(key.clone()),
+                version: store
+                    .trace_records
+                    .get(&key)
+                    .map(|stored| stored.version)
+                    .unwrap_or(IdentityVersion::new(1)),
             })
             .collect();
         items.sort_by(|left, right| left.value_ref.as_str().cmp(right.value_ref.as_str()));
@@ -2333,10 +2399,13 @@ impl IdentityTraceRecordRepository for IdentityInMemoryRuntime {
             .unwrap_or_default();
         let mut items: Vec<_> = keys
             .into_iter()
-            .filter_map(|key| store.trace_records.get(&key))
-            .map(|stored| IdentityVersionedRef {
-                value_ref: stored.trace.trace_record_ref.clone(),
-                version: stored.version,
+            .map(|key| IdentityVersionedRef {
+                value_ref: IdentityTraceRecordRef::new(key.clone()),
+                version: store
+                    .trace_records
+                    .get(&key)
+                    .map(|stored| stored.version)
+                    .unwrap_or(IdentityVersion::new(1)),
             })
             .collect();
         items.sort_by(|left, right| left.value_ref.as_str().cmp(right.value_ref.as_str()));
@@ -2391,17 +2460,19 @@ impl IdentityTraceRecordRepository for IdentityInMemoryRuntime {
             .lock()
             .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
         let keys = store
-            .trace_member_index
-            .get(&member_key(&member_ref))
+            .trace_member_change_kind_index
+            .get(&trace_member_change_kind_key(&member_ref, &change_kind_ref))
             .cloned()
             .unwrap_or_default();
         let mut items: Vec<_> = keys
             .into_iter()
-            .filter_map(|key| store.trace_records.get(&key))
-            .filter(|stored| stored.trace.change_kind_ref.same_kind(&change_kind_ref))
-            .map(|stored| IdentityVersionedRef {
-                value_ref: stored.trace.trace_record_ref.clone(),
-                version: stored.version,
+            .map(|key| IdentityVersionedRef {
+                value_ref: IdentityTraceRecordRef::new(key.clone()),
+                version: store
+                    .trace_records
+                    .get(&key)
+                    .map(|stored| stored.version)
+                    .unwrap_or(IdentityVersion::new(1)),
             })
             .collect();
         items.sort_by(|left, right| left.value_ref.as_str().cmp(right.value_ref.as_str()));
@@ -3473,21 +3544,55 @@ impl IdentityReadVisibilityRepository for IdentityInMemoryRuntime {
 
     fn resolve_trace_read(
         &self,
-        _subject_ref: IdentityTraceSubjectRef,
+        subject_ref: IdentityTraceSubjectRef,
         _consumer_ref: ConsumerRef,
         _visibility_context_ref: VisibilityContextRef,
     ) -> Result<Option<IdentityVisibilityAccessSummary>, ApplicationError> {
-        Ok(None)
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store.trace_read_access.get(subject_ref.as_str()).cloned())
+    }
+
+    fn resolve_trace_member_page_read(
+        &self,
+        member_ref: GlobalMemberRef,
+        change_kind_ref: Option<IdentityChangeKindRef>,
+        _consumer_ref: ConsumerRef,
+        _visibility_context_ref: VisibilityContextRef,
+    ) -> Result<Option<IdentityVisibilityAccessSummary>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .trace_member_page_access
+            .get(&trace_member_page_access_key(
+                &member_ref,
+                change_kind_ref.as_ref(),
+            ))
+            .cloned())
     }
 
     fn resolve_audit_read(
         &self,
-        _audit_subject_ref: IdentityAuditSubjectRef,
-        _audit_scope_ref: AuditScopeRef,
+        audit_subject_ref: IdentityAuditSubjectRef,
+        audit_scope_ref: AuditScopeRef,
         _consumer_ref: ConsumerRef,
         _visibility_context_ref: VisibilityContextRef,
     ) -> Result<Option<IdentityVisibilityAccessSummary>, ApplicationError> {
-        Ok(None)
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .audit_read_access
+            .get(&audit_access_key(&audit_subject_ref, &audit_scope_ref))
+            .cloned())
     }
 
     fn resolve_report_read(
@@ -5630,6 +5735,54 @@ fn member_scope_key(member_ref: &GlobalMemberRef, scope_ref: &VisibilityScopeRef
     format!("{}::{}", member_ref.id().as_str(), scope_ref.as_str())
 }
 
+fn trace_member_page_access_key(
+    member_ref: &GlobalMemberRef,
+    change_kind_ref: Option<&IdentityChangeKindRef>,
+) -> String {
+    match change_kind_ref {
+        Some(change_kind_ref) => format!(
+            "{}::{}",
+            member_ref.id().as_str(),
+            trace_change_kind_key(change_kind_ref),
+        ),
+        None => format!("{}::page", member_ref.id().as_str()),
+    }
+}
+
+fn trace_member_change_kind_key(
+    member_ref: &GlobalMemberRef,
+    change_kind_ref: &IdentityChangeKindRef,
+) -> String {
+    format!(
+        "{}::{}",
+        member_ref.id().as_str(),
+        trace_change_kind_key(change_kind_ref),
+    )
+}
+
+fn trace_change_kind_key(change_kind_ref: &IdentityChangeKindRef) -> String {
+    match &change_kind_ref.source_ref {
+        Some(source_ref) => format!(
+            "{:?}::{:?}::{}",
+            change_kind_ref.change_kind,
+            source_ref.owner(),
+            source_ref.external_ref.as_str(),
+        ),
+        None => format!("{:?}::none", change_kind_ref.change_kind),
+    }
+}
+
+fn audit_access_key(
+    audit_subject_ref: &IdentityAuditSubjectRef,
+    audit_scope_ref: &AuditScopeRef,
+) -> String {
+    format!(
+        "{}::{}",
+        audit_subject_ref.as_str(),
+        audit_scope_ref.as_str()
+    )
+}
+
 fn role_capability_summary_key(summary_ref: &RoleCapabilitySummaryRef) -> String {
     summary_ref.summary_id.as_str().to_owned()
 }
@@ -5852,13 +6005,19 @@ mod tests {
     };
     use identity_contracts::events::{IdentityConsumerOutcome, IdentityConsumerReceipt};
     use identity_contracts::metadata::{
-        IdentityCommandMetadata, IdentityQueryMetadata, IdentityRequestDigestMarker,
+        IdentityCommandMetadata, IdentityDegradedKind, IdentityQueryDisposition,
+        IdentityQueryMetadata, IdentityRequestDigestMarker,
     };
     use identity_contracts::protocol::{
         IdentityCommandName, IdentityDigestAlgorithmMarkerRef, IdentityInboundConsumerName,
         IdentityJobName, IdentityProtocolSchemaVersionRef, IdentityQueryName,
     };
-    use identity_contracts::queries::IdentityQueryRequest;
+    use identity_contracts::queries::{
+        GetGlobalLifecycleSummaryRequest, GetGlobalMemberAnchorRequest,
+        GetRoleCapabilitySummaryRequest, IdentityPublicPageRequest, IdentityQueryRequest,
+        IdentityTraceReadSelector, ListCareerRecordsRequest, ListMemoryReferencesRequest,
+        ReadAuditTrailRequest, ReadIdentityTraceRequest, ReadMemberSummaryRequest,
+    };
     use identity_contracts::receipts::MaintenanceIssueRef;
     use identity_contracts::refs::{
         ArchiveHandoffRef, ArchiveRef, CapabilityEvidenceKind, CapabilityEvidenceRef,
@@ -5871,12 +6030,13 @@ mod tests {
         IdentityCanonicalRequestMarkerRef, IdentityChangeKind, IdentityConsumerReceiptRef,
         IdentityJobReportRef, IdentityJobRunRef, IdentityJobScopeMarkerRef,
         IdentityOperationChannel, IdentityOutboxPayloadMarkerRef, IdentityReadSubjectRef,
-        IdentityRequestDigestValue, IdentityStoredResultRef, IdentityTimestamp,
-        LifecycleReasonKind, LifecycleReasonRef, MemoryRef, MemoryReferenceChangeIntent,
-        MemoryReferenceChangeMaterialKind, MemoryReferenceChangeMaterialMarker,
-        MemoryReferenceReasonKind, MemoryReferenceReasonRef, MemoryReferenceSourceKind,
-        MemoryReferenceSourceRef, MemoryReferenceStateKind as PublicMemoryReferenceStateKind,
-        ProjectParticipationRef, RoleCapabilityChangeMaterialKind,
+        IdentityReadSurfaceKind, IdentityRedactionMarkerRef, IdentityRequestDigestValue,
+        IdentityStoredResultRef, IdentityTimestamp, LifecycleReasonKind, LifecycleReasonRef,
+        MemoryRef, MemoryReferenceChangeIntent, MemoryReferenceChangeMaterialKind,
+        MemoryReferenceChangeMaterialMarker, MemoryReferenceReasonKind, MemoryReferenceReasonRef,
+        MemoryReferenceSourceKind, MemoryReferenceSourceRef,
+        MemoryReferenceStateKind as PublicMemoryReferenceStateKind, ProjectParticipationRef,
+        ProjectionFreshnessMarkerRef, RoleCapabilityChangeMaterialKind,
         RoleCapabilityChangeMaterialMarker, RoleCapabilityChangeReasonKind,
         RoleCapabilityChangeReasonRef, RoleCapabilitySourceKind,
         RoleCapabilitySummaryStateKind as PublicRoleCapabilitySummaryStateKind, RoleSourceRef,
@@ -5945,6 +6105,10 @@ mod tests {
             Vec::new(),
             visibility_result(&format!("visibility-{scope}")),
             Some(IdentityTruthCursor::new("truth-cursor-1")),
+            Some(ProjectionFreshnessMarkerRef {
+                projection_ref: projection_ref("projection-1"),
+                state_kind: "stale".into(),
+            }),
             IdentityReadMaterialMarker::new(IdentityReadMaterialKind::SafeSummaryRefs, None),
         )
         .expect("summary view")
@@ -7343,7 +7507,10 @@ mod tests {
                     scope_ref: scope_ref("scope-a"),
                     access_state: identity_contracts::views::IdentityVisibilityAccessState::Visible,
                     redaction_profile_ref: None,
+                    redaction_marker_ref: None,
                     visibility_result_ref: visibility_result("visibility-a"),
+                    degraded_marker_ref: None,
+                    degraded_kind: None,
                 },
             )
             .build();
@@ -7371,6 +7538,17 @@ mod tests {
             operation_context_factory: runtime,
             read_visibility_repository: runtime,
             projection_repository: runtime,
+            member_repository: runtime,
+            lifecycle_repository: runtime,
+            role_capability_repository: runtime,
+            career_record_repository: runtime,
+            memory_reference_repository: runtime,
+            trace_record_repository: runtime,
+            audit_trail_repository: runtime,
+            truth_change_subject_mapper: runtime,
+            degradation_mapper:
+                &identity_application::DefaultIdentityQueryMaterialDegradationMapper,
+            unit_of_work_manager: runtime,
         })
     }
 
@@ -7404,6 +7582,142 @@ mod tests {
             None,
             timestamp(1),
         )
+    }
+
+    fn trace_query_request(
+        selector: IdentityTraceReadSelector,
+    ) -> IdentityQueryRequest<ReadIdentityTraceRequest> {
+        IdentityQueryRequest {
+            actor_ref: ActorRef::new("actor-1", ActorKind::Human),
+            query_name: IdentityQueryName::new("ReadIdentityTrace"),
+            metadata: IdentityQueryMetadata {
+                request_marker_ref: IdentityApiRequestMarkerRef::new("trace-query-request-1"),
+                schema_version_ref: IdentityProtocolSchemaVersionRef::new("identity.query.v1"),
+                visibility_context_ref: VisibilityContextRef::new("context-1"),
+                trace_context_ref: None,
+            },
+            page: Some(IdentityPublicPageRequest {
+                cursor: None,
+                limit: 10,
+            }),
+            body: ReadIdentityTraceRequest {
+                selector,
+                consumer_ref: ConsumerRef::new("consumer-1"),
+            },
+        }
+    }
+
+    fn trace_query_context() -> IdentityOperationContext {
+        IdentityOperationContext::from_query(
+            IdentityOperationContextRef::new("trace-query-context-1"),
+            IdentityOperationName::new("ReadIdentityTrace"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            identity_application::support::IdentityRequestMetadataRef::new(
+                "trace-query-metadata-1",
+            ),
+            IdentityRequestDigest::from_canonical_marker(
+                IdentityCanonicalRequestMarkerRef::new("canonical-trace-query-1"),
+                IdentityRequestDigestValue::new("digest-trace-query-1"),
+                IdentityProtocolSchemaVersionRef::new("identity.query.v1"),
+                IdentityDigestAlgorithmMarkerRef::new("sha256-v1"),
+            ),
+            None,
+            timestamp(1),
+        )
+    }
+
+    fn single_query_request<T>(query_name: &str, body: T) -> IdentityQueryRequest<T> {
+        IdentityQueryRequest {
+            actor_ref: ActorRef::new("actor-1", ActorKind::Human),
+            query_name: IdentityQueryName::new(query_name),
+            metadata: IdentityQueryMetadata {
+                request_marker_ref: IdentityApiRequestMarkerRef::new(format!(
+                    "query-request-{query_name}"
+                )),
+                schema_version_ref: IdentityProtocolSchemaVersionRef::new("identity.query.v1"),
+                visibility_context_ref: VisibilityContextRef::new("context-1"),
+                trace_context_ref: None,
+            },
+            page: None,
+            body,
+        }
+    }
+
+    fn paged_query_request<T>(query_name: &str, body: T) -> IdentityQueryRequest<T> {
+        IdentityQueryRequest {
+            page: Some(IdentityPublicPageRequest {
+                cursor: None,
+                limit: 10,
+            }),
+            ..single_query_request(query_name, body)
+        }
+    }
+
+    fn named_query_context(query_name: &str, token: &str) -> IdentityOperationContext {
+        IdentityOperationContext::from_query(
+            IdentityOperationContextRef::new(format!("query-context-{query_name}-{token}")),
+            IdentityOperationName::new(query_name),
+            ActorRef::new("actor-1", ActorKind::Human),
+            identity_application::support::IdentityRequestMetadataRef::new(format!(
+                "query-metadata-{query_name}-{token}"
+            )),
+            IdentityRequestDigest::from_canonical_marker(
+                IdentityCanonicalRequestMarkerRef::new(format!(
+                    "canonical-query-{query_name}-{token}"
+                )),
+                IdentityRequestDigestValue::new(format!("digest-query-{query_name}-{token}")),
+                IdentityProtocolSchemaVersionRef::new("identity.query.v1"),
+                IdentityDigestAlgorithmMarkerRef::new("sha256-v1"),
+            ),
+            None,
+            timestamp(1),
+        )
+    }
+
+    fn member_access_summary(
+        token: &str,
+        access_state: IdentityVisibilityAccessState,
+    ) -> IdentityVisibilityAccessSummary {
+        IdentityVisibilityAccessSummary {
+            read_subject_ref: IdentityReadSubjectRef::new(format!("member-read-subject:{token}")),
+            consumer_ref: ConsumerRef::new("consumer-1"),
+            actor_ref: Some(ActorRef::new("actor-1", ActorKind::Human)),
+            visibility_context_ref: VisibilityContextRef::new("context-1"),
+            scope_ref: scope_ref("scope-a"),
+            access_state,
+            redaction_profile_ref: None,
+            redaction_marker_ref: matches!(
+                access_state,
+                IdentityVisibilityAccessState::Redacted | IdentityVisibilityAccessState::NotVisible
+            )
+            .then(|| IdentityRedactionMarkerRef::new(format!("member-redaction:{token}"))),
+            visibility_result_ref: visibility_result(&format!("member-visibility-{token}")),
+            degraded_marker_ref: None,
+            degraded_kind: None,
+        }
+    }
+
+    fn trace_access_summary(
+        token: &str,
+        access_state: IdentityVisibilityAccessState,
+    ) -> IdentityVisibilityAccessSummary {
+        IdentityVisibilityAccessSummary {
+            read_subject_ref: IdentityReadSubjectRef::new(format!("trace-read-subject:{token}")),
+            consumer_ref: ConsumerRef::new("consumer-1"),
+            actor_ref: Some(ActorRef::new("actor-1", ActorKind::Human)),
+            visibility_context_ref: VisibilityContextRef::new("context-1"),
+            scope_ref: scope_ref("scope-a"),
+            access_state,
+            redaction_profile_ref: None,
+            redaction_marker_ref: matches!(
+                access_state,
+                IdentityVisibilityAccessState::Redacted | IdentityVisibilityAccessState::NotVisible
+            )
+            .then(|| IdentityRedactionMarkerRef::new(format!("trace-redaction:{token}"))),
+            visibility_result_ref: visibility_result(&format!("trace-visibility-{token}")),
+            degraded_marker_ref: None,
+            degraded_kind: None,
+        }
     }
 
     #[test]
@@ -7447,7 +7761,10 @@ mod tests {
                     scope_ref: scope_ref("scope-a"),
                     access_state: IdentityVisibilityAccessState::Visible,
                     redaction_profile_ref: None,
+                    redaction_marker_ref: None,
                     visibility_result_ref: visibility_result("visibility-a"),
+                    degraded_marker_ref: None,
+                    degraded_kind: None,
                 },
             )
             .build();
@@ -7490,6 +7807,10 @@ mod tests {
             Vec::new(),
             visibility_result("visibility-a"),
             Some(IdentityTruthCursor::new("truth-cursor-1")),
+            Some(ProjectionFreshnessMarkerRef {
+                projection_ref: projection_ref("projection-1"),
+                state_kind: "stale".into(),
+            }),
             IdentityReadMaterialMarker::new(IdentityReadMaterialKind::SafeSummaryRefs, None),
         )
         .expect("view");
@@ -7511,7 +7832,10 @@ mod tests {
                     scope_ref: scope_ref("scope-a"),
                     access_state: IdentityVisibilityAccessState::Visible,
                     redaction_profile_ref: None,
+                    redaction_marker_ref: None,
                     visibility_result_ref: visibility_result("visibility-a"),
+                    degraded_marker_ref: None,
+                    degraded_kind: None,
                 },
             )
             .build();
@@ -7530,6 +7854,505 @@ mod tests {
         let staged_after = runtime.staged_write_count().expect("staged writes");
 
         assert_eq!(error.kind, ApplicationErrorKind::ConsistencyDefect);
+        assert_eq!(active_before, 0);
+        assert_eq!(active_after, 0);
+        assert_eq!(staged_before, 0);
+        assert_eq!(staged_after, 0);
+    }
+
+    #[test]
+    fn get_global_member_anchor_missing_returns_missing_without_create() {
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member_summary_access(
+                member_ref("member-anchor-missing-1"),
+                member_access_summary("anchor-missing", IdentityVisibilityAccessState::Visible),
+            )
+            .build();
+        let service = query_service(&runtime);
+        let active_before = runtime.active_write_transactions().expect("active writes");
+        let staged_before = runtime.staged_write_count().expect("staged writes");
+
+        let response = service
+            .get_global_member_anchor(
+                single_query_request(
+                    "GetGlobalMemberAnchor",
+                    GetGlobalMemberAnchorRequest {
+                        member_ref: member_ref("member-anchor-missing-1"),
+                        consumer_ref: ConsumerRef::new("consumer-1"),
+                    },
+                ),
+                named_query_context("GetGlobalMemberAnchor", "missing"),
+            )
+            .expect("anchor query");
+
+        let active_after = runtime.active_write_transactions().expect("active writes");
+        let staged_after = runtime.staged_write_count().expect("staged writes");
+
+        assert_eq!(
+            response.surface.disposition,
+            IdentityQueryDisposition::Missing
+        );
+        assert!(response.body.is_none());
+        assert!(
+            runtime
+                .get_member_with_version(member_ref("member-anchor-missing-1"))
+                .expect("load member")
+                .is_none()
+        );
+        assert_eq!(active_before, 0);
+        assert_eq!(active_after, 0);
+        assert_eq!(staged_before, 0);
+        assert_eq!(staged_after, 0);
+    }
+
+    #[test]
+    fn core_member_queries_return_body_free_material_without_write() {
+        let member = GlobalMember::establish(
+            member_ref("member-query-core-1"),
+            identity_source_ref(IdentitySourceOwner::Identity, "member-source-query-core-1"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let lifecycle = identity_domain::lifecycle::GlobalLifecycleState::initial_available(
+            ActorRef::new("actor-1", ActorKind::Human),
+            lifecycle_reason(
+                "member-source-query-core-1",
+                LifecycleReasonKind::InitialProvisioned,
+            ),
+            timestamp(1),
+        );
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member.clone(), IdentityVersion::new(1))
+            .seed_lifecycle(
+                member.member_ref.clone(),
+                lifecycle,
+                IdentityVersion::new(1),
+            )
+            .seed_member_summary_access(
+                member.member_ref.clone(),
+                member_access_summary("core-visible", IdentityVisibilityAccessState::Visible),
+            )
+            .build();
+        let command = command_service(&runtime);
+        command
+            .maintain_role_capability_summary(
+                maintain_role_request(
+                    "query-core-role-1",
+                    member.member_ref.clone(),
+                    "query-core-role-source-1",
+                ),
+                command_context(
+                    "MaintainRoleCapabilitySummary",
+                    "idem-role-query-core-role-1",
+                    "role-query-core-role-1",
+                ),
+            )
+            .expect("seed role summary");
+        command
+            .append_career_record(
+                append_career_request(
+                    "query-core-career-1",
+                    member.member_ref.clone(),
+                    "query-core-work-source-1",
+                    WorkSourceKind::ProjectParticipationAccepted,
+                    CareerRecordChangeIntent::AppendNew,
+                    None,
+                ),
+                command_context(
+                    "AppendCareerRecord",
+                    "idem-career-query-core-career-1",
+                    "career-query-core-career-1",
+                ),
+            )
+            .expect("seed career record");
+        command
+            .maintain_memory_reference(
+                maintain_memory_request(
+                    "query-core-memory-1",
+                    member.member_ref.clone(),
+                    "query-core-memory-source-1",
+                    MemoryReferenceSourceKind::MemorySourceEvent,
+                    MemoryReferenceChangeIntent::LinkMemory,
+                    None,
+                ),
+                command_context(
+                    "MaintainMemoryReference",
+                    "idem-memory-query-core-memory-1",
+                    "memory-query-core-memory-1",
+                ),
+            )
+            .expect("seed memory reference");
+
+        let service = query_service(&runtime);
+        let active_before = runtime.active_write_transactions().expect("active writes");
+        let staged_before = runtime.staged_write_count().expect("staged writes");
+
+        let anchor = service
+            .get_global_member_anchor(
+                single_query_request(
+                    "GetGlobalMemberAnchor",
+                    GetGlobalMemberAnchorRequest {
+                        member_ref: member.member_ref.clone(),
+                        consumer_ref: ConsumerRef::new("consumer-1"),
+                    },
+                ),
+                named_query_context("GetGlobalMemberAnchor", "visible"),
+            )
+            .expect("anchor query");
+        assert_eq!(
+            anchor.surface.disposition,
+            IdentityQueryDisposition::Visible
+        );
+        assert_eq!(
+            anchor.body.expect("anchor view").member_ref,
+            member.member_ref.clone()
+        );
+
+        let lifecycle_summary = service
+            .get_global_lifecycle_summary(
+                single_query_request(
+                    "GetGlobalLifecycleSummary",
+                    GetGlobalLifecycleSummaryRequest {
+                        member_ref: member.member_ref.clone(),
+                        consumer_ref: ConsumerRef::new("consumer-1"),
+                    },
+                ),
+                named_query_context("GetGlobalLifecycleSummary", "visible"),
+            )
+            .expect("lifecycle query");
+        assert_eq!(
+            lifecycle_summary
+                .body
+                .expect("lifecycle view")
+                .lifecycle_state_kind,
+            PublicLifecycleStateKind::Available
+        );
+
+        let role_summary = service
+            .get_role_capability_summary(
+                single_query_request(
+                    "GetRoleCapabilitySummary",
+                    GetRoleCapabilitySummaryRequest {
+                        member_ref: member.member_ref.clone(),
+                        consumer_ref: ConsumerRef::new("consumer-1"),
+                        summary_ref: None,
+                    },
+                ),
+                named_query_context("GetRoleCapabilitySummary", "visible"),
+            )
+            .expect("role query");
+        assert_eq!(
+            role_summary.surface.disposition,
+            IdentityQueryDisposition::Visible
+        );
+        let role_view = role_summary.body.expect("role view");
+        assert_eq!(role_view.member_ref, member.member_ref.clone());
+        assert!(role_view.safe_summary_ref.is_some());
+
+        let careers = service
+            .list_career_records(
+                paged_query_request(
+                    "ListCareerRecords",
+                    ListCareerRecordsRequest {
+                        member_ref: member.member_ref.clone(),
+                        consumer_ref: ConsumerRef::new("consumer-1"),
+                    },
+                ),
+                named_query_context("ListCareerRecords", "visible"),
+            )
+            .expect("career query");
+        assert_eq!(
+            careers.surface.disposition,
+            IdentityQueryDisposition::Visible
+        );
+        assert_eq!(careers.items.len(), 1);
+
+        let memories = service
+            .list_memory_references(
+                paged_query_request(
+                    "ListMemoryReferences",
+                    ListMemoryReferencesRequest {
+                        member_ref: member.member_ref.clone(),
+                        consumer_ref: ConsumerRef::new("consumer-1"),
+                    },
+                ),
+                named_query_context("ListMemoryReferences", "visible"),
+            )
+            .expect("memory query");
+        assert_eq!(
+            memories.surface.disposition,
+            IdentityQueryDisposition::Visible
+        );
+        assert_eq!(memories.items.len(), 1);
+
+        let active_after = runtime.active_write_transactions().expect("active writes");
+        let staged_after = runtime.staged_write_count().expect("staged writes");
+        assert_eq!(active_before, 0);
+        assert_eq!(active_after, 0);
+        assert_eq!(staged_before, 0);
+        assert_eq!(staged_after, 0);
+    }
+
+    #[test]
+    fn read_member_summary_missing_freshness_returns_material_degraded_surface() {
+        let mut view = MemberSummaryView::from_projection(
+            MemberSummaryViewRef::new("view-scope-a"),
+            member_ref("member-1"),
+            scope_ref("scope-a"),
+            MemberSummarySliceRef::new(
+                MemberSummarySliceKind::Anchor,
+                member_ref("member-1"),
+                identity_source_ref(IdentitySourceOwner::Identity, "summary-source-1"),
+            ),
+            MemberSummarySliceRef::new(
+                MemberSummarySliceKind::Lifecycle,
+                member_ref("member-1"),
+                identity_source_ref(IdentitySourceOwner::Identity, "summary-source-1"),
+            ),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            visibility_result("summary-visibility-1"),
+            Some(IdentityTruthCursor::new("truth-cursor-1")),
+            None,
+            IdentityReadMaterialMarker::new(IdentityReadMaterialKind::SafeSummaryRefs, None),
+        )
+        .expect("view");
+        view.read_surface_kind = IdentityReadSurfaceKind::Stale;
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member_summary_view_with_lookup_scope(
+                member_ref("member-1"),
+                scope_ref("scope-a"),
+                view,
+                IdentityVersion::new(1),
+            )
+            .seed_member_summary_access(
+                member_ref("member-1"),
+                member_access_summary("summary-visible", IdentityVisibilityAccessState::Visible),
+            )
+            .build();
+        let service = query_service(&runtime);
+
+        let response = service
+            .read_member_summary(
+                single_query_request(
+                    "ReadMemberSummary",
+                    ReadMemberSummaryRequest {
+                        member_ref: member_ref("member-1"),
+                        consumer_ref: ConsumerRef::new("consumer-1"),
+                    },
+                ),
+                named_query_context("ReadMemberSummary", "missing-freshness"),
+            )
+            .expect("member summary query");
+
+        assert_eq!(
+            response.surface.disposition,
+            IdentityQueryDisposition::Degraded
+        );
+        assert_eq!(
+            response
+                .surface
+                .degraded
+                .as_ref()
+                .expect("degraded marker")
+                .degraded_kind,
+            IdentityDegradedKind::MaterialUnsafe
+        );
+        assert!(response.body.is_none());
+    }
+
+    #[test]
+    fn read_identity_trace_by_member_empty_copies_page_access_without_write() {
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_trace_member_page_access(
+                member_ref("member-trace-empty-1"),
+                None,
+                trace_access_summary("member-empty", IdentityVisibilityAccessState::Visible),
+            )
+            .build();
+        let service = query_service(&runtime);
+        let active_before = runtime.active_write_transactions().expect("active writes");
+        let staged_before = runtime.staged_write_count().expect("staged writes");
+
+        let response = service
+            .read_identity_trace(
+                trace_query_request(IdentityTraceReadSelector::ByMember {
+                    member_ref: member_ref("member-trace-empty-1"),
+                }),
+                trace_query_context(),
+            )
+            .expect("trace query");
+
+        let active_after = runtime.active_write_transactions().expect("active writes");
+        let staged_after = runtime.staged_write_count().expect("staged writes");
+
+        assert_eq!(
+            response.surface.disposition,
+            IdentityQueryDisposition::Empty
+        );
+        assert_eq!(
+            response.surface.visibility.visibility_result_ref,
+            visibility_result("trace-visibility-member-empty")
+        );
+        assert_eq!(
+            response.surface.visibility.read_surface_kind,
+            IdentityReadSurfaceKind::Empty
+        );
+        assert!(response.items.is_empty());
+        assert_eq!(active_before, 0);
+        assert_eq!(active_after, 0);
+        assert_eq!(staged_before, 0);
+        assert_eq!(staged_after, 0);
+    }
+
+    #[test]
+    fn read_identity_trace_by_member_first_missing_uses_page_access_degradation() {
+        let trace = trace_record("member-missing-1", member_ref("member-trace-missing-1"));
+        let missing_trace_ref = trace.trace_record_ref.clone();
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_trace_record(trace, IdentityVersion::new(1))
+            .seed_trace_member_page_access(
+                member_ref("member-trace-missing-1"),
+                None,
+                trace_access_summary("member-missing", IdentityVisibilityAccessState::Visible),
+            )
+            .build();
+        runtime
+            .shared
+            .store
+            .lock()
+            .expect("lock runtime store")
+            .trace_records
+            .remove(missing_trace_ref.as_str());
+        let service = query_service(&runtime);
+
+        let response = service
+            .read_identity_trace(
+                trace_query_request(IdentityTraceReadSelector::ByMember {
+                    member_ref: member_ref("member-trace-missing-1"),
+                }),
+                trace_query_context(),
+            )
+            .expect("trace query");
+
+        assert_eq!(
+            response.surface.disposition,
+            IdentityQueryDisposition::Degraded
+        );
+        assert_eq!(
+            response.surface.visibility.visibility_result_ref,
+            visibility_result("trace-visibility-member-missing")
+        );
+        assert_eq!(
+            response
+                .surface
+                .degraded
+                .as_ref()
+                .expect("degraded marker")
+                .degraded_kind,
+            IdentityDegradedKind::PartialResult
+        );
+        assert!(response.items.is_empty());
+    }
+
+    #[test]
+    fn read_identity_trace_by_subject_redacts_item_fields_and_copies_visibility_result() {
+        let trace = trace_record("subject-redacted-1", member_ref("member-trace-redacted-1"));
+        let subject_ref = trace.subject_ref.clone();
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_trace_record(trace, IdentityVersion::new(1))
+            .seed_trace_read_access(
+                subject_ref.clone(),
+                trace_access_summary("subject-redacted", IdentityVisibilityAccessState::Redacted),
+            )
+            .build();
+        let service = query_service(&runtime);
+
+        let response = service
+            .read_identity_trace(
+                trace_query_request(IdentityTraceReadSelector::BySubject {
+                    member_ref: member_ref("member-trace-redacted-1"),
+                    subject_ref,
+                    after_cursor_ref: None,
+                }),
+                trace_query_context(),
+            )
+            .expect("trace query");
+
+        assert_eq!(
+            response.surface.disposition,
+            IdentityQueryDisposition::Redacted
+        );
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(
+            response.items[0].visibility_result_ref,
+            visibility_result("trace-visibility-subject-redacted")
+        );
+        assert_eq!(response.items[0].reason_ref, None);
+        assert_eq!(response.items[0].source_ref, None);
+        assert_eq!(response.items[0].actor_ref, None);
+    }
+
+    #[test]
+    fn read_audit_trail_uses_member_canonical_subject_and_stays_read_only() {
+        let requested_member = member_ref("member-audit-query-1");
+        let runtime = IdentityInMemoryRuntime::builder().build();
+        let command = command_service(&runtime);
+        command
+            .establish_global_member(
+                establish_request("audit-query-1", Some(requested_member.clone())),
+                establish_context("audit-query-1"),
+            )
+            .expect("establish member");
+
+        let subjects = identity_application::DefaultIdentityTruthChangeSubjectMapper
+            .member_subjects(requested_member.clone());
+        let trail = runtime
+            .find_audit_trail_by_subject(subjects.audit_subject_ref.clone())
+            .expect("find audit trail")
+            .expect("member audit trail")
+            .value;
+        runtime
+            .shared
+            .store
+            .lock()
+            .expect("lock runtime store")
+            .audit_read_access
+            .insert(
+                audit_access_key(&subjects.audit_subject_ref, &trail.audit_scope_ref),
+                member_access_summary("audit-visible", IdentityVisibilityAccessState::Visible),
+            );
+
+        let service = query_service(&runtime);
+        let active_before = runtime.active_write_transactions().expect("active writes");
+        let staged_before = runtime.staged_write_count().expect("staged writes");
+
+        let response = service
+            .read_audit_trail(
+                paged_query_request(
+                    "ReadAuditTrail",
+                    ReadAuditTrailRequest {
+                        member_ref: requested_member,
+                        audit_scope_ref: trail.audit_scope_ref.clone(),
+                        audit_cursor_ref: None,
+                        consumer_ref: ConsumerRef::new("consumer-1"),
+                    },
+                ),
+                named_query_context("ReadAuditTrail", "visible"),
+            )
+            .expect("audit query");
+
+        let active_after = runtime.active_write_transactions().expect("active writes");
+        let staged_after = runtime.staged_write_count().expect("staged writes");
+
+        assert_eq!(
+            response.surface.disposition,
+            IdentityQueryDisposition::Visible
+        );
+        assert!(!response.items.is_empty());
+        assert_eq!(response.items[0].audit_trail_ref, trail.audit_trail_ref);
         assert_eq!(active_before, 0);
         assert_eq!(active_after, 0);
         assert_eq!(staged_before, 0);

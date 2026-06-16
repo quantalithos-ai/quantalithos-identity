@@ -1040,6 +1040,8 @@ pub struct IdentityVisibilityDecision {
     pub redaction_marker_ref: Option<IdentityRedactionMarkerRef>,
     /// Optional degraded marker.
     pub degraded_marker_ref: Option<IdentityDegradedMarkerRef>,
+    /// Optional degraded kind copied from a formal summary.
+    pub degraded_kind: Option<IdentityDegradedKind>,
     /// Timestamp when the visibility decision was assembled.
     pub decided_at: IdentityTimestamp,
 }
@@ -1065,6 +1067,7 @@ impl IdentityVisibilityDecision {
             disposition: IdentityReadDispositionKind::Visible,
             redaction_marker_ref: None,
             degraded_marker_ref: None,
+            degraded_kind: None,
             decided_at,
         }
     }
@@ -1091,6 +1094,7 @@ impl IdentityVisibilityDecision {
             disposition: IdentityReadDispositionKind::Redacted,
             redaction_marker_ref: Some(redaction_marker_ref),
             degraded_marker_ref: None,
+            degraded_kind: None,
             decided_at,
         }
     }
@@ -1117,6 +1121,7 @@ impl IdentityVisibilityDecision {
             disposition: IdentityReadDispositionKind::NotVisible,
             redaction_marker_ref,
             degraded_marker_ref: None,
+            degraded_kind: None,
             decided_at,
         }
     }
@@ -1131,6 +1136,7 @@ impl IdentityVisibilityDecision {
         visibility_result_ref: VisibilityResultRef,
         surface_kind: identity_contracts::refs::IdentityReadSurfaceKind,
         degraded_marker_ref: IdentityDegradedMarkerRef,
+        degraded_kind: IdentityDegradedKind,
         decided_at: IdentityTimestamp,
     ) -> Self {
         Self {
@@ -1143,6 +1149,7 @@ impl IdentityVisibilityDecision {
             disposition: IdentityReadDispositionKind::Degraded,
             redaction_marker_ref: None,
             degraded_marker_ref: Some(degraded_marker_ref),
+            degraded_kind: Some(degraded_kind),
             decided_at,
         }
     }
@@ -1157,6 +1164,7 @@ impl IdentityVisibilityDecision {
         visibility_result_ref: VisibilityResultRef,
         surface_kind: identity_contracts::refs::IdentityReadSurfaceKind,
         degraded_marker_ref: IdentityDegradedMarkerRef,
+        degraded_kind: IdentityDegradedKind,
         decided_at: IdentityTimestamp,
     ) -> Self {
         Self {
@@ -1169,6 +1177,7 @@ impl IdentityVisibilityDecision {
             disposition: IdentityReadDispositionKind::StaleVisible,
             redaction_marker_ref: None,
             degraded_marker_ref: Some(degraded_marker_ref),
+            degraded_kind: Some(degraded_kind),
             decided_at,
         }
     }
@@ -1188,7 +1197,9 @@ impl IdentityVisibilityDecision {
             .map(
                 |degraded_marker_ref| identity_contracts::metadata::IdentityDegradedMarker {
                     degraded_marker_ref: degraded_marker_ref.clone(),
-                    degraded_kind: IdentityDegradedKind::DependencyUnavailable,
+                    degraded_kind: self
+                        .degraded_kind
+                        .unwrap_or(IdentityDegradedKind::DependencyUnavailable),
                 },
             )
     }
@@ -1201,6 +1212,23 @@ impl IdentityVisibilityDecision {
             redaction_marker_ref: self.redaction_marker_ref.clone(),
         }
     }
+}
+
+/// Application-local body-free degraded summary for material detected after access resolution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityQueryMaterialDegradationSummary {
+    /// Canonical read subject copied from the already-resolved access summary.
+    pub read_subject_ref: IdentityReadSubjectRef,
+    /// Visibility context copied from the already-resolved access summary.
+    pub visibility_context_ref: VisibilityContextRef,
+    /// Visibility scope copied from the already-resolved access summary.
+    pub visibility_scope_ref: VisibilityScopeRef,
+    /// Visibility result copied from the already-resolved access summary.
+    pub visibility_result_ref: VisibilityResultRef,
+    /// Safe degraded marker allocated by the mapper implementation.
+    pub degraded_marker_ref: IdentityDegradedMarkerRef,
+    /// Safe degraded kind allocated by the mapper implementation.
+    pub degraded_kind: IdentityDegradedKind,
 }
 
 /// Application-local job report assembly object.
