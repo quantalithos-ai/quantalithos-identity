@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 use core_contracts::actor::ActorRef;
 use identity_application::errors::{ApplicationError, ApplicationErrorKind};
 use identity_application::mapper::{
-    DefaultIdentityAcceptedAuditTrailMarkerMapper, DefaultIdentityTruthChangeSubjectMapper,
+    DefaultIdentityAcceptedAuditTrailMarkerMapper, DefaultIdentityMarkerSubjectMapper,
+    DefaultIdentityTruthChangeSubjectMapper,
 };
 use identity_application::ports::{
     CareerRecordRepository, ExternalReferenceTypedSidecarRefs, GlobalLifecycleRepository,
@@ -15,7 +16,7 @@ use identity_application::ports::{
     IdentityCommandEffectSummaryRepository, IdentityCursorAssignerPort,
     IdentityExternalReferenceResolverPort, IdentityExternalSourceResolverPort,
     IdentityHandoffDeliveryPort, IdentityHandoffTargetPort, IdentityIdGeneratorPort,
-    IdentityIdempotencyRepository, IdentityJobReportRepository,
+    IdentityIdempotencyRepository, IdentityJobReportRepository, IdentityMarkerSubjectMapper,
     IdentityOperationContextFactoryPort, IdentityOutboxRepository, IdentityProjectionRepository,
     IdentityReadVisibilityRepository, IdentityReconciliationReportRepository,
     IdentityReferenceStateRepository, IdentityStoredResultRepository,
@@ -2886,6 +2887,43 @@ impl IdentityAcceptedAuditTrailMarkerMapper for IdentityInMemoryRuntime {
             change_kind_ref,
             source_cursor_ref,
         )
+    }
+}
+
+impl IdentityMarkerSubjectMapper for IdentityInMemoryRuntime {
+    fn source_marker_subject(
+        &self,
+        source_ref: identity_contracts::refs::IdentitySourceRef,
+    ) -> identity_contracts::refs::IdentityTraceSubjectRef {
+        DefaultIdentityMarkerSubjectMapper.source_marker_subject(source_ref)
+    }
+
+    fn external_reference_marker_subject(
+        &self,
+        reference_ref: ExternalReferenceRef,
+    ) -> identity_contracts::refs::IdentityTraceSubjectRef {
+        DefaultIdentityMarkerSubjectMapper.external_reference_marker_subject(reference_ref)
+    }
+
+    fn projection_marker_subject(
+        &self,
+        projection_ref: IdentityProjectionRef,
+    ) -> identity_contracts::refs::IdentityTraceSubjectRef {
+        DefaultIdentityMarkerSubjectMapper.projection_marker_subject(projection_ref)
+    }
+
+    fn job_marker_subject(
+        &self,
+        job_run_ref: IdentityJobRunRef,
+    ) -> identity_contracts::refs::IdentityTraceSubjectRef {
+        DefaultIdentityMarkerSubjectMapper.job_marker_subject(job_run_ref)
+    }
+
+    fn handoff_receipt_marker_subject(
+        &self,
+        receipt_ref: HandoffReceiptRef,
+    ) -> identity_contracts::refs::IdentityTraceSubjectRef {
+        DefaultIdentityMarkerSubjectMapper.handoff_receipt_marker_subject(receipt_ref)
     }
 }
 
@@ -6721,7 +6759,10 @@ mod tests {
         UpdateGlobalLifecycleStateRequest,
     };
     use identity_contracts::events::{
-        IdentityConsumerOutcome, IdentityConsumerReceipt, IdentityInboundEventEnvelope,
+        ArchiveHandoffResultPayload, IdentityConsumerOutcome, IdentityConsumerReceipt,
+        IdentityInboundEventEnvelope, MemoryReferenceSourceStateChangedPayload,
+        RoleCapabilitySourceChangedPayload, TraceHandoffResultKind, TraceHandoffResultPayload,
+        WorkParticipationAcceptedPayload,
     };
     use identity_contracts::metadata::{
         IdentityCommandMetadata, IdentityDegradedKind, IdentityQueryDisposition,
@@ -6745,19 +6786,20 @@ mod tests {
         ArchiveHandoffRef, ArchiveRef, CapabilityEvidenceKind, CapabilityEvidenceRef,
         CapabilitySourceRef, CareerAppendMaterialKind, CareerAppendMaterialMarker,
         CareerAppendReasonKind, CareerAppendReasonRef, CareerRecordChangeIntent,
-        CareerRecordStateKind as PublicCareerRecordStateKind, ExternalReferenceKind,
-        ExternalReferenceSafeSummaryRef, ExternalSourceVersionRef,
+        CareerRecordStateKind as PublicCareerRecordStateKind, CareerSafeSummaryRef,
+        ExternalReferenceKind, ExternalReferenceSafeSummaryRef, ExternalSourceVersionRef,
         GlobalLifecycleStateKind as PublicLifecycleStateKind, HandoffAttemptRef, HandoffReasonRef,
-        HandoffScopeRef, HandoffStateKind as PublicHandoffStateKind, HandoffTargetRef,
-        IdentityApiRequestMarkerRef, IdentityCanonicalRequestMarkerRef, IdentityChangeKind,
-        IdentityConsumerBindingRef, IdentityConsumerReceiptRef, IdentityDegradedMarkerRef,
-        IdentityEventEnvelopeMarkerRef, IdentityJobReportRef, IdentityJobRunRef,
-        IdentityJobScopeMarkerRef, IdentityMaintenanceTargetRef, IdentityOperationChannel,
-        IdentityOutboxPayloadMarkerRef, IdentityReadSubjectRef, IdentityReadSurfaceKind,
-        IdentityRedactionMarkerRef, IdentityRequestDigestValue, IdentitySourceEventRef,
-        IdentityStoredResultRef, IdentityTimestamp, LifecycleReasonKind, LifecycleReasonRef,
-        MemoryRef, MemoryReferenceChangeIntent, MemoryReferenceChangeMaterialKind,
-        MemoryReferenceChangeMaterialMarker, MemoryReferenceReasonKind, MemoryReferenceReasonRef,
+        HandoffReceiptRef, HandoffScopeRef, HandoffStateKind as PublicHandoffStateKind,
+        HandoffTargetRef, IdentityApiRequestMarkerRef, IdentityCanonicalRequestMarkerRef,
+        IdentityChangeKind, IdentityConsumerBindingRef, IdentityConsumerReceiptRef,
+        IdentityDegradedMarkerRef, IdentityEventEnvelopeMarkerRef, IdentityJobReportRef,
+        IdentityJobRunRef, IdentityJobScopeMarkerRef, IdentityMaintenanceTargetRef,
+        IdentityOperationChannel, IdentityOutboxPayloadMarkerRef, IdentityReadSubjectRef,
+        IdentityReadSurfaceKind, IdentityRedactionMarkerRef, IdentityRequestDigestValue,
+        IdentitySourceEventRef, IdentityStoredResultRef, IdentityTimestamp, LifecycleReasonKind,
+        LifecycleReasonRef, MemoryRef, MemoryReferenceChangeIntent,
+        MemoryReferenceChangeMaterialKind, MemoryReferenceChangeMaterialMarker,
+        MemoryReferenceReasonKind, MemoryReferenceReasonRef, MemoryReferenceRef,
         MemoryReferenceSourceKind, MemoryReferenceSourceRef,
         MemoryReferenceStateKind as PublicMemoryReferenceStateKind,
         OutboxStateKind as PublicOutboxStateKind, ProjectParticipationRef,
@@ -6765,7 +6807,8 @@ mod tests {
         ReconciliationReportRef,
         ReferenceResolutionStateKind as PublicReferenceResolutionStateKind,
         RoleCapabilityChangeMaterialKind, RoleCapabilityChangeMaterialMarker,
-        RoleCapabilityChangeReasonKind, RoleCapabilityChangeReasonRef, RoleCapabilitySourceKind,
+        RoleCapabilityChangeReasonKind, RoleCapabilityChangeReasonRef,
+        RoleCapabilitySafeSummaryRef, RoleCapabilitySourceKind, RoleCapabilitySourceVersionRef,
         RoleCapabilitySummaryStateKind as PublicRoleCapabilitySummaryStateKind, RoleSourceRef,
         TopicKeyRef, TraceHandoffSafeMaterialRef, VisibilityContextRef, WorkSourceKind,
         WorkSourceRef,
@@ -6774,7 +6817,10 @@ mod tests {
         IdentityReadMaterialKind, IdentityReadMaterialMarker, IdentityVisibilityAccessState,
         MemberSummarySliceKind, MemberSummarySliceRef,
     };
+    use identity_domain::career::CareerRecord;
     use identity_domain::handoff::HandoffState;
+    use identity_domain::member_identity::GlobalMember;
+    use identity_domain::memory_reference::MemoryReference;
     use identity_domain::outbox::{IdentityOutboxRecord, OutboxState};
 
     use super::*;
@@ -6926,6 +6972,17 @@ mod tests {
         )
     }
 
+    fn consumer_request_digest(
+        token: &str,
+    ) -> identity_application::support::IdentityRequestDigest {
+        identity_application::support::IdentityRequestDigest::from_canonical_marker(
+            IdentityCanonicalRequestMarkerRef::new(format!("canonical-consumer-{token}")),
+            IdentityRequestDigestValue::new(format!("digest-consumer-{token}")),
+            IdentityProtocolSchemaVersionRef::new("identity.consumer.v1"),
+            IdentityDigestAlgorithmMarkerRef::new("sha256-v1"),
+        )
+    }
+
     fn request_digest_marker(token: &str) -> IdentityRequestDigestMarker {
         IdentityRequestDigestMarker {
             canonical_marker_ref: IdentityCanonicalRequestMarkerRef::new(format!(
@@ -6977,9 +7034,24 @@ mod tests {
             unit_of_work_manager: runtime,
             clock: runtime,
             id_generator: runtime,
+            cursor_assigner: runtime,
             operation_context_factory: runtime,
             idempotency_repository: runtime,
             stored_result_repository: runtime,
+            truth_change_subject_mapper: runtime,
+            marker_subject_mapper: runtime,
+            accepted_audit_trail_marker_mapper: runtime,
+            member_repository: runtime,
+            role_capability_repository: runtime,
+            career_record_repository: runtime,
+            memory_reference_repository: runtime,
+            reference_state_repository: runtime,
+            external_reference_resolver: runtime,
+            trace_record_repository: runtime,
+            audit_trail_repository: runtime,
+            outbox_repository: runtime,
+            projection_repository: runtime,
+            handoff_intent_repository: runtime,
         })
     }
 
@@ -7160,6 +7232,110 @@ mod tests {
             identity_source_ref(IdentitySourceOwner::Identity, token),
         )
         .expect("memory reason")
+    }
+
+    fn role_source_version(
+        source_ref: &identity_contracts::refs::RoleCapabilitySourceRef,
+        token: &str,
+    ) -> RoleCapabilitySourceVersionRef {
+        RoleCapabilitySourceVersionRef::new(source_ref.clone(), token).expect("role source version")
+    }
+
+    fn memory_reference_ref(token: &str) -> MemoryReferenceRef {
+        MemoryReferenceRef::from_id(
+            identity_contracts::refs::MemoryReferenceId::new(token.to_owned())
+                .expect("memory reference id"),
+        )
+    }
+
+    fn linked_memory_reference(
+        reference_token: &str,
+        member_ref: GlobalMemberRef,
+        source_token: &str,
+    ) -> MemoryReference {
+        let source_ref =
+            memory_source_ref(source_token, MemoryReferenceSourceKind::MemorySourceEvent);
+        let summary = identity_contracts::refs::MemoryReferenceSourceSummary::from_resolver(
+            source_ref.clone(),
+            Some(
+                MemoryRef::from_source(identity_source_ref(
+                    IdentitySourceOwner::MemoryArchive,
+                    &format!("memory-{source_token}"),
+                ))
+                .expect("memory ref"),
+            ),
+            None,
+            None,
+            Some(
+                identity_contracts::refs::MemorySafeSummaryRef::new(
+                    source_ref.clone(),
+                    format!("safe-{source_token}"),
+                )
+                .expect("memory safe summary"),
+            ),
+            identity_contracts::refs::MemoryReferenceSourceState::Trusted,
+        );
+        MemoryReference::link_for_member(
+            memory_reference_ref(reference_token),
+            member_ref,
+            summary,
+            memory_reason(
+                "memory-link-reason-1",
+                MemoryReferenceReasonKind::ManualMaintain,
+            ),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("linked memory reference")
+    }
+
+    fn archived_memory_reference(
+        reference_token: &str,
+        member_ref: GlobalMemberRef,
+        source_token: &str,
+        handoff_token: &str,
+    ) -> MemoryReference {
+        let source_ref = memory_source_ref(
+            source_token,
+            MemoryReferenceSourceKind::ArchiveHandoffResult,
+        );
+        let archive_handoff_ref = ArchiveHandoffRef::new(
+            identity_source_ref(IdentitySourceOwner::MemoryArchive, handoff_token),
+            handoff_token,
+        )
+        .expect("archive handoff ref");
+        let summary = identity_contracts::refs::MemoryReferenceSourceSummary::from_resolver(
+            source_ref.clone(),
+            Some(
+                MemoryRef::from_source(identity_source_ref(
+                    IdentitySourceOwner::MemoryArchive,
+                    &format!("memory-{source_token}"),
+                ))
+                .expect("memory ref"),
+            ),
+            Some(
+                ArchiveRef::from_source(identity_source_ref(
+                    IdentitySourceOwner::MemoryArchive,
+                    &format!("archive-{source_token}"),
+                ))
+                .expect("archive ref"),
+            ),
+            Some(archive_handoff_ref),
+            None,
+            identity_contracts::refs::MemoryReferenceSourceState::HandoffResultAccepted,
+        );
+        MemoryReference::from_archive_handoff(
+            memory_reference_ref(reference_token),
+            member_ref,
+            summary,
+            memory_reason(
+                "memory-handoff-reason-1",
+                MemoryReferenceReasonKind::ArchiveHandoffResult,
+            ),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("archived memory reference")
     }
 
     fn job_context(
@@ -7589,6 +7765,25 @@ mod tests {
         }
     }
 
+    fn inbound_event_envelope_with_payload<T>(
+        token: &str,
+        consumer_name: &str,
+        payload: T,
+    ) -> IdentityInboundEventEnvelope<T> {
+        IdentityInboundEventEnvelope {
+            consumer_name: IdentityInboundConsumerName::new(consumer_name),
+            envelope_marker_ref: IdentityEventEnvelopeMarkerRef::new(format!("envelope-{token}")),
+            consumer_binding_ref: IdentityConsumerBindingRef::new(format!("binding-{token}")),
+            source_event_ref: IdentitySourceEventRef::new(format!("source-event-{token}")),
+            idempotency_key: format!("idem-{token}").into(),
+            schema_version_ref: IdentityProtocolSchemaVersionRef::new("identity.consumer.v1"),
+            occurred_at: None,
+            received_at: timestamp(1),
+            trace_context_ref: None,
+            payload,
+        }
+    }
+
     fn inbound_context(token: &str, operation_name: &str) -> IdentityOperationContext {
         IdentityOperationContext::from_inbound_event(
             IdentityOperationContextRef::new(format!("context-{token}")),
@@ -7598,7 +7793,7 @@ mod tests {
                 "metadata-{token}"
             )),
             IdentityIdempotencyKey::new(format!("idem-{token}")),
-            request_digest(token),
+            consumer_request_digest(token),
             None,
             IdentitySourceEventRef::new(format!("source-event-{token}")),
             timestamp(1),
@@ -7614,7 +7809,7 @@ mod tests {
                 "metadata-{token}"
             )),
             IdentityIdempotencyKey::new(format!("idem-{token}")),
-            request_digest(token),
+            consumer_request_digest(token),
             None,
             IdentitySourceEventRef::new(format!("source-event-{token}")),
             timestamp(1),
@@ -8331,6 +8526,534 @@ mod tests {
                 .expect("load callback envelope")
                 .expect("callback envelope"),
             stored_receipt
+        );
+    }
+
+    #[test]
+    fn handle_role_capability_source_changed_accepts_and_replays() {
+        let member_ref = member_ref("member-role-consumer-1");
+        let member = GlobalMember::establish(
+            member_ref.clone(),
+            identity_source_ref(
+                IdentitySourceOwner::Identity,
+                "member-source-role-consumer-1",
+            ),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let source_ref = role_capability_source_ref("role-consumer-source-1");
+        let payload = RoleCapabilitySourceChangedPayload {
+            member_ref: member_ref.clone(),
+            source_ref: source_ref.clone(),
+            source_version_ref: role_source_version(&source_ref, "version-1"),
+            source_state_kind:
+                identity_contracts::refs::RoleCapabilitySourceStateKind::SourceResolved,
+            safe_summary_ref: Some(
+                RoleCapabilitySafeSummaryRef::new(source_ref.clone(), "safe-role-consumer-1")
+                    .expect("role safe summary"),
+            ),
+            evidence_refs: vec![
+                CapabilityEvidenceRef::new(
+                    CapabilityEvidenceKind::MethodArtifact,
+                    source_ref.source_ref.clone(),
+                )
+                .expect("evidence ref"),
+            ],
+            external_reference_ref: None,
+            reference_owner_ref: None,
+            change_reason_ref: Some(role_change_reason("role-consumer-reason-1")),
+            material_marker: RoleCapabilityChangeMaterialMarker::new(
+                RoleCapabilityChangeMaterialKind::SafeSummaryMarker,
+                Some(source_ref.source_ref.clone()),
+            ),
+        };
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member, IdentityVersion::new(1))
+            .build();
+        let service = consumer_service(&runtime);
+
+        let first = service
+            .handle_role_capability_source_changed(
+                inbound_event_envelope_with_payload(
+                    "role-consumer-1",
+                    "HandleRoleCapabilitySourceChanged",
+                    payload.clone(),
+                ),
+                inbound_context("role-consumer-1", "HandleRoleCapabilitySourceChanged"),
+            )
+            .expect("accepted");
+        assert_eq!(first.outcome, IdentityConsumerOutcome::Accepted);
+        assert_eq!(first.trace_refs.len(), 1);
+        assert_eq!(first.outbox_refs.len(), 1);
+
+        let snapshot = runtime
+            .find_source_snapshot_by_source(source_ref.clone())
+            .expect("load snapshot")
+            .expect("snapshot");
+        assert_eq!(
+            snapshot.value.source_state,
+            identity_domain::role_capability::RoleCapabilitySourceStateKind::SourceResolved
+        );
+        assert_eq!(
+            snapshot.value.source_version_ref,
+            payload.source_version_ref
+        );
+
+        let replay = service
+            .handle_role_capability_source_changed(
+                inbound_event_envelope_with_payload(
+                    "role-consumer-1",
+                    "HandleRoleCapabilitySourceChanged",
+                    payload,
+                ),
+                inbound_context("role-consumer-1", "HandleRoleCapabilitySourceChanged"),
+            )
+            .expect("replay");
+        assert_eq!(replay.outcome, IdentityConsumerOutcome::DuplicateReplayed);
+        assert_eq!(replay.stored_result_ref, first.stored_result_ref);
+        assert_eq!(
+            runtime
+                .list_trace_records_by_member(member_ref, IdentityRepositoryPage::new(None, 16))
+                .expect("list traces")
+                .items
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn handle_work_participation_accepted_source_duplicate_returns_noop() {
+        let member_ref = member_ref("member-work-consumer-1");
+        let member = GlobalMember::establish(
+            member_ref.clone(),
+            identity_source_ref(
+                IdentitySourceOwner::Identity,
+                "member-source-work-consumer-1",
+            ),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let work_token = format!("{}::{}", member_ref.id().as_str(), "work-consumer-source-1");
+        let work_source_ref =
+            work_source(&work_token, WorkSourceKind::ProjectParticipationAccepted);
+        let project_participation_ref = project_participation(&work_token);
+        let career_source_marker_ref = career_source_marker(
+            &member_ref,
+            &work_source_ref,
+            "career-source-marker-consumer-1",
+        );
+        let safe_summary_ref =
+            CareerSafeSummaryRef::new(work_source_ref.clone(), "career-safe-consumer-1")
+                .expect("career safe summary");
+        let existing = CareerRecord::append_from_work_source(
+            identity_contracts::refs::CareerRecordRef::from_id(
+                identity_contracts::refs::CareerRecordId::new(
+                    "career-existing-consumer-1".to_owned(),
+                )
+                .expect("career record id"),
+            ),
+            member_ref.clone(),
+            identity_contracts::refs::WorkParticipationSourceSummary::from_resolver(
+                project_participation_ref.clone(),
+                work_source_ref.clone(),
+                career_source_marker_ref.clone(),
+                Some(safe_summary_ref.clone()),
+                identity_contracts::refs::WorkParticipationSourceState::Trusted,
+            ),
+            CareerAppendReasonRef::new(
+                CareerAppendReasonKind::WorkParticipationAccepted,
+                work_source_ref.source_ref.clone(),
+            )
+            .expect("append reason"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("career record");
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member, IdentityVersion::new(1))
+            .seed_career_record(existing, IdentityVersion::new(1))
+            .build();
+        let service = consumer_service(&runtime);
+
+        let receipt = service
+            .handle_work_participation_accepted(
+                inbound_event_envelope_with_payload(
+                    "work-consumer-1",
+                    "HandleWorkParticipationAccepted",
+                    WorkParticipationAcceptedPayload {
+                        member_ref: member_ref.clone(),
+                        project_participation_ref,
+                        work_source_ref: work_source_ref.clone(),
+                        career_source_marker_ref: career_source_marker_ref.clone(),
+                        safe_summary_ref,
+                        append_reason_ref: Some(
+                            CareerAppendReasonRef::new(
+                                CareerAppendReasonKind::WorkParticipationAccepted,
+                                work_source_ref.source_ref.clone(),
+                            )
+                            .expect("append reason"),
+                        ),
+                        material_marker: CareerAppendMaterialMarker {
+                            material_kind: CareerAppendMaterialKind::SafeSummaryMarker,
+                            source_ref: Some(work_source_ref.source_ref.clone()),
+                        },
+                    },
+                ),
+                inbound_context("work-consumer-1", "HandleWorkParticipationAccepted"),
+            )
+            .expect("noop");
+
+        assert_eq!(receipt.outcome, IdentityConsumerOutcome::Noop);
+        assert!(receipt.trace_refs.is_empty());
+        assert!(receipt.outbox_refs.is_empty());
+        assert_eq!(
+            runtime
+                .list_records_by_member(member_ref, IdentityRepositoryPage::new(None, 16))
+                .expect("list career records")
+                .items
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn handle_memory_reference_source_state_changed_missing_relation_does_not_create() {
+        let member_ref = member_ref("member-memory-consumer-1");
+        let member = GlobalMember::establish(
+            member_ref.clone(),
+            identity_source_ref(
+                IdentitySourceOwner::Identity,
+                "member-source-memory-consumer-1",
+            ),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let source_ref = memory_source_ref(
+            "memory-consumer-source-1",
+            MemoryReferenceSourceKind::MemorySourceEvent,
+        );
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member, IdentityVersion::new(1))
+            .build();
+        let service = consumer_service(&runtime);
+
+        let receipt = service
+            .handle_memory_reference_source_state_changed(
+                inbound_event_envelope_with_payload(
+                    "memory-consumer-1",
+                    "HandleMemoryReferenceSourceStateChanged",
+                    MemoryReferenceSourceStateChangedPayload {
+                        member_ref: member_ref.clone(),
+                        memory_reference_ref: None,
+                        source_ref: source_ref.clone(),
+                        memory_ref: Some(
+                            MemoryRef::from_source(identity_source_ref(
+                                IdentitySourceOwner::MemoryArchive,
+                                "memory-carrier-consumer-1",
+                            ))
+                            .expect("memory ref"),
+                        ),
+                        archive_ref: None,
+                        target_state_kind: PublicMemoryReferenceStateKind::Stale,
+                        safe_summary_ref: None,
+                        external_reference_ref: None,
+                        reference_owner_ref: None,
+                        reason_ref: Some(memory_reason(
+                            "memory-consumer-reason-1",
+                            MemoryReferenceReasonKind::SourceStateChanged,
+                        )),
+                        material_marker: MemoryReferenceChangeMaterialMarker {
+                            material_kind: MemoryReferenceChangeMaterialKind::ReferenceMarkersOnly,
+                            source_ref: Some(source_ref.source_ref.clone()),
+                        },
+                    },
+                ),
+                inbound_context(
+                    "memory-consumer-1",
+                    "HandleMemoryReferenceSourceStateChanged",
+                ),
+            )
+            .expect("quarantined");
+
+        assert_eq!(receipt.outcome, IdentityConsumerOutcome::Quarantined);
+        assert!(
+            runtime
+                .list_references_by_member(member_ref, IdentityRepositoryPage::new(None, 16))
+                .expect("list memory references")
+                .items
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .list_pending_outbox_records(None, IdentityRepositoryPage::new(None, 16))
+                .expect("list outbox")
+                .items
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn handle_archive_handoff_result_target_mismatch_rejects_without_mutation() {
+        let member_ref = member_ref("member-archive-callback-1");
+        let member = GlobalMember::establish(
+            member_ref.clone(),
+            identity_source_ref(
+                IdentitySourceOwner::Identity,
+                "member-source-archive-callback-1",
+            ),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let direct = linked_memory_reference(
+            "memory-direct-archive-callback-1",
+            member_ref.clone(),
+            "memory-direct-source-archive-callback-1",
+        );
+        let callback_target = archived_memory_reference(
+            "memory-target-archive-callback-1",
+            member_ref.clone(),
+            "archive-target-source-1",
+            "archive-callback-handoff-1",
+        );
+        let archive_ref = callback_target.archive_ref.clone().expect("archive ref");
+        let archive_handoff_ref = callback_target
+            .archive_handoff_ref
+            .clone()
+            .expect("archive handoff ref");
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member, IdentityVersion::new(1))
+            .seed_memory_reference(direct.clone(), IdentityVersion::new(1))
+            .seed_memory_reference(callback_target.clone(), IdentityVersion::new(1))
+            .build();
+        let service = consumer_service(&runtime);
+
+        let receipt = service
+            .handle_archive_handoff_result(
+                inbound_event_envelope_with_payload(
+                    "archive-callback-mismatch-1",
+                    "HandleArchiveHandoffResult",
+                    ArchiveHandoffResultPayload {
+                        member_ref: member_ref.clone(),
+                        memory_reference_ref: Some(direct.memory_reference_ref.clone()),
+                        archive_ref,
+                        archive_handoff_ref: archive_handoff_ref.clone(),
+                        target_state_kind: PublicMemoryReferenceStateKind::Archived,
+                        reason_ref: Some(memory_reason(
+                            "archive-callback-reason-1",
+                            MemoryReferenceReasonKind::ArchiveHandoffResult,
+                        )),
+                        issue_ref: None,
+                        material_marker: MemoryReferenceChangeMaterialMarker {
+                            material_kind: MemoryReferenceChangeMaterialKind::HandoffMarkerOnly,
+                            source_ref: Some(archive_handoff_ref.source_ref.clone()),
+                        },
+                    },
+                ),
+                callback_context("archive-callback-mismatch-1", "HandleArchiveHandoffResult"),
+            )
+            .expect("rejected");
+
+        assert_eq!(receipt.outcome, IdentityConsumerOutcome::Rejected);
+        assert_eq!(
+            runtime
+                .get_memory_reference_with_version(direct.memory_reference_ref.clone())
+                .expect("load direct relation")
+                .expect("direct relation")
+                .version,
+            IdentityVersion::new(1)
+        );
+        assert_eq!(
+            runtime
+                .get_memory_reference_with_version(callback_target.memory_reference_ref)
+                .expect("load callback target relation")
+                .expect("callback target relation")
+                .version,
+            IdentityVersion::new(1)
+        );
+        assert!(
+            runtime
+                .list_pending_outbox_records(None, IdentityRepositoryPage::new(None, 16))
+                .expect("list outbox")
+                .items
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn handle_trace_handoff_result_delivered_requires_receipt() {
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_handoff_intent(handoff_intent(), IdentityVersion::new(1))
+            .build();
+        let service = consumer_service(&runtime);
+
+        let receipt = service
+            .handle_trace_handoff_result(
+                inbound_event_envelope_with_payload(
+                    "trace-callback-missing-receipt-1",
+                    "HandleTraceHandoffResult",
+                    TraceHandoffResultPayload {
+                        handoff_intent_ref: TraceHandoffIntentRef::new("handoff-1"),
+                        handoff_target_ref: HandoffTargetRef::new("target-1"),
+                        handoff_scope_ref: Some(HandoffScopeRef::new("scope-1")),
+                        attempt_ref: HandoffAttemptRef::new(identity_source_ref(
+                            IdentitySourceOwner::Identity,
+                            "attempt-trace-callback-missing-receipt-1",
+                        )),
+                        result_kind: TraceHandoffResultKind::Delivered,
+                        receipt_ref: None,
+                        issue_ref: None,
+                    },
+                ),
+                callback_context(
+                    "trace-callback-missing-receipt-1",
+                    "HandleTraceHandoffResult",
+                ),
+            )
+            .expect("rejected");
+
+        assert_eq!(receipt.outcome, IdentityConsumerOutcome::Rejected);
+        let persisted = runtime
+            .get_handoff_intent_with_version(TraceHandoffIntentRef::new("handoff-1"))
+            .expect("load handoff intent")
+            .expect("handoff intent");
+        assert_eq!(persisted.version, IdentityVersion::new(1));
+        assert_eq!(
+            persisted.value.handoff_state.state_kind,
+            HandoffStateKind::PendingHandoff
+        );
+        assert_eq!(
+            runtime
+                .get_handoff_callback_receipt(receipt.stored_result_ref.clone())
+                .expect("load callback receipt")
+                .expect("callback receipt")
+                .result_kind,
+            IdentityStoredResultKind::HandoffCallbackReceipt
+        );
+        assert!(
+            runtime
+                .list_pending_outbox_records(None, IdentityRepositoryPage::new(None, 16))
+                .expect("list outbox")
+                .items
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn handle_trace_handoff_result_delivered_replays_stored_receipt() {
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_handoff_intent(handoff_intent(), IdentityVersion::new(1))
+            .build();
+        let service = consumer_service(&runtime);
+        let payload = TraceHandoffResultPayload {
+            handoff_intent_ref: TraceHandoffIntentRef::new("handoff-1"),
+            handoff_target_ref: HandoffTargetRef::new("target-1"),
+            handoff_scope_ref: Some(HandoffScopeRef::new("scope-1")),
+            attempt_ref: HandoffAttemptRef::new(identity_source_ref(
+                IdentitySourceOwner::Identity,
+                "attempt-trace-callback-accepted-1",
+            )),
+            result_kind: TraceHandoffResultKind::Delivered,
+            receipt_ref: Some(HandoffReceiptRef::new("handoff-receipt-consumer-1")),
+            issue_ref: None,
+        };
+
+        let first = service
+            .handle_trace_handoff_result(
+                inbound_event_envelope_with_payload(
+                    "trace-callback-accepted-1",
+                    "HandleTraceHandoffResult",
+                    payload.clone(),
+                ),
+                callback_context("trace-callback-accepted-1", "HandleTraceHandoffResult"),
+            )
+            .expect("accepted");
+        assert_eq!(first.outcome, IdentityConsumerOutcome::Accepted);
+        assert_eq!(first.trace_refs.len(), 2);
+        assert_eq!(first.outbox_refs.len(), 1);
+
+        let persisted = runtime
+            .get_handoff_intent_with_version(TraceHandoffIntentRef::new("handoff-1"))
+            .expect("load handoff intent")
+            .expect("handoff intent");
+        assert_eq!(persisted.version, IdentityVersion::new(2));
+        assert_eq!(
+            persisted.value.handoff_state.state_kind,
+            HandoffStateKind::Delivered
+        );
+        assert_eq!(
+            persisted.value.handoff_state.receipt_ref,
+            Some(HandoffReceiptRef::new("handoff-receipt-consumer-1"))
+        );
+        assert_eq!(
+            runtime
+                .get_handoff_callback_receipt(first.stored_result_ref.clone())
+                .expect("load stored callback receipt")
+                .expect("stored callback receipt")
+                .result_kind,
+            IdentityStoredResultKind::HandoffCallbackReceipt
+        );
+        assert_eq!(
+            runtime
+                .list_trace_records_by_member(
+                    member_ref("member-1"),
+                    IdentityRepositoryPage::new(None, 16)
+                )
+                .expect("list traces")
+                .items
+                .len(),
+            2
+        );
+        assert_eq!(
+            runtime
+                .list_pending_outbox_records(None, IdentityRepositoryPage::new(None, 16))
+                .expect("list outbox")
+                .items
+                .len(),
+            1
+        );
+
+        let replay = service
+            .handle_trace_handoff_result(
+                inbound_event_envelope_with_payload(
+                    "trace-callback-accepted-1",
+                    "HandleTraceHandoffResult",
+                    payload,
+                ),
+                callback_context("trace-callback-accepted-1", "HandleTraceHandoffResult"),
+            )
+            .expect("replay");
+        assert_eq!(replay.outcome, IdentityConsumerOutcome::DuplicateReplayed);
+        assert_eq!(replay.stored_result_ref, first.stored_result_ref);
+        assert_eq!(
+            runtime
+                .get_handoff_intent_with_version(TraceHandoffIntentRef::new("handoff-1"))
+                .expect("reload handoff intent")
+                .expect("handoff intent")
+                .version,
+            IdentityVersion::new(2)
+        );
+        assert_eq!(
+            runtime
+                .list_trace_records_by_member(
+                    member_ref("member-1"),
+                    IdentityRepositoryPage::new(None, 16)
+                )
+                .expect("list traces after replay")
+                .items
+                .len(),
+            2
+        );
+        assert_eq!(
+            runtime
+                .list_pending_outbox_records(None, IdentityRepositoryPage::new(None, 16))
+                .expect("list outbox after replay")
+                .items
+                .len(),
+            1
         );
     }
 
