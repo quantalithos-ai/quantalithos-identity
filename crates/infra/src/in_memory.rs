@@ -16,10 +16,11 @@ use identity_application::ports::{
     IdentityExternalSourceResolverPort, IdentityHandoffDeliveryPort, IdentityHandoffTargetPort,
     IdentityIdGeneratorPort, IdentityIdempotencyRepository, IdentityJobReportRepository,
     IdentityOperationContextFactoryPort, IdentityOutboxRepository, IdentityProjectionRepository,
-    IdentityReadVisibilityRepository, IdentityReferenceStateRepository,
-    IdentityStoredResultRepository, IdentityTraceRecordRepository,
-    IdentityTruthChangeSubjectMapper, IdentityUnitOfWork, IdentityUnitOfWorkManagerPort,
-    MemoryReferenceRepository, RoleCapabilityRepository, TraceHandoffIntentRepository,
+    IdentityReadVisibilityRepository, IdentityReconciliationReportRepository,
+    IdentityReferenceStateRepository, IdentityStoredResultRepository,
+    IdentityTraceRecordRepository, IdentityTruthChangeSubjectMapper, IdentityUnitOfWork,
+    IdentityUnitOfWorkManagerPort, MemoryReferenceRepository, RoleCapabilityRepository,
+    TraceHandoffIntentRepository,
 };
 use identity_application::support::{
     AuditTrailId, IdempotencyReserveOutcome, IdentityAcceptedAuditTrailMarkers,
@@ -43,15 +44,16 @@ use identity_contracts::refs::{
     ExternalReferenceRef, ExternalSourceRef, ExternalSourceVersionRef, GlobalMemberId,
     GlobalMemberRef, GovernanceBasisRef, GovernanceBasisState, GovernanceBasisSummary,
     HandoffIssueRef, HandoffReceiptRef, HandoffScopeRef, HandoffTargetRef, IdentityAuditSubjectRef,
-    IdentityChangeKindRef, IdentityJobRunRef, IdentityOutboxRecordRef, IdentityOutboxSubjectRef,
-    IdentityProjectionCursorRef, IdentityProjectionRef, IdentityReferenceOwnerRef,
-    IdentitySourceOwner, IdentitySourceRef, IdentityTimestamp, IdentityTraceRecordRef,
-    IdentityTraceSubjectRef, IdentityTruthCursor, LifecycleRiskRef, MemberSummaryViewRef,
-    MemoryRef, MemoryReferenceId, MemoryReferenceRef, MemoryReferenceSourceState,
-    ProjectParticipationRef, ProjectionStateRef, ReferenceResolutionStateRef,
-    RoleCapabilitySourceRef, RoleCapabilitySourceSnapshotRef, RoleCapabilitySummaryRef,
-    TopicKeyRef, TraceHandoffSafeMaterialRef, VisibilityContextRef, VisibilityResultRef,
-    VisibilityScopeRef, WorkParticipationSourceState, WorkParticipationSourceSummary,
+    IdentityChangeKindRef, IdentityJobRunRef, IdentityMaintenanceTargetRef,
+    IdentityOutboxRecordRef, IdentityOutboxSubjectRef, IdentityProjectionCursorRef,
+    IdentityProjectionRef, IdentityReferenceOwnerRef, IdentitySourceOwner, IdentitySourceRef,
+    IdentityTimestamp, IdentityTraceRecordRef, IdentityTraceSubjectRef, IdentityTruthCursor,
+    LifecycleRiskRef, MaintenanceScopeRef, MemberSummaryViewRef, MemoryRef, MemoryReferenceId,
+    MemoryReferenceRef, MemoryReferenceSourceState, ProjectParticipationRef, ProjectionStateRef,
+    ReconciliationReportRef, ReferenceResolutionStateRef, RoleCapabilitySourceRef,
+    RoleCapabilitySourceSnapshotRef, RoleCapabilitySummaryRef, TopicKeyRef,
+    TraceHandoffSafeMaterialRef, VisibilityContextRef, VisibilityResultRef, VisibilityScopeRef,
+    WorkParticipationSourceState, WorkParticipationSourceSummary,
 };
 use identity_contracts::views::{IdentityVisibilityAccessSummary, MemberSummaryView};
 use identity_domain::audit::{AuditTrail, AuditTrailEntry};
@@ -62,6 +64,7 @@ use identity_domain::member_identity::GlobalMember;
 use identity_domain::memory_reference::MemoryReference;
 use identity_domain::outbox::{IdentityOutboxRecord, OutboxStateKind};
 use identity_domain::projection_state::{ProjectionState, ProjectionStateKind};
+use identity_domain::reconciliation::{ReconciliationReport, ReconciliationReportStateKind};
 use identity_domain::reference_state::{ReferenceResolutionState, ReferenceResolutionStateKind};
 use identity_domain::role_capability::{RoleCapabilitySourceSnapshot, RoleCapabilitySummary};
 use identity_domain::trace::IdentityTraceRecord;
@@ -316,6 +319,18 @@ impl IdentityInMemoryRuntimeBuilder {
         self
     }
 
+    pub fn seed_reconciliation_report(
+        mut self,
+        report: ReconciliationReport,
+        version: IdentityVersion,
+    ) -> Self {
+        self.store.reconciliation_reports.insert(
+            report.report_ref.as_str().to_owned(),
+            StoredReconciliationReport { report, version },
+        );
+        self
+    }
+
     pub fn seed_handoff_intent(
         mut self,
         intent: TraceHandoffIntent,
@@ -510,6 +525,95 @@ impl IdentityInMemoryRuntimeBuilder {
             audit_access_key(&audit_subject_ref, &audit_scope_ref),
             access_summary,
         );
+        self
+    }
+
+    pub fn seed_report_read_access(
+        mut self,
+        report_ref: ReconciliationReportRef,
+        access_summary: IdentityVisibilityAccessSummary,
+    ) -> Self {
+        self.store
+            .report_read_access
+            .insert(report_ref.as_str().to_owned(), access_summary);
+        self
+    }
+
+    pub fn seed_reconciliation_scope_read_access(
+        mut self,
+        maintenance_scope_ref: MaintenanceScopeRef,
+        access_summary: IdentityVisibilityAccessSummary,
+    ) -> Self {
+        self.store.reconciliation_scope_read_access.insert(
+            maintenance_scope_key(&maintenance_scope_ref),
+            access_summary,
+        );
+        self
+    }
+
+    pub fn seed_projection_state_read_access(
+        mut self,
+        projection_ref: IdentityProjectionRef,
+        projection_state_ref: Option<ProjectionStateRef>,
+        access_summary: IdentityVisibilityAccessSummary,
+    ) -> Self {
+        self.store.projection_state_read_access.insert(
+            projection_state_access_key(&projection_ref, projection_state_ref.as_ref()),
+            access_summary,
+        );
+        self
+    }
+
+    pub fn seed_reference_state_read_access(
+        mut self,
+        external_reference_ref: ExternalReferenceRef,
+        owner_ref: Option<IdentityReferenceOwnerRef>,
+        access_summary: IdentityVisibilityAccessSummary,
+    ) -> Self {
+        self.store.reference_state_read_access.insert(
+            reference_state_access_key(&external_reference_ref, owner_ref.as_ref()),
+            access_summary,
+        );
+        self
+    }
+
+    pub fn seed_outbox_record_read_access(
+        mut self,
+        outbox_ref: Option<IdentityOutboxRecordRef>,
+        subject_ref: Option<IdentityOutboxSubjectRef>,
+        topic_key_ref: Option<TopicKeyRef>,
+        access_summary: IdentityVisibilityAccessSummary,
+    ) -> Self {
+        self.store.outbox_record_read_access.insert(
+            outbox_record_access_key(
+                outbox_ref.as_ref(),
+                subject_ref.as_ref(),
+                topic_key_ref.as_ref(),
+            ),
+            access_summary,
+        );
+        self
+    }
+
+    pub fn seed_outbox_trace_page_read_access(
+        mut self,
+        trace_record_ref: IdentityTraceRecordRef,
+        access_summary: IdentityVisibilityAccessSummary,
+    ) -> Self {
+        self.store
+            .outbox_trace_page_read_access
+            .insert(trace_record_ref.as_str().to_owned(), access_summary);
+        self
+    }
+
+    pub fn seed_handoff_intent_read_access(
+        mut self,
+        handoff_intent_ref: TraceHandoffIntentRef,
+        access_summary: IdentityVisibilityAccessSummary,
+    ) -> Self {
+        self.store
+            .handoff_intent_read_access
+            .insert(handoff_intent_ref.as_str().to_owned(), access_summary);
         self
     }
 
@@ -797,6 +901,24 @@ impl IdentityInMemoryRuntime {
         ))
     }
 
+    fn predicted_reconciliation_report_version(
+        &self,
+        report_ref: &ReconciliationReportRef,
+    ) -> Result<IdentityVersion, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(IdentityVersion::new(
+            store
+                .reconciliation_reports
+                .get(report_ref.as_str())
+                .map(|stored| stored.version.get() + 1)
+                .unwrap_or(1),
+        ))
+    }
+
     fn predicted_handoff_version(
         &self,
         intent_ref: &TraceHandoffIntentRef,
@@ -888,6 +1010,7 @@ struct RuntimeStore {
     member_scope_index: HashMap<String, String>,
     projection_states: HashMap<String, StoredProjectionState>,
     reference_states: HashMap<String, StoredReferenceState>,
+    reconciliation_reports: HashMap<String, StoredReconciliationReport>,
     handoff_intents: HashMap<String, StoredHandoffIntent>,
     outbox_records: HashMap<String, StoredOutboxRecord>,
     outbox_subject_index: HashMap<String, String>,
@@ -913,6 +1036,13 @@ struct RuntimeStore {
     trace_read_access: HashMap<String, IdentityVisibilityAccessSummary>,
     trace_member_page_access: HashMap<String, IdentityVisibilityAccessSummary>,
     audit_read_access: HashMap<String, IdentityVisibilityAccessSummary>,
+    report_read_access: HashMap<String, IdentityVisibilityAccessSummary>,
+    reconciliation_scope_read_access: HashMap<String, IdentityVisibilityAccessSummary>,
+    projection_state_read_access: HashMap<String, IdentityVisibilityAccessSummary>,
+    reference_state_read_access: HashMap<String, IdentityVisibilityAccessSummary>,
+    outbox_record_read_access: HashMap<String, IdentityVisibilityAccessSummary>,
+    outbox_trace_page_read_access: HashMap<String, IdentityVisibilityAccessSummary>,
+    handoff_intent_read_access: HashMap<String, IdentityVisibilityAccessSummary>,
     faults: HashSet<FaultCase>,
 }
 
@@ -981,6 +1111,12 @@ struct StoredProjectionState {
 struct StoredReferenceState {
     state: ReferenceResolutionState,
     sidecars: ExternalReferenceTypedSidecarRefs,
+    version: IdentityVersion,
+}
+
+#[derive(Clone, Debug)]
+struct StoredReconciliationReport {
+    report: ReconciliationReport,
     version: IdentityVersion,
 }
 
@@ -1064,6 +1200,10 @@ enum StagedOp {
     },
     SaveReferenceState {
         state: ReferenceResolutionState,
+        expected_version: Option<IdentityVersion>,
+    },
+    SaveReconciliationReport {
+        report: ReconciliationReport,
         expected_version: Option<IdentityVersion>,
     },
     SaveTypedSidecars {
@@ -3270,6 +3410,96 @@ impl IdentityReferenceStateRepository for IdentityInMemoryRuntime {
     }
 }
 
+impl IdentityReconciliationReportRepository for IdentityInMemoryRuntime {
+    fn get_report_with_version(
+        &self,
+        report_ref: ReconciliationReportRef,
+    ) -> Result<Option<Versioned<ReconciliationReport>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .reconciliation_reports
+            .get(report_ref.as_str())
+            .map(|stored| Versioned {
+                value: stored.report.clone(),
+                version: stored.version,
+            }))
+    }
+
+    fn list_reports_by_scope(
+        &self,
+        maintenance_scope_ref: MaintenanceScopeRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<ReconciliationReportRef>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(project_reconciliation_report_page(
+            store.reconciliation_reports.values().collect(),
+            page,
+            |stored| stored.report.maintenance_scope_ref == maintenance_scope_ref,
+        ))
+    }
+
+    fn list_reports_by_target(
+        &self,
+        target_ref: IdentityMaintenanceTargetRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<ReconciliationReportRef>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(project_reconciliation_report_page(
+            store.reconciliation_reports.values().collect(),
+            page,
+            |stored| stored.report.target_refs.contains(&target_ref),
+        ))
+    }
+
+    fn list_reports_by_state(
+        &self,
+        state_kind: ReconciliationReportStateKind,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityVersionedRef<ReconciliationReportRef>>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(project_reconciliation_report_page(
+            store.reconciliation_reports.values().collect(),
+            page,
+            |stored| stored.report.report_state == state_kind,
+        ))
+    }
+
+    fn save_report(
+        &self,
+        report: ReconciliationReport,
+        expected_version: Option<IdentityVersion>,
+        uow: &dyn IdentityUnitOfWork,
+    ) -> Result<IdentityVersionedRef<ReconciliationReportRef>, ApplicationError> {
+        self.stage(
+            &uow.transaction_ref(),
+            StagedOp::SaveReconciliationReport {
+                report: report.clone(),
+                expected_version,
+            },
+        )?;
+        Ok(IdentityVersionedRef {
+            value_ref: report.report_ref.clone(),
+            version: self.predicted_reconciliation_report_version(&report.report_ref)?,
+        })
+    }
+}
+
 impl TraceHandoffIntentRepository for IdentityInMemoryRuntime {
     fn get_handoff_intent_with_version(
         &self,
@@ -3597,60 +3827,150 @@ impl IdentityReadVisibilityRepository for IdentityInMemoryRuntime {
 
     fn resolve_report_read(
         &self,
-        _report_ref: identity_contracts::refs::ReconciliationReportRef,
+        report_ref: identity_contracts::refs::ReconciliationReportRef,
         _consumer_ref: ConsumerRef,
         _visibility_context_ref: VisibilityContextRef,
     ) -> Result<Option<IdentityVisibilityAccessSummary>, ApplicationError> {
-        Ok(None)
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store.report_read_access.get(report_ref.as_str()).cloned())
     }
 
     fn resolve_reconciliation_scope_read(
         &self,
-        _maintenance_scope_ref: identity_contracts::refs::MaintenanceScopeRef,
+        maintenance_scope_ref: identity_contracts::refs::MaintenanceScopeRef,
         _consumer_ref: ConsumerRef,
         _visibility_context_ref: VisibilityContextRef,
     ) -> Result<Option<IdentityVisibilityAccessSummary>, ApplicationError> {
-        Ok(None)
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .reconciliation_scope_read_access
+            .get(&maintenance_scope_key(&maintenance_scope_ref))
+            .cloned())
     }
 
     fn resolve_projection_state_read(
         &self,
-        _projection_ref: IdentityProjectionRef,
-        _projection_state_ref: Option<ProjectionStateRef>,
+        projection_ref: IdentityProjectionRef,
+        projection_state_ref: Option<ProjectionStateRef>,
         _consumer_ref: ConsumerRef,
         _visibility_context_ref: VisibilityContextRef,
     ) -> Result<Option<IdentityVisibilityAccessSummary>, ApplicationError> {
-        Ok(None)
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .projection_state_read_access
+            .get(&projection_state_access_key(
+                &projection_ref,
+                projection_state_ref.as_ref(),
+            ))
+            .cloned()
+            .or_else(|| {
+                store
+                    .projection_state_read_access
+                    .get(&projection_state_access_key(&projection_ref, None))
+                    .cloned()
+            }))
     }
 
     fn resolve_reference_state_read(
         &self,
-        _external_reference_ref: ExternalReferenceRef,
-        _owner_ref: Option<IdentityReferenceOwnerRef>,
+        external_reference_ref: ExternalReferenceRef,
+        owner_ref: Option<IdentityReferenceOwnerRef>,
         _consumer_ref: ConsumerRef,
         _visibility_context_ref: VisibilityContextRef,
     ) -> Result<Option<IdentityVisibilityAccessSummary>, ApplicationError> {
-        Ok(None)
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .reference_state_read_access
+            .get(&reference_state_access_key(
+                &external_reference_ref,
+                owner_ref.as_ref(),
+            ))
+            .cloned()
+            .or_else(|| {
+                store
+                    .reference_state_read_access
+                    .get(&reference_state_access_key(&external_reference_ref, None))
+                    .cloned()
+            }))
     }
 
     fn resolve_outbox_record_read(
         &self,
-        _outbox_ref: Option<IdentityOutboxRecordRef>,
-        _subject_ref: Option<IdentityOutboxSubjectRef>,
-        _topic_key_ref: Option<TopicKeyRef>,
+        outbox_ref: Option<IdentityOutboxRecordRef>,
+        subject_ref: Option<IdentityOutboxSubjectRef>,
+        topic_key_ref: Option<TopicKeyRef>,
         _consumer_ref: ConsumerRef,
         _visibility_context_ref: VisibilityContextRef,
     ) -> Result<Option<IdentityVisibilityAccessSummary>, ApplicationError> {
-        Ok(None)
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .outbox_record_read_access
+            .get(&outbox_record_access_key(
+                outbox_ref.as_ref(),
+                subject_ref.as_ref(),
+                topic_key_ref.as_ref(),
+            ))
+            .cloned()
+            .or_else(|| {
+                store
+                    .outbox_record_read_access
+                    .get(&outbox_record_access_key(outbox_ref.as_ref(), None, None))
+                    .cloned()
+            }))
+    }
+
+    fn resolve_outbox_trace_page_read(
+        &self,
+        trace_record_ref: IdentityTraceRecordRef,
+        _consumer_ref: ConsumerRef,
+        _visibility_context_ref: VisibilityContextRef,
+    ) -> Result<Option<IdentityVisibilityAccessSummary>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .outbox_trace_page_read_access
+            .get(trace_record_ref.as_str())
+            .cloned())
     }
 
     fn resolve_handoff_intent_read(
         &self,
-        _intent_ref: TraceHandoffIntentRef,
+        intent_ref: TraceHandoffIntentRef,
         _consumer_ref: ConsumerRef,
         _visibility_context_ref: VisibilityContextRef,
     ) -> Result<Option<IdentityVisibilityAccessSummary>, ApplicationError> {
-        Ok(None)
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .handoff_intent_read_access
+            .get(intent_ref.as_str())
+            .cloned())
     }
 
     fn get_visibility_decision(
@@ -3751,11 +4071,22 @@ impl IdentityOutboxRepository for IdentityInMemoryRuntime {
             .store
             .lock()
             .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
-        Ok(project_outbox_page(
-            store.outbox_records.values().collect(),
-            page,
-            |stored| stored.record.matches_subject(&subject_ref),
-        ))
+        let mut items: Vec<_> = store
+            .outbox_subject_index
+            .iter()
+            .filter(|(key, _)| key.starts_with(&format!("{}::", subject_ref.as_str())))
+            .map(|(_, value)| IdentityVersionedRef {
+                value_ref: IdentityOutboxRecordRef::new(value.clone()),
+                version: store
+                    .outbox_records
+                    .get(value)
+                    .map(|stored| stored.version)
+                    .unwrap_or(IdentityVersion::new(1)),
+            })
+            .collect();
+        items.sort_by(|left, right| left.value_ref.as_str().cmp(right.value_ref.as_str()));
+        let (items, next_cursor) = paged(items, page, "outbox-subject");
+        Ok(Page { items, next_cursor })
     }
 
     fn find_outbox_records_by_trace(
@@ -3768,11 +4099,22 @@ impl IdentityOutboxRepository for IdentityInMemoryRuntime {
             .store
             .lock()
             .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
-        Ok(project_outbox_page(
-            store.outbox_records.values().collect(),
-            page,
-            |stored| stored.record.trace_record_ref == trace_record_ref,
-        ))
+        let mut items: Vec<_> = store
+            .outbox_trace_index
+            .iter()
+            .filter(|(key, _)| key.starts_with(&format!("{}::", trace_record_ref.as_str())))
+            .map(|(_, value)| IdentityVersionedRef {
+                value_ref: IdentityOutboxRecordRef::new(value.clone()),
+                version: store
+                    .outbox_records
+                    .get(value)
+                    .map(|stored| stored.version)
+                    .unwrap_or(IdentityVersion::new(1)),
+            })
+            .collect();
+        items.sort_by(|left, right| left.value_ref.as_str().cmp(right.value_ref.as_str()));
+        let (items, next_cursor) = paged(items, page, "outbox-trace");
+        Ok(Page { items, next_cursor })
     }
 
     fn save_outbox_record(
@@ -4437,6 +4779,10 @@ fn apply_op(
             state,
             expected_version,
         } => apply_save_reference_state(store, state, expected_version),
+        StagedOp::SaveReconciliationReport {
+            report,
+            expected_version,
+        } => apply_save_reconciliation_report(store, report, expected_version),
         StagedOp::SaveTypedSidecars {
             reference_ref,
             sidecars,
@@ -5118,6 +5464,44 @@ fn apply_save_typed_sidecars(
     Ok(())
 }
 
+fn apply_save_reconciliation_report(
+    store: &mut RuntimeStore,
+    report: ReconciliationReport,
+    expected_version: Option<IdentityVersion>,
+) -> Result<(), ApplicationError> {
+    match (
+        store.reconciliation_reports.get(report.report_ref.as_str()),
+        expected_version,
+    ) {
+        (None, None) => {
+            store.reconciliation_reports.insert(
+                report.report_ref.as_str().to_owned(),
+                StoredReconciliationReport {
+                    report,
+                    version: IdentityVersion::new(1),
+                },
+            );
+            Ok(())
+        }
+        (Some(existing), Some(expected)) if existing.version == expected => {
+            store.reconciliation_reports.insert(
+                report.report_ref.as_str().to_owned(),
+                StoredReconciliationReport {
+                    report,
+                    version: IdentityVersion::new(expected.get() + 1),
+                },
+            );
+            Ok(())
+        }
+        (None, Some(_)) => Err(ApplicationError::not_found(
+            "reconciliation report not found for update",
+        )),
+        _ => Err(ApplicationError::optimistic_version_conflict(
+            "reconciliation report version mismatch",
+        )),
+    }
+}
+
 fn apply_save_handoff_intent(
     store: &mut RuntimeStore,
     intent: TraceHandoffIntent,
@@ -5624,6 +6008,39 @@ where
     Page { items, next_cursor }
 }
 
+fn project_reconciliation_report_page<F>(
+    entries: Vec<&StoredReconciliationReport>,
+    page: IdentityRepositoryPage,
+    predicate: F,
+) -> Page<IdentityVersionedRef<ReconciliationReportRef>>
+where
+    F: Fn(&StoredReconciliationReport) -> bool,
+{
+    let filtered: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| predicate(entry))
+        .collect();
+    let start = parse_page_cursor(page.cursor.as_ref(), "report");
+    let items: Vec<_> = filtered
+        .iter()
+        .skip(start)
+        .take(page.limit as usize)
+        .map(|entry| IdentityVersionedRef {
+            value_ref: entry.report.report_ref.clone(),
+            version: entry.version,
+        })
+        .collect();
+    let next_cursor = if start + items.len() < filtered.len() {
+        Some(IdentityRepositoryCursor::new(format!(
+            "report:{}",
+            start + items.len()
+        )))
+    } else {
+        None
+    };
+    Page { items, next_cursor }
+}
+
 fn project_reference_page<F>(
     entries: Vec<&StoredReferenceState>,
     page: IdentityRepositoryPage,
@@ -5780,6 +6197,58 @@ fn audit_access_key(
         "{}::{}",
         audit_subject_ref.as_str(),
         audit_scope_ref.as_str()
+    )
+}
+
+fn maintenance_scope_key(maintenance_scope_ref: &MaintenanceScopeRef) -> String {
+    identity_source_key(&maintenance_scope_ref.scope_ref)
+}
+
+fn projection_state_access_key(
+    projection_ref: &IdentityProjectionRef,
+    projection_state_ref: Option<&ProjectionStateRef>,
+) -> String {
+    match projection_state_ref {
+        Some(projection_state_ref) => format!(
+            "{}::{}",
+            projection_ref.as_str(),
+            projection_state_ref.projection_state_id.as_str()
+        ),
+        None => format!("{}::none", projection_ref.as_str()),
+    }
+}
+
+fn reference_state_access_key(
+    external_reference_ref: &ExternalReferenceRef,
+    owner_ref: Option<&IdentityReferenceOwnerRef>,
+) -> String {
+    match owner_ref {
+        Some(owner_ref) => format!(
+            "{}::{}::{:?}",
+            external_reference_key(external_reference_ref),
+            identity_source_key(&owner_ref.owner_ref),
+            owner_ref.owner_kind
+        ),
+        None => format!("{}::none", external_reference_key(external_reference_ref)),
+    }
+}
+
+fn outbox_record_access_key(
+    outbox_ref: Option<&IdentityOutboxRecordRef>,
+    subject_ref: Option<&IdentityOutboxSubjectRef>,
+    topic_key_ref: Option<&TopicKeyRef>,
+) -> String {
+    let outbox_token = outbox_ref.map(|value| value.as_str()).unwrap_or("none");
+    let subject_token = subject_ref.map(|value| value.as_str()).unwrap_or("none");
+    let topic_token = topic_key_ref.map(|value| value.as_str()).unwrap_or("none");
+    format!("{outbox_token}::{subject_token}::{topic_token}")
+}
+
+fn identity_source_key(source_ref: &IdentitySourceRef) -> String {
+    format!(
+        "{:?}::{}",
+        source_ref.source_owner,
+        source_ref.external_ref.as_str()
     )
 }
 
@@ -6014,31 +6483,38 @@ mod tests {
     };
     use identity_contracts::queries::{
         GetGlobalLifecycleSummaryRequest, GetGlobalMemberAnchorRequest,
-        GetRoleCapabilitySummaryRequest, IdentityPublicPageRequest, IdentityQueryRequest,
-        IdentityTraceReadSelector, ListCareerRecordsRequest, ListMemoryReferencesRequest,
-        ReadAuditTrailRequest, ReadIdentityTraceRequest, ReadMemberSummaryRequest,
+        GetIdentityOutboxStateRequest, GetProjectionStateRequest,
+        GetReferenceResolutionStateRequest, GetRoleCapabilitySummaryRequest,
+        GetTraceHandoffStateRequest, IdentityOutboxListSelector, IdentityPublicPageRequest,
+        IdentityQueryRequest, IdentityTraceReadSelector, ListCareerRecordsRequest,
+        ListMemoryReferencesRequest, ListPendingIdentityOutboxRequest, ReadAuditTrailRequest,
+        ReadIdentityTraceRequest, ReadMemberSummaryRequest, ReadReconciliationReportRequest,
     };
     use identity_contracts::receipts::MaintenanceIssueRef;
     use identity_contracts::refs::{
         ArchiveHandoffRef, ArchiveRef, CapabilityEvidenceKind, CapabilityEvidenceRef,
         CapabilitySourceRef, CareerAppendMaterialKind, CareerAppendMaterialMarker,
         CareerAppendReasonKind, CareerAppendReasonRef, CareerRecordChangeIntent,
-        CareerRecordStateKind as PublicCareerRecordStateKind, ExternalReferenceSafeSummaryRef,
-        ExternalSourceVersionRef, GlobalLifecycleStateKind as PublicLifecycleStateKind,
-        HandoffAttemptRef, HandoffReasonRef, HandoffScopeRef,
-        HandoffStateKind as PublicHandoffStateKind, HandoffTargetRef, IdentityApiRequestMarkerRef,
-        IdentityCanonicalRequestMarkerRef, IdentityChangeKind, IdentityConsumerReceiptRef,
-        IdentityJobReportRef, IdentityJobRunRef, IdentityJobScopeMarkerRef,
+        CareerRecordStateKind as PublicCareerRecordStateKind, ExternalReferenceKind,
+        ExternalReferenceSafeSummaryRef, ExternalSourceVersionRef,
+        GlobalLifecycleStateKind as PublicLifecycleStateKind, HandoffAttemptRef, HandoffReasonRef,
+        HandoffScopeRef, HandoffStateKind as PublicHandoffStateKind, HandoffTargetRef,
+        IdentityApiRequestMarkerRef, IdentityCanonicalRequestMarkerRef, IdentityChangeKind,
+        IdentityConsumerReceiptRef, IdentityDegradedMarkerRef, IdentityJobReportRef,
+        IdentityJobRunRef, IdentityJobScopeMarkerRef, IdentityMaintenanceTargetRef,
         IdentityOperationChannel, IdentityOutboxPayloadMarkerRef, IdentityReadSubjectRef,
         IdentityReadSurfaceKind, IdentityRedactionMarkerRef, IdentityRequestDigestValue,
         IdentityStoredResultRef, IdentityTimestamp, LifecycleReasonKind, LifecycleReasonRef,
         MemoryRef, MemoryReferenceChangeIntent, MemoryReferenceChangeMaterialKind,
         MemoryReferenceChangeMaterialMarker, MemoryReferenceReasonKind, MemoryReferenceReasonRef,
         MemoryReferenceSourceKind, MemoryReferenceSourceRef,
-        MemoryReferenceStateKind as PublicMemoryReferenceStateKind, ProjectParticipationRef,
-        ProjectionFreshnessMarkerRef, RoleCapabilityChangeMaterialKind,
-        RoleCapabilityChangeMaterialMarker, RoleCapabilityChangeReasonKind,
-        RoleCapabilityChangeReasonRef, RoleCapabilitySourceKind,
+        MemoryReferenceStateKind as PublicMemoryReferenceStateKind,
+        OutboxStateKind as PublicOutboxStateKind, ProjectParticipationRef,
+        ProjectionFreshnessMarkerRef, ProjectionStateKind as PublicProjectionStateKind,
+        ReconciliationReportRef,
+        ReferenceResolutionStateKind as PublicReferenceResolutionStateKind,
+        RoleCapabilityChangeMaterialKind, RoleCapabilityChangeMaterialMarker,
+        RoleCapabilityChangeReasonKind, RoleCapabilityChangeReasonRef, RoleCapabilitySourceKind,
         RoleCapabilitySummaryStateKind as PublicRoleCapabilitySummaryStateKind, RoleSourceRef,
         TopicKeyRef, TraceHandoffSafeMaterialRef, VisibilityContextRef, WorkSourceKind,
         WorkSourceRef,
@@ -7545,6 +8021,10 @@ mod tests {
             memory_reference_repository: runtime,
             trace_record_repository: runtime,
             audit_trail_repository: runtime,
+            reference_state_repository: runtime,
+            reconciliation_report_repository: runtime,
+            outbox_repository: runtime,
+            handoff_intent_repository: runtime,
             truth_change_subject_mapper: runtime,
             degradation_mapper:
                 &identity_application::DefaultIdentityQueryMaterialDegradationMapper,
@@ -7717,6 +8197,74 @@ mod tests {
             visibility_result_ref: visibility_result(&format!("trace-visibility-{token}")),
             degraded_marker_ref: None,
             degraded_kind: None,
+        }
+    }
+
+    fn operations_access_summary(
+        token: &str,
+        access_state: IdentityVisibilityAccessState,
+    ) -> IdentityVisibilityAccessSummary {
+        IdentityVisibilityAccessSummary {
+            read_subject_ref: IdentityReadSubjectRef::new(format!("ops-read-subject:{token}")),
+            consumer_ref: ConsumerRef::new("consumer-1"),
+            actor_ref: Some(ActorRef::new("actor-1", ActorKind::Human)),
+            visibility_context_ref: VisibilityContextRef::new("context-1"),
+            scope_ref: scope_ref("ops-scope-a"),
+            access_state,
+            redaction_profile_ref: None,
+            redaction_marker_ref: matches!(
+                access_state,
+                IdentityVisibilityAccessState::Redacted | IdentityVisibilityAccessState::NotVisible
+            )
+            .then(|| IdentityRedactionMarkerRef::new(format!("ops-redaction:{token}"))),
+            visibility_result_ref: visibility_result(&format!("ops-visibility-{token}")),
+            degraded_marker_ref: matches!(
+                access_state,
+                IdentityVisibilityAccessState::Degraded
+                    | IdentityVisibilityAccessState::Unavailable
+            )
+            .then(|| IdentityDegradedMarkerRef::new(format!("ops-degraded:{token}"))),
+            degraded_kind: matches!(
+                access_state,
+                IdentityVisibilityAccessState::Degraded
+                    | IdentityVisibilityAccessState::Unavailable
+            )
+            .then_some(IdentityDegradedKind::DependencyUnavailable),
+        }
+    }
+
+    fn reconciliation_report(
+        token: &str,
+        scope_ref: identity_contracts::refs::MaintenanceScopeRef,
+        report_state: identity_domain::reconciliation::ReconciliationReportStateKind,
+    ) -> ReconciliationReport {
+        let target_refs = vec![IdentityMaintenanceTargetRef::new(format!("target-{token}"))];
+        let finding_refs = matches!(
+            report_state,
+            identity_domain::reconciliation::ReconciliationReportStateKind::FindingDetected
+        )
+        .then(|| {
+            vec![identity_contracts::refs::ReconciliationFindingRef::new(
+                format!("finding-{token}"),
+            )]
+        })
+        .unwrap_or_default();
+        let issue_refs = matches!(
+            report_state,
+            identity_domain::reconciliation::ReconciliationReportStateKind::Partial
+                | identity_domain::reconciliation::ReconciliationReportStateKind::Failed
+        )
+        .then(|| vec![MaintenanceIssueRef::new(format!("issue-{token}"))])
+        .unwrap_or_default();
+        ReconciliationReport {
+            report_ref: ReconciliationReportRef::new(format!("report-{token}")),
+            maintenance_scope_ref: scope_ref,
+            target_refs,
+            finding_refs,
+            issue_refs,
+            report_state,
+            generated_by_ref: Some(ActorRef::new("actor-1", ActorKind::Human)),
+            generated_at: timestamp(1),
         }
     }
 
@@ -8357,6 +8905,426 @@ mod tests {
         assert_eq!(active_after, 0);
         assert_eq!(staged_before, 0);
         assert_eq!(staged_after, 0);
+    }
+
+    #[test]
+    fn get_projection_state_stale_returns_freshness_marker_without_write() {
+        let state = projection_state("ops-stale-1");
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_projection_state(state.clone(), IdentityVersion::new(1))
+            .seed_projection_state_read_access(
+                state.projection_ref.clone(),
+                None,
+                operations_access_summary(
+                    "projection-stale-initial",
+                    IdentityVisibilityAccessState::Visible,
+                ),
+            )
+            .seed_projection_state_read_access(
+                state.projection_ref.clone(),
+                Some(state.projection_state_ref.clone()),
+                operations_access_summary(
+                    "projection-stale-final",
+                    IdentityVisibilityAccessState::Visible,
+                ),
+            )
+            .build();
+        let service = query_service(&runtime);
+        let active_before = runtime.active_write_transactions().expect("active writes");
+        let staged_before = runtime.staged_write_count().expect("staged writes");
+
+        let response = service
+            .get_projection_state(
+                single_query_request(
+                    "GetProjectionState",
+                    GetProjectionStateRequest {
+                        projection_ref: state.projection_ref.clone(),
+                        projection_state_ref: None,
+                        consumer_ref: ConsumerRef::new("consumer-1"),
+                    },
+                ),
+                named_query_context("GetProjectionState", "stale"),
+            )
+            .expect("projection query");
+
+        let active_after = runtime.active_write_transactions().expect("active writes");
+        let staged_after = runtime.staged_write_count().expect("staged writes");
+
+        assert_eq!(
+            response.surface.disposition,
+            IdentityQueryDisposition::StaleVisible
+        );
+        assert_eq!(
+            response
+                .surface
+                .projection_freshness_ref
+                .as_ref()
+                .expect("freshness marker")
+                .state_kind,
+            "stale"
+        );
+        assert_eq!(
+            response.body.expect("projection state view").state_kind,
+            Some(PublicProjectionStateKind::Stale)
+        );
+        assert_eq!(active_before, 0);
+        assert_eq!(active_after, 0);
+        assert_eq!(staged_before, 0);
+        assert_eq!(staged_after, 0);
+    }
+
+    #[test]
+    fn get_reference_resolution_state_returns_bundle_without_write() {
+        let state = reference_state_resolved();
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_reference_state(
+                state.clone(),
+                ExternalReferenceTypedSidecarRefs {
+                    role_capability_safe_summary_ref: None,
+                    career_safe_summary_ref: None,
+                    memory_safe_summary_ref: None,
+                    governance_basis_summary_ref: None,
+                    evidence_summary_ref: None,
+                    source_version_ref: Some(ExternalSourceVersionRef::new(identity_source_ref(
+                        IdentitySourceOwner::MethodLibrary,
+                        "query-reference-sidecar-version-1",
+                    ))),
+                },
+                IdentityVersion::new(1),
+            )
+            .seed_reference_state_read_access(
+                state.external_reference_ref.clone(),
+                None,
+                operations_access_summary(
+                    "reference-visible",
+                    IdentityVisibilityAccessState::Visible,
+                ),
+            )
+            .build();
+        let service = query_service(&runtime);
+        let active_before = runtime.active_write_transactions().expect("active writes");
+        let staged_before = runtime.staged_write_count().expect("staged writes");
+
+        let response = service
+            .get_reference_resolution_state(
+                single_query_request(
+                    "GetReferenceResolutionState",
+                    GetReferenceResolutionStateRequest {
+                        external_reference_ref: state.external_reference_ref.clone(),
+                        owner_ref: None,
+                        consumer_ref: ConsumerRef::new("consumer-1"),
+                    },
+                ),
+                named_query_context("GetReferenceResolutionState", "visible"),
+            )
+            .expect("reference query");
+
+        let active_after = runtime.active_write_transactions().expect("active writes");
+        let staged_after = runtime.staged_write_count().expect("staged writes");
+        let body = response.body.expect("reference state view");
+
+        assert_eq!(
+            response.surface.disposition,
+            IdentityQueryDisposition::Visible
+        );
+        assert_eq!(
+            body.state_kind,
+            Some(PublicReferenceResolutionStateKind::Resolved)
+        );
+        assert!(body.sidecar_refs.is_some());
+        assert_eq!(active_before, 0);
+        assert_eq!(active_after, 0);
+        assert_eq!(staged_before, 0);
+        assert_eq!(staged_after, 0);
+    }
+
+    #[test]
+    fn read_reconciliation_report_exact_visible_stays_read_only() {
+        let scope = maintenance_scope("report-query-scope-1");
+        let report = reconciliation_report(
+            "report-query-visible-1",
+            scope.clone(),
+            identity_domain::reconciliation::ReconciliationReportStateKind::Generated,
+        );
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_reconciliation_report(report.clone(), IdentityVersion::new(1))
+            .seed_reconciliation_scope_read_access(
+                scope.clone(),
+                operations_access_summary(
+                    "report-scope-visible",
+                    IdentityVisibilityAccessState::Visible,
+                ),
+            )
+            .seed_report_read_access(
+                report.report_ref.clone(),
+                operations_access_summary(
+                    "report-item-visible",
+                    IdentityVisibilityAccessState::Visible,
+                ),
+            )
+            .build();
+        let service = query_service(&runtime);
+        let active_before = runtime.active_write_transactions().expect("active writes");
+        let staged_before = runtime.staged_write_count().expect("staged writes");
+
+        let response = service
+            .read_reconciliation_report(
+                single_query_request(
+                    "ReadReconciliationReport",
+                    ReadReconciliationReportRequest {
+                        maintenance_scope_ref: scope,
+                        report_ref: Some(report.report_ref.clone()),
+                        consumer_ref: ConsumerRef::new("consumer-1"),
+                    },
+                ),
+                named_query_context("ReadReconciliationReport", "exact-visible"),
+            )
+            .expect("report query");
+
+        let active_after = runtime.active_write_transactions().expect("active writes");
+        let staged_after = runtime.staged_write_count().expect("staged writes");
+
+        assert_eq!(
+            response.surface.disposition,
+            IdentityQueryDisposition::Visible
+        );
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(response.items[0].report_ref, report.report_ref);
+        assert_eq!(active_before, 0);
+        assert_eq!(active_after, 0);
+        assert_eq!(staged_before, 0);
+        assert_eq!(staged_after, 0);
+    }
+
+    #[test]
+    fn list_pending_identity_outbox_by_trace_empty_copies_page_access_without_write() {
+        let trace_record_ref = IdentityTraceRecordRef::new("trace-outbox-empty-1");
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_outbox_trace_page_read_access(
+                trace_record_ref.clone(),
+                operations_access_summary(
+                    "outbox-trace-empty",
+                    IdentityVisibilityAccessState::Visible,
+                ),
+            )
+            .build();
+        let service = query_service(&runtime);
+        let active_before = runtime.active_write_transactions().expect("active writes");
+        let staged_before = runtime.staged_write_count().expect("staged writes");
+
+        let response = service
+            .list_pending_identity_outbox(
+                paged_query_request(
+                    "ListPendingIdentityOutbox",
+                    ListPendingIdentityOutboxRequest {
+                        selector: IdentityOutboxListSelector::ByTrace { trace_record_ref },
+                        consumer_ref: ConsumerRef::new("consumer-1"),
+                    },
+                ),
+                named_query_context("ListPendingIdentityOutbox", "trace-empty"),
+            )
+            .expect("outbox page query");
+
+        let active_after = runtime.active_write_transactions().expect("active writes");
+        let staged_after = runtime.staged_write_count().expect("staged writes");
+
+        assert_eq!(
+            response.surface.disposition,
+            IdentityQueryDisposition::Empty
+        );
+        assert_eq!(
+            response.surface.visibility.visibility_result_ref,
+            visibility_result("ops-visibility-outbox-trace-empty")
+        );
+        assert!(response.items.is_empty());
+        assert_eq!(active_before, 0);
+        assert_eq!(active_after, 0);
+        assert_eq!(staged_before, 0);
+        assert_eq!(staged_after, 0);
+    }
+
+    #[test]
+    fn list_pending_identity_outbox_by_trace_missing_item_uses_item_degradation() {
+        let record = outbox_record("trace-missing-1", OutboxState::pending(timestamp(1)));
+        let outbox_ref = record.outbox_record_ref.clone();
+        let trace_record_ref = record.trace_record_ref.clone();
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_outbox_record(record, IdentityVersion::new(1))
+            .seed_outbox_trace_page_read_access(
+                trace_record_ref.clone(),
+                operations_access_summary(
+                    "outbox-trace-page",
+                    IdentityVisibilityAccessState::Visible,
+                ),
+            )
+            .seed_outbox_record_read_access(
+                Some(outbox_ref.clone()),
+                None,
+                None,
+                operations_access_summary(
+                    "outbox-trace-ref",
+                    IdentityVisibilityAccessState::Visible,
+                ),
+            )
+            .build();
+        runtime
+            .shared
+            .store
+            .lock()
+            .expect("lock runtime store")
+            .outbox_records
+            .remove(outbox_ref.as_str());
+        let service = query_service(&runtime);
+
+        let response = service
+            .list_pending_identity_outbox(
+                paged_query_request(
+                    "ListPendingIdentityOutbox",
+                    ListPendingIdentityOutboxRequest {
+                        selector: IdentityOutboxListSelector::ByTrace { trace_record_ref },
+                        consumer_ref: ConsumerRef::new("consumer-1"),
+                    },
+                ),
+                named_query_context("ListPendingIdentityOutbox", "trace-missing"),
+            )
+            .expect("outbox page query");
+
+        assert_eq!(
+            response.surface.disposition,
+            IdentityQueryDisposition::Degraded
+        );
+        assert_eq!(
+            response
+                .surface
+                .degraded
+                .as_ref()
+                .expect("degraded marker")
+                .degraded_kind,
+            IdentityDegradedKind::PartialResult
+        );
+        assert!(response.items.is_empty());
+    }
+
+    #[test]
+    fn get_identity_outbox_state_returns_body_free_state_without_write() {
+        let record = outbox_record(
+            "state-visible-1",
+            OutboxState::retryable_failed(
+                identity_contracts::refs::OutboxDeliveryIssueRef::new(identity_source_ref(
+                    IdentitySourceOwner::Identity,
+                    "outbox-issue-state-visible-1",
+                )),
+                timestamp(2),
+            ),
+        );
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_outbox_record(record.clone(), IdentityVersion::new(1))
+            .seed_outbox_record_read_access(
+                Some(record.outbox_record_ref.clone()),
+                None,
+                None,
+                operations_access_summary(
+                    "outbox-state-initial",
+                    IdentityVisibilityAccessState::Visible,
+                ),
+            )
+            .seed_outbox_record_read_access(
+                Some(record.outbox_record_ref.clone()),
+                Some(record.subject_ref.clone()),
+                Some(record.topic_key_ref.clone()),
+                operations_access_summary(
+                    "outbox-state-final",
+                    IdentityVisibilityAccessState::Visible,
+                ),
+            )
+            .build();
+        let service = query_service(&runtime);
+        let active_before = runtime.active_write_transactions().expect("active writes");
+        let staged_before = runtime.staged_write_count().expect("staged writes");
+
+        let response = service
+            .get_identity_outbox_state(
+                single_query_request(
+                    "GetIdentityOutboxState",
+                    GetIdentityOutboxStateRequest {
+                        outbox_record_ref: record.outbox_record_ref.clone(),
+                        consumer_ref: ConsumerRef::new("consumer-1"),
+                    },
+                ),
+                named_query_context("GetIdentityOutboxState", "visible"),
+            )
+            .expect("outbox state query");
+
+        let active_after = runtime.active_write_transactions().expect("active writes");
+        let staged_after = runtime.staged_write_count().expect("staged writes");
+        let body = response.body.expect("outbox state view");
+
+        assert_eq!(
+            response.surface.disposition,
+            IdentityQueryDisposition::Visible
+        );
+        assert_eq!(
+            body.outbox_state_kind,
+            PublicOutboxStateKind::RetryableFailed
+        );
+        assert_eq!(active_before, 0);
+        assert_eq!(active_after, 0);
+        assert_eq!(staged_before, 0);
+        assert_eq!(staged_after, 0);
+    }
+
+    #[test]
+    fn get_trace_handoff_state_delivered_without_receipt_returns_degraded_surface() {
+        let mut intent = handoff_intent();
+        intent.handoff_state = HandoffState {
+            state_kind: identity_domain::handoff::HandoffStateKind::Delivered,
+            attempt_ref: Some(HandoffAttemptRef::new(identity_source_ref(
+                IdentitySourceOwner::Identity,
+                "handoff-attempt-invalid-1",
+            ))),
+            receipt_ref: None,
+            issue_ref: None,
+            changed_at: timestamp(2),
+        };
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_handoff_intent(intent.clone(), IdentityVersion::new(1))
+            .seed_handoff_intent_read_access(
+                intent.handoff_intent_ref.clone(),
+                operations_access_summary(
+                    "handoff-invalid",
+                    IdentityVisibilityAccessState::Visible,
+                ),
+            )
+            .build();
+        let service = query_service(&runtime);
+
+        let response = service
+            .get_trace_handoff_state(
+                single_query_request(
+                    "GetTraceHandoffState",
+                    GetTraceHandoffStateRequest {
+                        handoff_intent_ref: intent.handoff_intent_ref.clone(),
+                        consumer_ref: ConsumerRef::new("consumer-1"),
+                    },
+                ),
+                named_query_context("GetTraceHandoffState", "invalid-delivered"),
+            )
+            .expect("handoff query");
+
+        assert_eq!(
+            response.surface.disposition,
+            IdentityQueryDisposition::Degraded
+        );
+        assert_eq!(
+            response
+                .surface
+                .degraded
+                .as_ref()
+                .expect("degraded marker")
+                .degraded_kind,
+            IdentityDegradedKind::MaterialUnsafe
+        );
+        assert!(response.body.is_none());
     }
 
     #[test]

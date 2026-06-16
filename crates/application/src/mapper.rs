@@ -9,10 +9,11 @@ use identity_contracts::refs::{
     AuditScopeRef, AuditTrailRef, CareerRecordRef, ExternalReferenceRef, GlobalMemberRef,
     HandoffIssueRef, HandoffReceiptRef, IdentityAuditSubjectRef, IdentityConsumerBindingRef,
     IdentityDegradedMarkerRef, IdentityJobRunRef, IdentityOutboxRecordRef,
-    IdentityOutboxSubjectRef, IdentityProjectionRef, IdentitySourceRef, IdentityTraceRecordRef,
-    IdentityTraceSubjectRef, MemoryReferenceRef, OutboxDeliveryIssueRef,
-    RoleCapabilitySourceSnapshotRef, RoleCapabilitySummaryRef, VisibilityResultRef,
-    VisibilityScopeRef,
+    IdentityOutboxSubjectRef, IdentityProjectionRef, IdentityReferenceOwnerRef, IdentitySourceRef,
+    IdentityTraceRecordRef, IdentityTraceSubjectRef, MaintenanceScopeRef, MemoryReferenceRef,
+    OutboxDeliveryIssueRef, ProjectionStateRef, ReconciliationReportRef,
+    ReferenceResolutionStateRef, RoleCapabilitySourceSnapshotRef, RoleCapabilitySummaryRef,
+    VisibilityResultRef, VisibilityScopeRef,
 };
 use identity_contracts::refs::{
     IdentityChangeKindRef, IdentityReadSurfaceKind, IdentityTruthCursor,
@@ -455,6 +456,161 @@ impl IdentityQueryMaterialDegradationMapper for DefaultIdentityQueryMaterialDegr
                 audit_scope_ref.as_str()
             ),
             IdentityDegradedKind::PartialResult,
+        )
+    }
+
+    fn projection_state_ref_mismatch(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        projection_ref: IdentityProjectionRef,
+        requested_state_ref: ProjectionStateRef,
+        loaded_state_ref: ProjectionStateRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:projection-state-ref-mismatch:{}:{}:{}",
+                projection_ref.as_str(),
+                requested_state_ref.projection_state_id.as_str(),
+                loaded_state_ref.projection_state_id.as_str()
+            ),
+            IdentityDegradedKind::MaterialUnsafe,
+        )
+    }
+
+    fn reference_state_owner_mismatch(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        reference_ref: ExternalReferenceRef,
+        expected_owner_ref: IdentityReferenceOwnerRef,
+        loaded_owner_ref: IdentityReferenceOwnerRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:reference-owner-mismatch:{:?}:{}:{:?}:{}:{:?}:{}",
+                reference_ref.reference_kind,
+                reference_ref.source_ref.external_ref.as_str(),
+                expected_owner_ref.owner_kind,
+                expected_owner_ref.owner_ref.external_ref.as_str(),
+                loaded_owner_ref.owner_kind,
+                loaded_owner_ref.owner_ref.external_ref.as_str()
+            ),
+            IdentityDegradedKind::MaterialUnsafe,
+        )
+    }
+
+    fn reference_sidecar_degraded(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        reference_ref: ExternalReferenceRef,
+        resolution_state_ref: Option<ReferenceResolutionStateRef>,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:reference-sidecar-degraded:{:?}:{}:{}",
+                reference_ref.reference_kind,
+                reference_ref.source_ref.external_ref.as_str(),
+                resolution_state_ref
+                    .as_ref()
+                    .map(|state_ref| state_ref.resolution_state_id.as_str())
+                    .unwrap_or("none")
+            ),
+            IdentityDegradedKind::PartialResult,
+        )
+    }
+
+    fn reconciliation_report_scope_mismatch(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        report_ref: ReconciliationReportRef,
+        expected_scope_ref: MaintenanceScopeRef,
+        loaded_scope_ref: MaintenanceScopeRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:report-scope-mismatch:{}:{}:{}",
+                report_ref.as_str(),
+                expected_scope_ref.scope_ref.external_ref.as_str(),
+                loaded_scope_ref.scope_ref.external_ref.as_str()
+            ),
+            IdentityDegradedKind::MaterialUnsafe,
+        )
+    }
+
+    fn reconciliation_report_item_missing_after_list(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        report_ref: ReconciliationReportRef,
+        expected_scope_ref: MaintenanceScopeRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:report-missing:{}:{}",
+                report_ref.as_str(),
+                expected_scope_ref.scope_ref.external_ref.as_str()
+            ),
+            IdentityDegradedKind::PartialResult,
+        )
+    }
+
+    fn outbox_record_item_missing_after_list(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        outbox_ref: IdentityOutboxRecordRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!("query-material:outbox-missing:{}", outbox_ref.as_str()),
+            IdentityDegradedKind::PartialResult,
+        )
+    }
+
+    fn outbox_record_selector_mismatch(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        outbox_ref: IdentityOutboxRecordRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:outbox-selector-mismatch:{}",
+                outbox_ref.as_str()
+            ),
+            IdentityDegradedKind::MaterialUnsafe,
+        )
+    }
+
+    fn handoff_intent_empty_trace_refs(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        intent_ref: TraceHandoffIntentRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:handoff-empty-trace-refs:{}",
+                intent_ref.as_str()
+            ),
+            IdentityDegradedKind::MaterialUnsafe,
+        )
+    }
+
+    fn handoff_intent_delivered_without_receipt(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        intent_ref: TraceHandoffIntentRef,
+    ) -> IdentityQueryMaterialDegradationSummary {
+        Self::summary(
+            access,
+            format!(
+                "query-material:handoff-delivered-without-receipt:{}",
+                intent_ref.as_str()
+            ),
+            IdentityDegradedKind::MaterialUnsafe,
         )
     }
 }

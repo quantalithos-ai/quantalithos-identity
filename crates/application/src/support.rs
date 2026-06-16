@@ -1163,8 +1163,8 @@ impl IdentityVisibilityDecision {
         visibility_scope_ref: VisibilityScopeRef,
         visibility_result_ref: VisibilityResultRef,
         surface_kind: identity_contracts::refs::IdentityReadSurfaceKind,
-        degraded_marker_ref: IdentityDegradedMarkerRef,
-        degraded_kind: IdentityDegradedKind,
+        degraded_marker_ref: Option<IdentityDegradedMarkerRef>,
+        degraded_kind: Option<IdentityDegradedKind>,
         decided_at: IdentityTimestamp,
     ) -> Self {
         Self {
@@ -1176,8 +1176,8 @@ impl IdentityVisibilityDecision {
             surface_kind,
             disposition: IdentityReadDispositionKind::StaleVisible,
             redaction_marker_ref: None,
-            degraded_marker_ref: Some(degraded_marker_ref),
-            degraded_kind: Some(degraded_kind),
+            degraded_marker_ref,
+            degraded_kind,
             decided_at,
         }
     }

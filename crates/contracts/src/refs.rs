@@ -470,6 +470,74 @@ pub enum HandoffStateKind {
     Cancelled,
 }
 
+/// Public projection freshness and rebuild state kind.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionStateKind {
+    /// Projection is aligned with a known source cursor.
+    Fresh,
+    /// Projection is behind or known to be stale.
+    Stale,
+    /// Projection rebuild has been formally requested.
+    RebuildPending,
+    /// Projection was rebuilt successfully.
+    Rebuilt,
+    /// Projection may be served only in degraded form.
+    Degraded,
+    /// Projection rebuild failed.
+    RebuildFailed,
+}
+
+/// Public external reference resolution state kind.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceResolutionStateKind {
+    /// External reference was resolved with safe summary material.
+    Resolved,
+    /// External source version changed or resolution is stale.
+    Stale,
+    /// External dependency is unavailable.
+    Unavailable,
+    /// External reference is not recognized by the formal resolver boundary.
+    Unrecognized,
+    /// Reference state requires report-only reconciliation.
+    PendingReconciliation,
+    /// Refresh attempt failed.
+    RefreshFailed,
+}
+
+/// Public report-only reconciliation state kind.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationReportStateKind {
+    /// Report was generated and can be read.
+    Generated,
+    /// No finding was detected in the requested scope.
+    NoFinding,
+    /// One or more findings were detected.
+    FindingDetected,
+    /// Report is partial because part of the scope failed or was unavailable.
+    Partial,
+    /// Report generation failed.
+    Failed,
+}
+
+/// Public outbox publish lifecycle state kind.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboxStateKind {
+    /// Accepted outbox exists and is waiting for publish.
+    PendingPublish,
+    /// Publisher boundary accepted the outbox.
+    Published,
+    /// Publish failed but may be retried.
+    RetryableFailed,
+    /// Publish failed terminally.
+    Failed,
+    /// Policy skipped propagation.
+    SkippedByPolicy,
+}
+
 /// Public role capability summary state kind.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

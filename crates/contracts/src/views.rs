@@ -5,21 +5,28 @@ use serde::{Deserialize, Serialize};
 
 use crate::errors::ContractError;
 use crate::metadata::IdentityDegradedKind;
+use crate::receipts::MaintenanceIssueRef;
 use crate::refs::{
     ArchiveHandoffRef, ArchiveRef, AuditScopeRef, AuditTrailRef, CapabilityEvidenceRef,
     CapabilitySourceRef, CareerAppendReasonRef, CareerRecordRef, CareerRecordStateKind,
     CareerSafeSummaryRef, CareerSourceMarkerRef, ConsumerRef, GlobalLifecycleStateKind,
-    GlobalMemberRef, GovernanceBasisRef, IdentityAnchorReasonRef, IdentityAnchorStateKind,
-    IdentityAuditSubjectRef, IdentityChangeKindRef, IdentityChangeReasonRef,
-    IdentityDegradedMarkerRef, IdentityReadSubjectRef, IdentityReadSurfaceKind,
-    IdentityRedactionMarkerRef, IdentitySourceRef, IdentityTimestamp, IdentityTraceRecordRef,
-    IdentityTruthCursor, LifecycleReasonRef, MemberSummaryViewRef, MemoryRef,
-    MemoryReferenceReasonRef, MemoryReferenceRef, MemoryReferenceSourceRef,
-    MemoryReferenceStateKind, MemorySafeSummaryRef, ProjectParticipationRef,
-    ProjectionFreshnessMarkerRef, RedactionProfileRef, RoleCapabilitySafeSummaryRef,
-    RoleCapabilitySourceSnapshotRef, RoleCapabilitySourceStateKind, RoleCapabilitySummaryRef,
-    RoleCapabilitySummaryStateKind, RoleSourceRef, VisibilityContextRef, VisibilityResultRef,
-    VisibilityScopeRef,
+    GlobalMemberRef, GovernanceBasisRef, HandoffAttemptRef, HandoffIssueRef, HandoffReceiptRef,
+    HandoffScopeRef, HandoffStateKind, HandoffTargetRef, IdentityAnchorReasonRef,
+    IdentityAnchorStateKind, IdentityAuditSubjectRef, IdentityChangeKindRef,
+    IdentityChangeReasonRef, IdentityDegradedMarkerRef, IdentityMaintenanceTargetRef,
+    IdentityOutboxPayloadMarkerRef, IdentityOutboxRecordRef, IdentityOutboxSubjectRef,
+    IdentityProjectionCursorRef, IdentityProjectionRef, IdentityReadSubjectRef,
+    IdentityReadSurfaceKind, IdentityRedactionMarkerRef, IdentitySourceRef, IdentityTimestamp,
+    IdentityTraceRecordRef, IdentityTruthCursor, LifecycleReasonRef, MaintenanceScopeRef,
+    MemberSummaryViewRef, MemoryRef, MemoryReferenceReasonRef, MemoryReferenceRef,
+    MemoryReferenceSourceRef, MemoryReferenceStateKind, MemorySafeSummaryRef,
+    OutboxDeliveryAttemptRef, OutboxDeliveryIssueRef, OutboxStateKind, ProjectParticipationRef,
+    ProjectionFreshnessMarkerRef, ProjectionStateKind, ProjectionStateRef,
+    ReconciliationFindingRef, ReconciliationReportRef, ReconciliationReportStateKind,
+    RedactionProfileRef, ReferenceResolutionStateKind, ReferenceResolutionStateRef,
+    RoleCapabilitySafeSummaryRef, RoleCapabilitySourceSnapshotRef, RoleCapabilitySourceStateKind,
+    RoleCapabilitySummaryRef, RoleCapabilitySummaryStateKind, RoleSourceRef, TopicKeyRef,
+    TraceHandoffSafeMaterialRef, VisibilityContextRef, VisibilityResultRef, VisibilityScopeRef,
 };
 
 /// Safe summary marker for the identity anchor slice.
@@ -479,4 +486,183 @@ pub struct AuditTrailEntryView {
     pub visibility_result_ref: VisibilityResultRef,
     /// Time associated with the trace.
     pub occurred_at: IdentityTimestamp,
+}
+
+/// Public body-free projection state view.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectionStateView {
+    /// Optional stable projection state ref.
+    pub projection_state_ref: Option<ProjectionStateRef>,
+    /// Projection or derived view being inspected.
+    pub projection_ref: IdentityProjectionRef,
+    /// Optional member linked to the projection.
+    pub member_ref: Option<GlobalMemberRef>,
+    /// Optional projection freshness or rebuild state.
+    pub state_kind: Option<ProjectionStateKind>,
+    /// Optional projection source cursor marker.
+    pub source_cursor_ref: Option<IdentityProjectionCursorRef>,
+    /// Optional maintenance scope marker.
+    pub maintenance_scope_ref: Option<MaintenanceScopeRef>,
+    /// Optional safe issue marker.
+    pub issue_ref: Option<MaintenanceIssueRef>,
+    /// Optional latest checked timestamp.
+    pub checked_at: Option<IdentityTimestamp>,
+    /// Visibility result for this read surface.
+    pub visibility_result_ref: VisibilityResultRef,
+}
+
+/// Public body-free sidecar refs for one external reference bundle.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceResolutionSidecarRefsView {
+    /// Optional role capability summary safe summary ref.
+    pub role_capability_safe_summary_ref: Option<crate::refs::ExternalReferenceSafeSummaryRef>,
+    /// Optional career safe summary ref.
+    pub career_safe_summary_ref: Option<crate::refs::ExternalReferenceSafeSummaryRef>,
+    /// Optional memory safe summary ref.
+    pub memory_safe_summary_ref: Option<crate::refs::ExternalReferenceSafeSummaryRef>,
+    /// Optional governance basis summary ref.
+    pub governance_basis_summary_ref: Option<crate::refs::ExternalReferenceSafeSummaryRef>,
+    /// Optional evidence summary ref.
+    pub evidence_summary_ref: Option<crate::refs::ExternalReferenceSafeSummaryRef>,
+    /// Optional external source version ref.
+    pub source_version_ref: Option<crate::refs::ExternalSourceVersionRef>,
+}
+
+/// Public body-free external reference resolution view.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceResolutionStateView {
+    /// Optional stable resolution state ref.
+    pub resolution_state_ref: Option<ReferenceResolutionStateRef>,
+    /// External reference bundle being inspected.
+    pub external_reference_ref: crate::refs::ExternalReferenceRef,
+    /// Optional local owner of the external reference.
+    pub owner_ref: Option<crate::refs::IdentityReferenceOwnerRef>,
+    /// Optional stored resolution state.
+    pub state_kind: Option<ReferenceResolutionStateKind>,
+    /// Optional external source version marker.
+    pub source_version_ref: Option<crate::refs::ExternalSourceVersionRef>,
+    /// Optional body-free safe summary marker.
+    pub safe_summary_ref: Option<crate::refs::ExternalReferenceSafeSummaryRef>,
+    /// Optional same-bundle typed sidecar refs.
+    pub sidecar_refs: Option<ReferenceResolutionSidecarRefsView>,
+    /// Optional safe issue marker.
+    pub issue_ref: Option<MaintenanceIssueRef>,
+    /// Optional latest checked timestamp.
+    pub checked_at: Option<IdentityTimestamp>,
+    /// Visibility result for this read surface.
+    pub visibility_result_ref: VisibilityResultRef,
+}
+
+/// Public body-free reconciliation report view.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReconciliationReportView {
+    /// Stable report ref.
+    pub report_ref: ReconciliationReportRef,
+    /// Maintenance scope covered by the report.
+    pub maintenance_scope_ref: MaintenanceScopeRef,
+    /// Projection, reference, or report targets checked by the report.
+    pub target_refs: Vec<IdentityMaintenanceTargetRef>,
+    /// Body-free finding refs.
+    pub finding_refs: Vec<ReconciliationFindingRef>,
+    /// Safe issue refs.
+    pub issue_refs: Vec<MaintenanceIssueRef>,
+    /// Public report-only state kind.
+    pub report_state: ReconciliationReportStateKind,
+    /// Optional generator actor or system marker.
+    pub generated_by_ref: Option<ActorRef>,
+    /// Time the report was generated.
+    pub generated_at: IdentityTimestamp,
+    /// Visibility result for this read surface.
+    pub visibility_result_ref: VisibilityResultRef,
+}
+
+/// Public body-free outbox record view.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityOutboxRecordView {
+    /// Stable outbox record ref.
+    pub outbox_record_ref: IdentityOutboxRecordRef,
+    /// Member whose accepted change owns this outbox record.
+    pub member_ref: GlobalMemberRef,
+    /// Canonical outbound subject marker.
+    pub subject_ref: IdentityOutboxSubjectRef,
+    /// Accepted change kind marker.
+    pub change_kind_ref: IdentityChangeKindRef,
+    /// Body-free payload marker.
+    pub payload_marker_ref: IdentityOutboxPayloadMarkerRef,
+    /// Topic binding marker.
+    pub topic_key_ref: TopicKeyRef,
+    /// Accepted trace record marker.
+    pub trace_record_ref: IdentityTraceRecordRef,
+    /// Current outbox publish state.
+    pub outbox_state_kind: OutboxStateKind,
+    /// Optional publish attempt marker.
+    pub attempt_ref: Option<OutboxDeliveryAttemptRef>,
+    /// Optional safe issue marker.
+    pub issue_ref: Option<OutboxDeliveryIssueRef>,
+    /// Create timestamp.
+    pub created_at: IdentityTimestamp,
+    /// Last update timestamp.
+    pub updated_at: IdentityTimestamp,
+    /// Visibility result for this read surface.
+    pub visibility_result_ref: VisibilityResultRef,
+}
+
+/// Public body-free outbox state view.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityOutboxStateView {
+    /// Stable outbox record ref.
+    pub outbox_record_ref: IdentityOutboxRecordRef,
+    /// Canonical outbound subject marker.
+    pub subject_ref: IdentityOutboxSubjectRef,
+    /// Topic binding marker.
+    pub topic_key_ref: TopicKeyRef,
+    /// Accepted trace record marker.
+    pub trace_record_ref: IdentityTraceRecordRef,
+    /// Current outbox publish state.
+    pub outbox_state_kind: OutboxStateKind,
+    /// Optional publish attempt marker.
+    pub attempt_ref: Option<OutboxDeliveryAttemptRef>,
+    /// Optional safe issue marker.
+    pub issue_ref: Option<OutboxDeliveryIssueRef>,
+    /// Body-free payload marker.
+    pub payload_marker_ref: IdentityOutboxPayloadMarkerRef,
+    /// Latest state change timestamp.
+    pub changed_at: IdentityTimestamp,
+    /// Visibility result for this read surface.
+    pub visibility_result_ref: VisibilityResultRef,
+}
+
+/// Public body-free trace handoff state view.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TraceHandoffStateView {
+    /// Stable handoff intent ref.
+    pub handoff_intent_ref: crate::receipts::TraceHandoffIntentRef,
+    /// Member that owns the handoff intent.
+    pub member_ref: GlobalMemberRef,
+    /// Accepted trace records included in the handoff.
+    pub trace_record_refs: Vec<IdentityTraceRecordRef>,
+    /// Optional canonical audit trail marker.
+    pub audit_trail_ref: Option<AuditTrailRef>,
+    /// Handoff target boundary marker.
+    pub handoff_target_ref: HandoffTargetRef,
+    /// Handoff scope boundary marker.
+    pub handoff_scope_ref: HandoffScopeRef,
+    /// Body-free handoff material marker.
+    pub safe_material_ref: TraceHandoffSafeMaterialRef,
+    /// Current handoff lifecycle state.
+    pub handoff_state_kind: HandoffStateKind,
+    /// Optional delivery attempt marker.
+    pub attempt_ref: Option<HandoffAttemptRef>,
+    /// Optional delivery receipt marker.
+    pub receipt_ref: Option<HandoffReceiptRef>,
+    /// Optional safe issue marker.
+    pub issue_ref: Option<HandoffIssueRef>,
+    /// Create timestamp.
+    pub created_at: IdentityTimestamp,
+    /// Latest intent update timestamp.
+    pub updated_at: IdentityTimestamp,
+    /// Latest handoff state change timestamp.
+    pub changed_at: IdentityTimestamp,
+    /// Visibility result for this read surface.
+    pub visibility_result_ref: VisibilityResultRef,
 }

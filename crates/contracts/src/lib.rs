@@ -51,41 +51,51 @@ mod tests {
     };
     use crate::queries::{
         GetGlobalLifecycleSummaryRequest, GetGlobalMemberAnchorRequest,
-        GetRoleCapabilitySummaryRequest, IdentityPageResponse, IdentityPublicPageCursor,
-        IdentityPublicPageInfo, IdentityPublicPageRequest, IdentityQueryRequest,
-        IdentityQueryResponse, IdentityTraceReadSelector, ListCareerRecordsRequest,
-        ListMemoryReferencesRequest, ReadAuditTrailRequest, ReadIdentityTraceRequest,
-        ReadMemberSummaryRequest,
+        GetIdentityOutboxStateRequest, GetProjectionStateRequest,
+        GetReferenceResolutionStateRequest, GetRoleCapabilitySummaryRequest,
+        GetTraceHandoffStateRequest, IdentityOutboxListSelector, IdentityPageResponse,
+        IdentityPublicPageCursor, IdentityPublicPageInfo, IdentityPublicPageRequest,
+        IdentityQueryRequest, IdentityQueryResponse, IdentityTraceReadSelector,
+        ListCareerRecordsRequest, ListMemoryReferencesRequest, ListPendingIdentityOutboxRequest,
+        ReadAuditTrailRequest, ReadIdentityTraceRequest, ReadMemberSummaryRequest,
+        ReadReconciliationReportRequest,
     };
-    use crate::receipts::TraceHandoffIntentRef;
+    use crate::receipts::{MaintenanceIssueRef, TraceHandoffIntentRef};
     use crate::refs::{
         ArchiveHandoffRef, ArchiveRef, AuditCursorRef, AuditScopeRef, AuditTrailRef,
         CapabilityEvidenceKind, CapabilityEvidenceRef, CapabilitySourceRef,
         CareerAppendMaterialKind, CareerAppendMaterialMarker, CareerAppendReasonKind,
         CareerAppendReasonRef, CareerRecordChangeIntent, CareerRecordId, CareerRecordRef,
         CareerRecordStateKind, CareerSafeSummaryRef, CareerSourceMarkerRef, ConsumerRef,
-        ExternalSourceRef, GlobalLifecycleStateKind, GlobalMemberId, GlobalMemberRef,
-        GovernanceBasisRef, HandoffReasonRef, HandoffReceiptRef, HandoffScopeRef, HandoffStateKind,
+        ExternalReferenceKind, ExternalReferenceRef, ExternalReferenceSafeSummaryRef,
+        ExternalSourceRef, ExternalSourceVersionRef, GlobalLifecycleStateKind, GlobalMemberId,
+        GlobalMemberRef, GovernanceBasisKind, GovernanceBasisRef, HandoffAttemptRef,
+        HandoffIssueRef, HandoffReasonRef, HandoffReceiptRef, HandoffScopeRef, HandoffStateKind,
         HandoffTargetRef, IdentityAnchorReasonKind, IdentityAnchorReasonRef,
         IdentityApiRequestMarkerRef, IdentityAuditSubjectRef, IdentityCanonicalRequestMarkerRef,
         IdentityChangeKind, IdentityChangeKindRef, IdentityChangeReasonRef,
         IdentityConsumerBindingRef, IdentityConsumerReceiptRef, IdentityDegradedMarkerRef,
         IdentityJobCursorRef, IdentityJobReportRef, IdentityJobRunMetadataRef, IdentityJobRunRef,
         IdentityJobScopeMarkerRef, IdentityMaintenanceTargetRef, IdentityOutboxPayloadMarkerRef,
-        IdentityOutboxRecordRef, IdentityOutboxSubjectRef, IdentityProjectionRef,
-        IdentityReadSubjectRef, IdentityReadSurfaceKind, IdentityRedactionMarkerRef,
+        IdentityOutboxRecordRef, IdentityOutboxSubjectRef, IdentityProjectionCursorRef,
+        IdentityProjectionRef, IdentityReadSubjectRef, IdentityReadSurfaceKind,
+        IdentityRedactionMarkerRef, IdentityReferenceOwnerKind, IdentityReferenceOwnerRef,
         IdentityRequestDigestValue, IdentitySourceEventRef, IdentitySourceOwner,
         IdentityStoredResultRef, IdentityTimestamp, IdentityTraceContextRef,
         IdentityTraceRecordRef, IdentityTraceSubjectRef, IdentityTruthCursor, LifecycleReasonKind,
-        LifecycleReasonRef, MemberSummaryViewRef, MemoryRef, MemoryReferenceChangeIntent,
-        MemoryReferenceChangeMaterialKind, MemoryReferenceChangeMaterialMarker, MemoryReferenceId,
-        MemoryReferenceReasonKind, MemoryReferenceReasonRef, MemoryReferenceRef,
-        MemoryReferenceSourceKind, MemoryReferenceSourceRef, MemoryReferenceStateKind,
-        MemorySafeSummaryRef, ProjectParticipationRef, ProjectionFreshnessMarkerRef,
-        ReconciliationReportRef, RoleCapabilityChangeMaterialKind,
-        RoleCapabilityChangeMaterialMarker, RoleCapabilityChangeReasonKind,
-        RoleCapabilityChangeReasonRef, RoleCapabilitySafeSummaryRef, RoleCapabilitySourceKind,
-        RoleCapabilitySourceRef, RoleCapabilitySourceSnapshotId, RoleCapabilitySourceSnapshotRef,
+        LifecycleReasonRef, MaintenanceScopeRef, MemberSummaryViewRef, MemoryRef,
+        MemoryReferenceChangeIntent, MemoryReferenceChangeMaterialKind,
+        MemoryReferenceChangeMaterialMarker, MemoryReferenceId, MemoryReferenceReasonKind,
+        MemoryReferenceReasonRef, MemoryReferenceRef, MemoryReferenceSourceKind,
+        MemoryReferenceSourceRef, MemoryReferenceStateKind, MemorySafeSummaryRef,
+        OutboxDeliveryAttemptRef, OutboxDeliveryIssueRef, OutboxStateKind, ProjectParticipationRef,
+        ProjectionFreshnessMarkerRef, ProjectionStateId, ProjectionStateKind, ProjectionStateRef,
+        ReconciliationFindingRef, ReconciliationReportRef, ReconciliationReportStateKind,
+        ReferenceResolutionStateId, ReferenceResolutionStateKind, ReferenceResolutionStateRef,
+        RoleCapabilityChangeMaterialKind, RoleCapabilityChangeMaterialMarker,
+        RoleCapabilityChangeReasonKind, RoleCapabilityChangeReasonRef,
+        RoleCapabilitySafeSummaryRef, RoleCapabilitySourceKind, RoleCapabilitySourceRef,
+        RoleCapabilitySourceSnapshotId, RoleCapabilitySourceSnapshotRef,
         RoleCapabilitySourceStateKind, RoleCapabilitySummaryId, RoleCapabilitySummaryRef,
         RoleCapabilitySummaryStateKind, RoleSourceRef, TopicKeyRef, TraceHandoffSafeMaterialRef,
         VisibilityContextRef, VisibilityResultRef, VisibilityScopeRef, WorkSourceKind,
@@ -93,9 +103,12 @@ mod tests {
     };
     use crate::views::{
         AuditTrailEntryView, CareerRecordView, GlobalLifecycleSummaryView, GlobalMemberAnchorView,
-        IdentityReadMaterialKind, IdentityReadMaterialMarker, IdentityTraceRecordView,
-        IdentityVisibilityAccessState, IdentityVisibilityAccessSummary, MemberSummarySliceKind,
-        MemberSummarySliceRef, MemberSummaryView, MemoryReferenceView, RoleCapabilitySummaryView,
+        IdentityOutboxRecordView, IdentityOutboxStateView, IdentityReadMaterialKind,
+        IdentityReadMaterialMarker, IdentityTraceRecordView, IdentityVisibilityAccessState,
+        IdentityVisibilityAccessSummary, MemberSummarySliceKind, MemberSummarySliceRef,
+        MemberSummaryView, MemoryReferenceView, ProjectionStateView, ReconciliationReportView,
+        ReferenceResolutionSidecarRefsView, ReferenceResolutionStateView,
+        RoleCapabilitySummaryView, TraceHandoffStateView,
     };
 
     fn roundtrip<T>(value: &T)
@@ -637,6 +650,44 @@ mod tests {
                 audit_cursor_ref: Some(AuditCursorRef::new("audit-cursor-1")),
                 consumer_ref: sample_consumer_ref(),
             },
+            GetProjectionStateRequest {
+                projection_ref: IdentityProjectionRef::new("projection-1"),
+                projection_state_ref: Some(ProjectionStateRef::from_id(
+                    ProjectionStateId::new("projection-state-1".to_owned())
+                        .expect("projection state id"),
+                )),
+                consumer_ref: sample_consumer_ref(),
+            },
+            GetReferenceResolutionStateRequest {
+                external_reference_ref: ExternalReferenceRef::new(
+                    ExternalReferenceKind::MethodSource,
+                    sample_identity_source_ref(),
+                ),
+                owner_ref: Some(IdentityReferenceOwnerRef::new(
+                    IdentityReferenceOwnerKind::Maintenance,
+                    sample_identity_source_ref(),
+                )),
+                consumer_ref: sample_consumer_ref(),
+            },
+            ReadReconciliationReportRequest {
+                maintenance_scope_ref: MaintenanceScopeRef::new(sample_identity_source_ref()),
+                report_ref: Some(ReconciliationReportRef::new("report-1")),
+                consumer_ref: sample_consumer_ref(),
+            },
+            ListPendingIdentityOutboxRequest {
+                selector: IdentityOutboxListSelector::ByTrace {
+                    trace_record_ref: IdentityTraceRecordRef::new("trace-record-1"),
+                },
+                consumer_ref: sample_consumer_ref(),
+            },
+            GetIdentityOutboxStateRequest {
+                outbox_record_ref: IdentityOutboxRecordRef::new("outbox-record-1"),
+                consumer_ref: sample_consumer_ref(),
+            },
+            GetTraceHandoffStateRequest {
+                handoff_intent_ref: TraceHandoffIntentRef::new("handoff-intent-1"),
+                consumer_ref: sample_consumer_ref(),
+            },
         );
 
         roundtrip(&query_requests.0);
@@ -647,6 +698,12 @@ mod tests {
         roundtrip(&query_requests.5);
         roundtrip(&query_requests.6);
         roundtrip(&query_requests.7);
+        roundtrip(&query_requests.8);
+        roundtrip(&query_requests.9);
+        roundtrip(&query_requests.10);
+        roundtrip(&query_requests.11);
+        roundtrip(&query_requests.12);
+        roundtrip(&query_requests.13);
 
         roundtrip(&IdentityVisibilityAccessSummary {
             read_subject_ref: IdentityReadSubjectRef::new("read-subject-1"),
@@ -705,9 +762,13 @@ mod tests {
             member_ref: sample_member_ref(),
             lifecycle_state_kind: GlobalLifecycleStateKind::Available,
             reason_ref: Some(sample_lifecycle_reason_ref()),
-            basis_ref: Some(GovernanceBasisRef::new(
-                ExternalSourceRef::new("basis-1".to_owned()).expect("basis ext ref"),
-            )),
+            basis_ref: Some(
+                GovernanceBasisRef::new(
+                    GovernanceBasisKind::GateDecision,
+                    ExternalSourceRef::new("basis-1".to_owned()).expect("basis ext ref"),
+                )
+                .expect("governance basis ref"),
+            ),
             changed_by_ref: Some(sample_actor_ref()),
             changed_at: IdentityTimestamp::from_clock(11).expect("valid timestamp"),
             member_summary_view_ref: Some(MemberSummaryViewRef::new("view-1")),
@@ -814,9 +875,13 @@ mod tests {
             source_cursor_ref: IdentityTruthCursor::new("truth-cursor-3"),
             reason_ref: Some(IdentityChangeReasonRef::new(sample_identity_source_ref())),
             source_ref: Some(sample_identity_source_ref()),
-            basis_ref: Some(GovernanceBasisRef::new(
-                ExternalSourceRef::new("basis-2".to_owned()).expect("basis ext ref"),
-            )),
+            basis_ref: Some(
+                GovernanceBasisRef::new(
+                    GovernanceBasisKind::GateDecision,
+                    ExternalSourceRef::new("basis-2".to_owned()).expect("basis ext ref"),
+                )
+                .expect("governance basis ref"),
+            ),
             actor_ref: Some(sample_actor_ref()),
             visibility_result_ref: VisibilityResultRef::new("visibility-result-2"),
             superseded_by_trace_ref: Some(IdentityTraceRecordRef::new("trace-record-2")),
@@ -839,6 +904,137 @@ mod tests {
             ),
             visibility_result_ref: VisibilityResultRef::new("visibility-result-3"),
             occurred_at: IdentityTimestamp::from_clock(15).expect("valid timestamp"),
+        });
+
+        roundtrip(&ProjectionStateView {
+            projection_state_ref: Some(ProjectionStateRef::from_id(
+                ProjectionStateId::new("projection-state-2".to_owned())
+                    .expect("projection state id"),
+            )),
+            projection_ref: IdentityProjectionRef::new("projection-1"),
+            member_ref: Some(sample_member_ref()),
+            state_kind: Some(ProjectionStateKind::Stale),
+            source_cursor_ref: Some(IdentityProjectionCursorRef::new(
+                sample_identity_source_ref(),
+            )),
+            maintenance_scope_ref: Some(MaintenanceScopeRef::new(sample_identity_source_ref())),
+            issue_ref: Some(MaintenanceIssueRef::new("maintenance-issue-1")),
+            checked_at: Some(IdentityTimestamp::from_clock(16).expect("valid timestamp")),
+            visibility_result_ref: VisibilityResultRef::new("visibility-result-4"),
+        });
+
+        roundtrip(&ReferenceResolutionSidecarRefsView {
+            role_capability_safe_summary_ref: Some(ExternalReferenceSafeSummaryRef::new(
+                ExternalReferenceRef::new(
+                    ExternalReferenceKind::MethodSource,
+                    sample_identity_source_ref(),
+                ),
+                sample_identity_source_ref(),
+            )),
+            career_safe_summary_ref: None,
+            memory_safe_summary_ref: None,
+            governance_basis_summary_ref: None,
+            evidence_summary_ref: None,
+            source_version_ref: Some(ExternalSourceVersionRef::new(sample_identity_source_ref())),
+        });
+
+        roundtrip(&ReferenceResolutionStateView {
+            resolution_state_ref: Some(ReferenceResolutionStateRef::from_id(
+                ReferenceResolutionStateId::new("reference-state-1".to_owned())
+                    .expect("reference state id"),
+            )),
+            external_reference_ref: ExternalReferenceRef::new(
+                ExternalReferenceKind::MethodSource,
+                sample_identity_source_ref(),
+            ),
+            owner_ref: Some(IdentityReferenceOwnerRef::new(
+                IdentityReferenceOwnerKind::Maintenance,
+                sample_identity_source_ref(),
+            )),
+            state_kind: Some(ReferenceResolutionStateKind::Resolved),
+            source_version_ref: Some(ExternalSourceVersionRef::new(sample_identity_source_ref())),
+            safe_summary_ref: Some(ExternalReferenceSafeSummaryRef::new(
+                ExternalReferenceRef::new(
+                    ExternalReferenceKind::MethodSource,
+                    sample_identity_source_ref(),
+                ),
+                sample_identity_source_ref(),
+            )),
+            sidecar_refs: Some(ReferenceResolutionSidecarRefsView {
+                role_capability_safe_summary_ref: None,
+                career_safe_summary_ref: None,
+                memory_safe_summary_ref: None,
+                governance_basis_summary_ref: None,
+                evidence_summary_ref: None,
+                source_version_ref: Some(ExternalSourceVersionRef::new(
+                    sample_identity_source_ref(),
+                )),
+            }),
+            issue_ref: None,
+            checked_at: Some(IdentityTimestamp::from_clock(17).expect("valid timestamp")),
+            visibility_result_ref: VisibilityResultRef::new("visibility-result-5"),
+        });
+
+        roundtrip(&ReconciliationReportView {
+            report_ref: ReconciliationReportRef::new("report-1"),
+            maintenance_scope_ref: MaintenanceScopeRef::new(sample_identity_source_ref()),
+            target_refs: vec![IdentityMaintenanceTargetRef::new("target-1")],
+            finding_refs: vec![ReconciliationFindingRef::new("finding-1")],
+            issue_refs: vec![MaintenanceIssueRef::new("maintenance-issue-2")],
+            report_state: ReconciliationReportStateKind::FindingDetected,
+            generated_by_ref: Some(sample_actor_ref()),
+            generated_at: IdentityTimestamp::from_clock(18).expect("valid timestamp"),
+            visibility_result_ref: VisibilityResultRef::new("visibility-result-6"),
+        });
+
+        roundtrip(&IdentityOutboxRecordView {
+            outbox_record_ref: IdentityOutboxRecordRef::new("outbox-record-1"),
+            member_ref: sample_member_ref(),
+            subject_ref: IdentityOutboxSubjectRef::new("outbox-subject-1"),
+            change_kind_ref: IdentityChangeKindRef::new(
+                IdentityChangeKind::MemberAnchorChanged,
+                Some(sample_identity_source_ref()),
+            ),
+            payload_marker_ref: IdentityOutboxPayloadMarkerRef::new("payload-marker-1"),
+            topic_key_ref: TopicKeyRef::new("topic-key-1"),
+            trace_record_ref: IdentityTraceRecordRef::new("trace-record-1"),
+            outbox_state_kind: OutboxStateKind::PendingPublish,
+            attempt_ref: Some(OutboxDeliveryAttemptRef::new(sample_identity_source_ref())),
+            issue_ref: Some(OutboxDeliveryIssueRef::new(sample_identity_source_ref())),
+            created_at: IdentityTimestamp::from_clock(19).expect("valid timestamp"),
+            updated_at: IdentityTimestamp::from_clock(20).expect("valid timestamp"),
+            visibility_result_ref: VisibilityResultRef::new("visibility-result-7"),
+        });
+
+        roundtrip(&IdentityOutboxStateView {
+            outbox_record_ref: IdentityOutboxRecordRef::new("outbox-record-2"),
+            subject_ref: IdentityOutboxSubjectRef::new("outbox-subject-2"),
+            topic_key_ref: TopicKeyRef::new("topic-key-2"),
+            trace_record_ref: IdentityTraceRecordRef::new("trace-record-2"),
+            outbox_state_kind: OutboxStateKind::RetryableFailed,
+            attempt_ref: Some(OutboxDeliveryAttemptRef::new(sample_identity_source_ref())),
+            issue_ref: Some(OutboxDeliveryIssueRef::new(sample_identity_source_ref())),
+            payload_marker_ref: IdentityOutboxPayloadMarkerRef::new("payload-marker-2"),
+            changed_at: IdentityTimestamp::from_clock(21).expect("valid timestamp"),
+            visibility_result_ref: VisibilityResultRef::new("visibility-result-8"),
+        });
+
+        roundtrip(&TraceHandoffStateView {
+            handoff_intent_ref: TraceHandoffIntentRef::new("handoff-intent-2"),
+            member_ref: sample_member_ref(),
+            trace_record_refs: vec![IdentityTraceRecordRef::new("trace-record-3")],
+            audit_trail_ref: Some(AuditTrailRef::new("audit-trail-2")),
+            handoff_target_ref: HandoffTargetRef::new("handoff-target-1"),
+            handoff_scope_ref: HandoffScopeRef::new("handoff-scope-1"),
+            safe_material_ref: TraceHandoffSafeMaterialRef::new("safe-material-1"),
+            handoff_state_kind: HandoffStateKind::Delivered,
+            attempt_ref: Some(HandoffAttemptRef::new(sample_identity_source_ref())),
+            receipt_ref: Some(HandoffReceiptRef::new("receipt-1")),
+            issue_ref: Some(HandoffIssueRef::new(sample_identity_source_ref())),
+            created_at: IdentityTimestamp::from_clock(22).expect("valid timestamp"),
+            updated_at: IdentityTimestamp::from_clock(23).expect("valid timestamp"),
+            changed_at: IdentityTimestamp::from_clock(24).expect("valid timestamp"),
+            visibility_result_ref: VisibilityResultRef::new("visibility-result-9"),
         });
     }
 

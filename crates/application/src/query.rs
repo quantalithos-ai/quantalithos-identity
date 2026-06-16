@@ -6,42 +6,56 @@ use identity_contracts::metadata::{
 };
 use identity_contracts::protocol::IdentityQueryName;
 use identity_contracts::queries::{
-    GetGlobalLifecycleSummaryRequest, GetGlobalMemberAnchorRequest,
-    GetRoleCapabilitySummaryRequest, IdentityPageResponse, IdentityPublicPageCursor,
-    IdentityPublicPageInfo, IdentityPublicPageRequest, IdentityQueryRequest, IdentityQueryResponse,
-    IdentityTraceReadSelector, ListCareerRecordsRequest, ListMemoryReferencesRequest,
+    GetGlobalLifecycleSummaryRequest, GetGlobalMemberAnchorRequest, GetIdentityOutboxStateRequest,
+    GetProjectionStateRequest, GetReferenceResolutionStateRequest, GetRoleCapabilitySummaryRequest,
+    GetTraceHandoffStateRequest, IdentityOutboxListSelector, IdentityPageResponse,
+    IdentityPublicPageCursor, IdentityPublicPageInfo, IdentityPublicPageRequest,
+    IdentityQueryRequest, IdentityQueryResponse, IdentityTraceReadSelector,
+    ListCareerRecordsRequest, ListMemoryReferencesRequest, ListPendingIdentityOutboxRequest,
     ReadAuditTrailRequest, ReadIdentityTraceRequest, ReadMemberSummaryRequest,
+    ReadReconciliationReportRequest,
 };
 use identity_contracts::refs::{
     CareerRecordStateKind as PublicCareerRecordStateKind, ConsumerRef,
     GlobalLifecycleStateKind as PublicLifecycleStateKind, GlobalMemberRef,
-    IdentityAnchorStateKind as PublicAnchorStateKind, IdentityReadSurfaceKind,
-    MemoryReferenceStateKind as PublicMemoryReferenceStateKind,
+    HandoffStateKind as PublicHandoffStateKind, IdentityAnchorStateKind as PublicAnchorStateKind,
+    IdentityReadSurfaceKind, MemoryReferenceStateKind as PublicMemoryReferenceStateKind,
+    OutboxStateKind as PublicOutboxStateKind, ProjectionStateKind as PublicProjectionStateKind,
+    ReconciliationReportStateKind as PublicReconciliationReportStateKind,
+    ReferenceResolutionStateKind as PublicReferenceResolutionStateKind,
     RoleCapabilitySourceStateKind as PublicRoleCapabilitySourceStateKind,
     RoleCapabilitySummaryStateKind as PublicRoleCapabilitySummaryStateKind, VisibilityContextRef,
 };
 use identity_contracts::views::{
     AuditTrailEntryView, CareerRecordView, GlobalLifecycleSummaryView, GlobalMemberAnchorView,
-    IdentityReadMaterialKind, IdentityReadMaterialMarker, IdentityTraceRecordView,
-    IdentityVisibilityAccessState, IdentityVisibilityAccessSummary, MemberSummaryView,
-    MemoryReferenceView, RoleCapabilitySummaryView,
+    IdentityOutboxRecordView, IdentityOutboxStateView, IdentityReadMaterialKind,
+    IdentityReadMaterialMarker, IdentityTraceRecordView, IdentityVisibilityAccessState,
+    IdentityVisibilityAccessSummary, MemberSummaryView, MemoryReferenceView, ProjectionStateView,
+    ReconciliationReportView, ReferenceResolutionSidecarRefsView, ReferenceResolutionStateView,
+    RoleCapabilitySummaryView, TraceHandoffStateView,
 };
 use identity_domain::career::CareerRecord;
+use identity_domain::handoff::{HandoffStateKind, TraceHandoffIntent};
 use identity_domain::member_identity::IdentityAnchorState;
 use identity_domain::memory_reference::{MemoryReference, MemoryReferenceStateKind};
+use identity_domain::outbox::{IdentityOutboxRecord, OutboxStateKind};
+use identity_domain::projection_state::{ProjectionState, ProjectionStateKind};
+use identity_domain::reconciliation::{ReconciliationReport, ReconciliationReportStateKind};
+use identity_domain::reference_state::{ReferenceResolutionState, ReferenceResolutionStateKind};
 use identity_domain::role_capability::{
     RoleCapabilitySourceSnapshot, RoleCapabilitySourceStateKind, RoleCapabilitySummaryStateKind,
 };
 use identity_domain::trace::IdentityTraceRecord;
 
-use crate::errors::ApplicationError;
+use crate::errors::{ApplicationError, ApplicationErrorKind};
 use crate::ports::{
     CareerRecordRepository, GlobalLifecycleRepository, GlobalMemberRepository,
     IdentityAuditTrailRepository, IdentityClockPort, IdentityIdGeneratorPort,
-    IdentityOperationContextFactoryPort, IdentityProjectionRepository,
+    IdentityOperationContextFactoryPort, IdentityOutboxRepository, IdentityProjectionRepository,
     IdentityQueryMaterialDegradationMapper, IdentityReadVisibilityRepository,
+    IdentityReconciliationReportRepository, IdentityReferenceStateRepository,
     IdentityTraceRecordRepository, IdentityTruthChangeSubjectMapper, IdentityUnitOfWorkManagerPort,
-    MemoryReferenceRepository, RoleCapabilityRepository,
+    MemoryReferenceRepository, RoleCapabilityRepository, TraceHandoffIntentRepository,
 };
 use crate::support::{
     IdentityOperationContext, IdentityOperationName, IdentityQueryMaterialDegradationSummary,
@@ -69,6 +83,11 @@ pub struct IdentityQueryServiceDeps<'a> {
     pub memory_reference_repository: &'a dyn MemoryReferenceRepository,
     pub trace_record_repository: &'a dyn IdentityTraceRecordRepository,
     pub audit_trail_repository: &'a dyn IdentityAuditTrailRepository,
+    /// Operations read repositories in scope for commit-05-c.
+    pub reference_state_repository: &'a dyn IdentityReferenceStateRepository,
+    pub reconciliation_report_repository: &'a dyn IdentityReconciliationReportRepository,
+    pub outbox_repository: &'a dyn IdentityOutboxRepository,
+    pub handoff_intent_repository: &'a dyn TraceHandoffIntentRepository,
     pub truth_change_subject_mapper: &'a dyn IdentityTruthChangeSubjectMapper,
     /// Formal mapper for query material degradation after a valid access summary exists.
     pub degradation_mapper: &'a dyn IdentityQueryMaterialDegradationMapper,
@@ -1325,6 +1344,936 @@ impl<'a> IdentityQueryService<'a> {
         })
     }
 
+    /// Commit-05-c flow: read one projection state without rebuild side effects.
+    pub fn get_projection_state(
+        &self,
+        request: IdentityQueryRequest<GetProjectionStateRequest>,
+        context: IdentityOperationContext,
+    ) -> Result<IdentityQueryResponse<ProjectionStateView>, ApplicationError> {
+        Self::assert_query_context(&request, &context)?;
+        let access = self
+            .deps
+            .read_visibility_repository
+            .resolve_projection_state_read(
+                request.body.projection_ref.clone(),
+                request.body.projection_state_ref.clone(),
+                request.body.consumer_ref.clone(),
+                request.metadata.visibility_context_ref.clone(),
+            )?
+            .ok_or_else(|| {
+                ApplicationError::invalid_request(
+                    "projection state read visibility could not form a canonical subject",
+                )
+            })?;
+
+        match self.surface_for_access(&access, None, false)? {
+            AccessSurfaceOutcome::Visible => {}
+            AccessSurfaceOutcome::Return(surface) => {
+                return Ok(IdentityQueryResponse {
+                    query_name: request.query_name,
+                    surface,
+                    body: None,
+                });
+            }
+        }
+
+        let Some(loaded) = self
+            .deps
+            .projection_repository
+            .get_projection_state_with_version(request.body.projection_ref.clone())?
+            .map(|value| value.value)
+        else {
+            return Ok(IdentityQueryResponse {
+                query_name: request.query_name,
+                surface: self.missing_surface(&access)?,
+                body: None,
+            });
+        };
+
+        if let Some(requested_state_ref) = request.body.projection_state_ref.clone() {
+            if requested_state_ref != loaded.projection_state_ref {
+                let degradation = self.deps.degradation_mapper.projection_state_ref_mismatch(
+                    access.clone(),
+                    request.body.projection_ref,
+                    requested_state_ref,
+                    loaded.projection_state_ref.clone(),
+                );
+                return Ok(IdentityQueryResponse {
+                    query_name: request.query_name,
+                    surface: self.degraded_surface_from_material(degradation)?,
+                    body: None,
+                });
+            }
+        }
+
+        let final_access = self
+            .deps
+            .read_visibility_repository
+            .resolve_projection_state_read(
+                loaded.projection_ref.clone(),
+                Some(loaded.projection_state_ref.clone()),
+                request.body.consumer_ref,
+                request.metadata.visibility_context_ref,
+            )?
+            .ok_or_else(|| {
+                ApplicationError::invalid_request(
+                    "projection state read visibility could not form a canonical loaded subject",
+                )
+            })?;
+
+        match self.surface_for_access(&final_access, None, false)? {
+            AccessSurfaceOutcome::Visible => {}
+            AccessSurfaceOutcome::Return(surface) => {
+                return Ok(IdentityQueryResponse {
+                    query_name: request.query_name,
+                    surface,
+                    body: None,
+                });
+            }
+        }
+
+        let body = self.projection_state_view(&final_access, &loaded);
+        let (surface, body) = match loaded.state_kind {
+            ProjectionStateKind::Fresh | ProjectionStateKind::Rebuilt => (
+                self.visible_surface_for_operations(&final_access, true)?,
+                Some(body),
+            ),
+            ProjectionStateKind::Stale => (
+                self.surface_from_access(
+                    &final_access,
+                    IdentityReadDispositionKind::StaleVisible,
+                    Some(self.projection_freshness_marker(&loaded)),
+                    true,
+                )?,
+                Some(body),
+            ),
+            ProjectionStateKind::RebuildPending => (self.rebuilding_surface(&final_access)?, None),
+            ProjectionStateKind::Degraded | ProjectionStateKind::RebuildFailed => (
+                self.degraded_operations_surface(&final_access, true)?,
+                Some(body),
+            ),
+        };
+
+        Ok(IdentityQueryResponse {
+            query_name: request.query_name,
+            surface,
+            body,
+        })
+    }
+
+    /// Commit-05-c flow: read one stored external reference bundle state without refresh.
+    pub fn get_reference_resolution_state(
+        &self,
+        request: IdentityQueryRequest<GetReferenceResolutionStateRequest>,
+        context: IdentityOperationContext,
+    ) -> Result<IdentityQueryResponse<ReferenceResolutionStateView>, ApplicationError> {
+        Self::assert_query_context(&request, &context)?;
+        let access = self
+            .deps
+            .read_visibility_repository
+            .resolve_reference_state_read(
+                request.body.external_reference_ref.clone(),
+                request.body.owner_ref.clone(),
+                request.body.consumer_ref,
+                request.metadata.visibility_context_ref,
+            )?
+            .ok_or_else(|| {
+                ApplicationError::invalid_request(
+                    "reference state read visibility could not form a canonical subject",
+                )
+            })?;
+
+        match self.surface_for_access(&access, None, false)? {
+            AccessSurfaceOutcome::Visible => {}
+            AccessSurfaceOutcome::Return(surface) => {
+                return Ok(IdentityQueryResponse {
+                    query_name: request.query_name,
+                    surface,
+                    body: None,
+                });
+            }
+        }
+
+        let Some(loaded) = self
+            .deps
+            .reference_state_repository
+            .get_reference_state_with_version(request.body.external_reference_ref.clone())?
+            .map(|value| value.value)
+        else {
+            return Ok(IdentityQueryResponse {
+                query_name: request.query_name,
+                surface: self.missing_surface(&access)?,
+                body: None,
+            });
+        };
+
+        if loaded.external_reference_ref != request.body.external_reference_ref {
+            return Err(ApplicationError::consistency_defect(
+                "loaded reference state does not match the requested external reference",
+            ));
+        }
+
+        if let Some(expected_owner_ref) = request.body.owner_ref {
+            if expected_owner_ref != loaded.reference_owner_ref {
+                let degradation = self.deps.degradation_mapper.reference_state_owner_mismatch(
+                    access.clone(),
+                    loaded.external_reference_ref.clone(),
+                    expected_owner_ref,
+                    loaded.reference_owner_ref.clone(),
+                );
+                return Ok(IdentityQueryResponse {
+                    query_name: request.query_name,
+                    surface: self.degraded_surface_from_material(degradation)?,
+                    body: None,
+                });
+            }
+        }
+
+        let sidecar_refs = match self
+            .deps
+            .reference_state_repository
+            .get_typed_sidecar_refs(loaded.external_reference_ref.clone())
+        {
+            Ok(sidecar_refs) => sidecar_refs,
+            Err(error) if error.kind == ApplicationErrorKind::DependencyUnavailable => {
+                let degradation = self.deps.degradation_mapper.reference_sidecar_degraded(
+                    access.clone(),
+                    loaded.external_reference_ref.clone(),
+                    Some(loaded.resolution_state_ref.clone()),
+                );
+                return Ok(IdentityQueryResponse {
+                    query_name: request.query_name,
+                    surface: self.degraded_surface_from_material(degradation)?,
+                    body: None,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+
+        let body = self.reference_resolution_state_view(&access, &loaded, sidecar_refs);
+        let surface = match loaded.state_kind {
+            ReferenceResolutionStateKind::Resolved => {
+                self.visible_surface_for_operations(&access, true)?
+            }
+            ReferenceResolutionStateKind::Stale => self.surface_from_access(
+                &access,
+                IdentityReadDispositionKind::StaleVisible,
+                None,
+                true,
+            )?,
+            ReferenceResolutionStateKind::Unavailable
+            | ReferenceResolutionStateKind::Unrecognized
+            | ReferenceResolutionStateKind::PendingReconciliation
+            | ReferenceResolutionStateKind::RefreshFailed => {
+                self.degraded_operations_surface(&access, true)?
+            }
+        };
+
+        Ok(IdentityQueryResponse {
+            query_name: request.query_name,
+            surface,
+            body: Some(body),
+        })
+    }
+
+    /// Commit-05-c flow: read report-only reconciliation material without regeneration.
+    pub fn read_reconciliation_report(
+        &self,
+        request: IdentityQueryRequest<ReadReconciliationReportRequest>,
+        context: IdentityOperationContext,
+    ) -> Result<IdentityPageResponse<ReconciliationReportView>, ApplicationError> {
+        Self::assert_query_context(&request, &context)?;
+        let scope_access = self
+            .deps
+            .read_visibility_repository
+            .resolve_reconciliation_scope_read(
+                request.body.maintenance_scope_ref.clone(),
+                request.body.consumer_ref.clone(),
+                request.metadata.visibility_context_ref.clone(),
+            )?
+            .ok_or_else(|| {
+                ApplicationError::invalid_request(
+                    "reconciliation report scope visibility could not form a canonical subject",
+                )
+            })?;
+
+        match self.surface_for_access(&scope_access, None, false)? {
+            AccessSurfaceOutcome::Visible => {}
+            AccessSurfaceOutcome::Return(surface) => {
+                return Ok(empty_page_response(request.query_name, surface));
+            }
+        }
+
+        if let Some(report_ref) = request.body.report_ref.clone() {
+            let Some(report) = self
+                .deps
+                .reconciliation_report_repository
+                .get_report_with_version(report_ref.clone())?
+                .map(|value| value.value)
+            else {
+                return Ok(empty_page_response(
+                    request.query_name,
+                    self.missing_surface(&scope_access)?,
+                ));
+            };
+
+            if report.maintenance_scope_ref != request.body.maintenance_scope_ref {
+                let degradation = self
+                    .deps
+                    .degradation_mapper
+                    .reconciliation_report_scope_mismatch(
+                        scope_access.clone(),
+                        report_ref,
+                        request.body.maintenance_scope_ref,
+                        report.maintenance_scope_ref.clone(),
+                    );
+                return Ok(empty_page_response(
+                    request.query_name,
+                    self.degraded_surface_from_material(degradation)?,
+                ));
+            }
+
+            let item_access = self
+                .deps
+                .read_visibility_repository
+                .resolve_report_read(
+                    report.report_ref.clone(),
+                    request.body.consumer_ref,
+                    request.metadata.visibility_context_ref,
+                )?
+                .ok_or_else(|| {
+                    ApplicationError::invalid_request(
+                        "reconciliation report item visibility could not form a canonical subject",
+                    )
+                })?;
+
+            match self.surface_for_access(&item_access, None, false)? {
+                AccessSurfaceOutcome::Visible => {}
+                AccessSurfaceOutcome::Return(surface) => {
+                    return Ok(empty_page_response(request.query_name, surface));
+                }
+            }
+
+            let view = self.reconciliation_report_view(&item_access, &report);
+            let surface = self.visible_surface_for_operations(&item_access, true)?;
+            return Ok(IdentityPageResponse {
+                query_name: request.query_name,
+                surface,
+                page_info: IdentityPublicPageInfo {
+                    next_cursor: None,
+                    has_more: false,
+                    item_count: 1,
+                },
+                items: vec![view],
+            });
+        }
+
+        let page = require_page(&request.page)?;
+        let listed = self
+            .deps
+            .reconciliation_report_repository
+            .list_reports_by_scope(request.body.maintenance_scope_ref.clone(), page)?;
+
+        if listed.items.is_empty() {
+            return Ok(empty_page_response(
+                request.query_name,
+                self.empty_surface(&scope_access)?,
+            ));
+        }
+
+        let mut items = Vec::new();
+        let mut degraded_surface = None;
+        let mut denied_count = 0usize;
+        let mut denied_access = None;
+        let mut partial_redaction_access = None;
+
+        for listed_report in &listed.items {
+            let item_access = self
+                .deps
+                .read_visibility_repository
+                .resolve_report_read(
+                    listed_report.value_ref.clone(),
+                    request.body.consumer_ref.clone(),
+                    request.metadata.visibility_context_ref.clone(),
+                )?
+                .ok_or_else(|| {
+                    ApplicationError::invalid_request(
+                        "reconciliation report item visibility could not form a canonical subject",
+                    )
+                })?;
+
+            match item_access.access_state {
+                IdentityVisibilityAccessState::NotVisible => {
+                    denied_count += 1;
+                    denied_access.get_or_insert(item_access);
+                    continue;
+                }
+                IdentityVisibilityAccessState::Degraded
+                | IdentityVisibilityAccessState::Unavailable => {
+                    degraded_surface = Some(self.degraded_operations_surface(&item_access, false)?);
+                    break;
+                }
+                IdentityVisibilityAccessState::Redacted => {
+                    partial_redaction_access.get_or_insert(item_access.clone());
+                }
+                IdentityVisibilityAccessState::Visible => {}
+            }
+
+            let loaded = match self
+                .deps
+                .reconciliation_report_repository
+                .get_report_with_version(listed_report.value_ref.clone())?
+            {
+                Some(report) => report.value,
+                None => {
+                    let degradation = self
+                        .deps
+                        .degradation_mapper
+                        .reconciliation_report_item_missing_after_list(
+                            item_access.clone(),
+                            listed_report.value_ref.clone(),
+                            request.body.maintenance_scope_ref.clone(),
+                        );
+                    degraded_surface = Some(self.degraded_surface_from_material(degradation)?);
+                    break;
+                }
+            };
+
+            if loaded.maintenance_scope_ref != request.body.maintenance_scope_ref {
+                let degradation = self
+                    .deps
+                    .degradation_mapper
+                    .reconciliation_report_scope_mismatch(
+                        item_access.clone(),
+                        listed_report.value_ref.clone(),
+                        request.body.maintenance_scope_ref.clone(),
+                        loaded.maintenance_scope_ref.clone(),
+                    );
+                degraded_surface = Some(self.degraded_surface_from_material(degradation)?);
+                break;
+            }
+
+            items.push(self.reconciliation_report_view(&item_access, &loaded));
+        }
+
+        if let Some(surface) = degraded_surface {
+            return Ok(IdentityPageResponse {
+                query_name: request.query_name,
+                surface,
+                page_info: page_info(&listed),
+                items,
+            });
+        }
+
+        let surface = if items.is_empty() && denied_count > 0 {
+            self.not_visible_surface(denied_access.as_ref().unwrap_or(&scope_access))?
+        } else if denied_count > 0 || partial_redaction_access.is_some() {
+            self.redacted_surface(
+                partial_redaction_access
+                    .as_ref()
+                    .or(denied_access.as_ref())
+                    .unwrap_or(&scope_access),
+                true,
+            )?
+        } else {
+            self.surface_for_list_success(&scope_access, false, false)?
+        };
+
+        Ok(IdentityPageResponse {
+            query_name: request.query_name,
+            surface,
+            page_info: page_info(&listed),
+            items,
+        })
+    }
+
+    /// Commit-05-c flow: list stored outbox state without publish or retry side effects.
+    pub fn list_pending_identity_outbox(
+        &self,
+        request: IdentityQueryRequest<ListPendingIdentityOutboxRequest>,
+        context: IdentityOperationContext,
+    ) -> Result<IdentityPageResponse<IdentityOutboxRecordView>, ApplicationError> {
+        Self::assert_query_context(&request, &context)?;
+        let page = require_page(&request.page)?;
+
+        let (selector_access, listed, subject_filter, topic_filter, trace_filter, selector_kind) =
+            match &request.body.selector {
+                IdentityOutboxListSelector::Pending { topic_key_ref } => {
+                    let access = self
+                        .deps
+                        .read_visibility_repository
+                        .resolve_outbox_record_read(
+                            None,
+                            None,
+                            topic_key_ref.clone(),
+                            request.body.consumer_ref.clone(),
+                            request.metadata.visibility_context_ref.clone(),
+                        )?
+                        .ok_or_else(|| {
+                            ApplicationError::invalid_request(
+                                "pending outbox visibility could not form a canonical subject",
+                            )
+                        })?;
+                    let listed = self
+                        .deps
+                        .outbox_repository
+                        .list_pending_outbox_records(topic_key_ref.clone(), page)?;
+                    (access, listed, None, topic_key_ref.clone(), None, "pending")
+                }
+                IdentityOutboxListSelector::Retryable { topic_key_ref } => {
+                    let access = self
+                        .deps
+                        .read_visibility_repository
+                        .resolve_outbox_record_read(
+                            None,
+                            None,
+                            topic_key_ref.clone(),
+                            request.body.consumer_ref.clone(),
+                            request.metadata.visibility_context_ref.clone(),
+                        )?
+                        .ok_or_else(|| {
+                            ApplicationError::invalid_request(
+                                "retryable outbox visibility could not form a canonical subject",
+                            )
+                        })?;
+                    let listed = self
+                        .deps
+                        .outbox_repository
+                        .list_retryable_outbox_records(topic_key_ref.clone(), page)?;
+                    (
+                        access,
+                        listed,
+                        None,
+                        topic_key_ref.clone(),
+                        None,
+                        "retryable",
+                    )
+                }
+                IdentityOutboxListSelector::BySubject { subject_ref } => {
+                    let access = self
+                        .deps
+                        .read_visibility_repository
+                        .resolve_outbox_record_read(
+                            None,
+                            Some(subject_ref.clone()),
+                            None,
+                            request.body.consumer_ref.clone(),
+                            request.metadata.visibility_context_ref.clone(),
+                        )?
+                        .ok_or_else(|| {
+                            ApplicationError::invalid_request(
+                                "outbox subject visibility could not form a canonical subject",
+                            )
+                        })?;
+                    let listed = self
+                        .deps
+                        .outbox_repository
+                        .list_outbox_records_by_subject(subject_ref.clone(), page)?;
+                    (
+                        access,
+                        listed,
+                        Some(subject_ref.clone()),
+                        None,
+                        None,
+                        "subject",
+                    )
+                }
+                IdentityOutboxListSelector::ByMember { member_ref } => {
+                    let subject_ref = self
+                        .deps
+                        .truth_change_subject_mapper
+                        .member_subjects(member_ref.clone())
+                        .outbox_subject_ref;
+                    let access = self
+                        .deps
+                        .read_visibility_repository
+                        .resolve_outbox_record_read(
+                            None,
+                            Some(subject_ref.clone()),
+                            None,
+                            request.body.consumer_ref.clone(),
+                            request.metadata.visibility_context_ref.clone(),
+                        )?
+                        .ok_or_else(|| {
+                            ApplicationError::invalid_request(
+                                "member outbox visibility could not form a canonical subject",
+                            )
+                        })?;
+                    let listed = self
+                        .deps
+                        .outbox_repository
+                        .list_outbox_records_by_subject(subject_ref.clone(), page)?;
+                    (access, listed, Some(subject_ref), None, None, "member")
+                }
+                IdentityOutboxListSelector::ByTrace { trace_record_ref } => {
+                    let access = self
+                        .deps
+                        .read_visibility_repository
+                        .resolve_outbox_trace_page_read(
+                            trace_record_ref.clone(),
+                            request.body.consumer_ref.clone(),
+                            request.metadata.visibility_context_ref.clone(),
+                        )?
+                        .ok_or_else(|| {
+                            ApplicationError::invalid_request(
+                                "outbox trace page visibility could not form a canonical subject",
+                            )
+                        })?;
+                    let listed = self
+                        .deps
+                        .outbox_repository
+                        .find_outbox_records_by_trace(trace_record_ref.clone(), page)?;
+                    (
+                        access,
+                        listed,
+                        None,
+                        None,
+                        Some(trace_record_ref.clone()),
+                        "trace",
+                    )
+                }
+            };
+
+        match self.surface_for_access(&selector_access, None, false)? {
+            AccessSurfaceOutcome::Visible => {}
+            AccessSurfaceOutcome::Return(surface) => {
+                return Ok(empty_page_response(request.query_name, surface));
+            }
+        }
+
+        if listed.items.is_empty() {
+            return Ok(empty_page_response(
+                request.query_name,
+                self.empty_surface(&selector_access)?,
+            ));
+        }
+
+        let mut items = Vec::new();
+        let mut degraded_surface = None;
+        let mut denied_count = 0usize;
+        let mut denied_access = None;
+        let mut partial_redaction_access = None;
+
+        for listed_outbox in &listed.items {
+            let ref_access = self
+                .deps
+                .read_visibility_repository
+                .resolve_outbox_record_read(
+                    Some(listed_outbox.value_ref.clone()),
+                    None,
+                    None,
+                    request.body.consumer_ref.clone(),
+                    request.metadata.visibility_context_ref.clone(),
+                )?
+                .ok_or_else(|| {
+                    ApplicationError::invalid_request(
+                        "outbox item visibility could not form a canonical subject",
+                    )
+                })?;
+
+            match ref_access.access_state {
+                IdentityVisibilityAccessState::NotVisible => {
+                    denied_count += 1;
+                    denied_access.get_or_insert(ref_access);
+                    continue;
+                }
+                IdentityVisibilityAccessState::Degraded
+                | IdentityVisibilityAccessState::Unavailable => {
+                    degraded_surface = Some(self.degraded_operations_surface(&ref_access, false)?);
+                    break;
+                }
+                IdentityVisibilityAccessState::Redacted => {
+                    partial_redaction_access.get_or_insert(ref_access.clone());
+                }
+                IdentityVisibilityAccessState::Visible => {}
+            }
+
+            let loaded = match self
+                .deps
+                .outbox_repository
+                .get_outbox_record_with_version(listed_outbox.value_ref.clone())?
+            {
+                Some(record) => record.value,
+                None => {
+                    let degradation = self
+                        .deps
+                        .degradation_mapper
+                        .outbox_record_item_missing_after_list(
+                            ref_access.clone(),
+                            listed_outbox.value_ref.clone(),
+                        );
+                    degraded_surface = Some(self.degraded_surface_from_material(degradation)?);
+                    break;
+                }
+            };
+
+            let selector_matches = match selector_kind {
+                "pending" => {
+                    loaded.outbox_state.state_kind == OutboxStateKind::PendingPublish
+                        && topic_filter
+                            .as_ref()
+                            .map(|topic| &loaded.topic_key_ref == topic)
+                            .unwrap_or(true)
+                }
+                "retryable" => {
+                    loaded.is_retryable()
+                        && topic_filter
+                            .as_ref()
+                            .map(|topic| &loaded.topic_key_ref == topic)
+                            .unwrap_or(true)
+                }
+                "subject" | "member" => subject_filter
+                    .as_ref()
+                    .map(|subject| loaded.subject_ref == *subject)
+                    .unwrap_or(false),
+                "trace" => trace_filter
+                    .as_ref()
+                    .map(|trace_ref| loaded.trace_record_ref == *trace_ref)
+                    .unwrap_or(false),
+                _ => false,
+            };
+
+            if !selector_matches {
+                let degradation = self
+                    .deps
+                    .degradation_mapper
+                    .outbox_record_selector_mismatch(
+                        ref_access.clone(),
+                        listed_outbox.value_ref.clone(),
+                    );
+                degraded_surface = Some(self.degraded_surface_from_material(degradation)?);
+                break;
+            }
+
+            let item_access = self
+                .deps
+                .read_visibility_repository
+                .resolve_outbox_record_read(
+                    Some(loaded.outbox_record_ref.clone()),
+                    Some(loaded.subject_ref.clone()),
+                    Some(loaded.topic_key_ref.clone()),
+                    request.body.consumer_ref.clone(),
+                    request.metadata.visibility_context_ref.clone(),
+                )?
+                .ok_or_else(|| {
+                    ApplicationError::invalid_request(
+                        "loaded outbox visibility could not form a canonical subject",
+                    )
+                })?;
+
+            match item_access.access_state {
+                IdentityVisibilityAccessState::NotVisible => {
+                    denied_count += 1;
+                    denied_access.get_or_insert(item_access);
+                    continue;
+                }
+                IdentityVisibilityAccessState::Degraded
+                | IdentityVisibilityAccessState::Unavailable => {
+                    degraded_surface = Some(self.degraded_operations_surface(&item_access, false)?);
+                    break;
+                }
+                IdentityVisibilityAccessState::Redacted => {
+                    partial_redaction_access.get_or_insert(item_access.clone());
+                }
+                IdentityVisibilityAccessState::Visible => {}
+            }
+
+            items.push(self.identity_outbox_record_view(&item_access, &loaded));
+        }
+
+        if let Some(surface) = degraded_surface {
+            return Ok(IdentityPageResponse {
+                query_name: request.query_name,
+                surface,
+                page_info: page_info(&listed),
+                items,
+            });
+        }
+
+        let surface = if items.is_empty() && denied_count > 0 {
+            self.not_visible_surface(denied_access.as_ref().unwrap_or(&selector_access))?
+        } else if denied_count > 0 || partial_redaction_access.is_some() {
+            self.redacted_surface(
+                partial_redaction_access
+                    .as_ref()
+                    .or(denied_access.as_ref())
+                    .unwrap_or(&selector_access),
+                true,
+            )?
+        } else {
+            self.surface_for_list_success(&selector_access, false, false)?
+        };
+
+        Ok(IdentityPageResponse {
+            query_name: request.query_name,
+            surface,
+            page_info: page_info(&listed),
+            items,
+        })
+    }
+
+    /// Commit-05-c flow: read one stored outbox state without publisher interaction.
+    pub fn get_identity_outbox_state(
+        &self,
+        request: IdentityQueryRequest<GetIdentityOutboxStateRequest>,
+        context: IdentityOperationContext,
+    ) -> Result<IdentityQueryResponse<IdentityOutboxStateView>, ApplicationError> {
+        Self::assert_query_context(&request, &context)?;
+        let access = self
+            .deps
+            .read_visibility_repository
+            .resolve_outbox_record_read(
+                Some(request.body.outbox_record_ref.clone()),
+                None,
+                None,
+                request.body.consumer_ref.clone(),
+                request.metadata.visibility_context_ref.clone(),
+            )?
+            .ok_or_else(|| {
+                ApplicationError::invalid_request(
+                    "outbox state visibility could not form a canonical subject",
+                )
+            })?;
+
+        match self.surface_for_access(&access, None, false)? {
+            AccessSurfaceOutcome::Visible => {}
+            AccessSurfaceOutcome::Return(surface) => {
+                return Ok(IdentityQueryResponse {
+                    query_name: request.query_name,
+                    surface,
+                    body: None,
+                });
+            }
+        }
+
+        let Some(record) = self
+            .deps
+            .outbox_repository
+            .get_outbox_record_with_version(request.body.outbox_record_ref.clone())?
+            .map(|value| value.value)
+        else {
+            return Ok(IdentityQueryResponse {
+                query_name: request.query_name,
+                surface: self.missing_surface(&access)?,
+                body: None,
+            });
+        };
+
+        let final_access = self
+            .deps
+            .read_visibility_repository
+            .resolve_outbox_record_read(
+                Some(record.outbox_record_ref.clone()),
+                Some(record.subject_ref.clone()),
+                Some(record.topic_key_ref.clone()),
+                request.body.consumer_ref,
+                request.metadata.visibility_context_ref,
+            )?
+            .ok_or_else(|| {
+                ApplicationError::invalid_request(
+                    "loaded outbox state visibility could not form a canonical subject",
+                )
+            })?;
+
+        match self.surface_for_access(&final_access, None, false)? {
+            AccessSurfaceOutcome::Visible => {}
+            AccessSurfaceOutcome::Return(surface) => {
+                return Ok(IdentityQueryResponse {
+                    query_name: request.query_name,
+                    surface,
+                    body: None,
+                });
+            }
+        }
+
+        Ok(IdentityQueryResponse {
+            query_name: request.query_name,
+            surface: self.visible_surface_for_operations(&final_access, true)?,
+            body: Some(self.identity_outbox_state_view(&final_access, &record)),
+        })
+    }
+
+    /// Commit-05-c flow: read one stored handoff state without delivery side effects.
+    pub fn get_trace_handoff_state(
+        &self,
+        request: IdentityQueryRequest<GetTraceHandoffStateRequest>,
+        context: IdentityOperationContext,
+    ) -> Result<IdentityQueryResponse<TraceHandoffStateView>, ApplicationError> {
+        Self::assert_query_context(&request, &context)?;
+        let access = self
+            .deps
+            .read_visibility_repository
+            .resolve_handoff_intent_read(
+                request.body.handoff_intent_ref.clone(),
+                request.body.consumer_ref,
+                request.metadata.visibility_context_ref,
+            )?
+            .ok_or_else(|| {
+                ApplicationError::invalid_request(
+                    "handoff state visibility could not form a canonical subject",
+                )
+            })?;
+
+        match self.surface_for_access(&access, None, false)? {
+            AccessSurfaceOutcome::Visible => {}
+            AccessSurfaceOutcome::Return(surface) => {
+                return Ok(IdentityQueryResponse {
+                    query_name: request.query_name,
+                    surface,
+                    body: None,
+                });
+            }
+        }
+
+        let Some(intent) = self
+            .deps
+            .handoff_intent_repository
+            .get_handoff_intent_with_version(request.body.handoff_intent_ref.clone())?
+            .map(|value| value.value)
+        else {
+            return Ok(IdentityQueryResponse {
+                query_name: request.query_name,
+                surface: self.missing_surface(&access)?,
+                body: None,
+            });
+        };
+
+        if intent.trace_record_refs.is_empty() {
+            let degradation = self
+                .deps
+                .degradation_mapper
+                .handoff_intent_empty_trace_refs(access.clone(), request.body.handoff_intent_ref);
+            return Ok(IdentityQueryResponse {
+                query_name: request.query_name,
+                surface: self.degraded_surface_from_material(degradation)?,
+                body: None,
+            });
+        }
+
+        if intent.handoff_state.state_kind == HandoffStateKind::Delivered
+            && intent.handoff_state.receipt_ref.is_none()
+        {
+            let degradation = self
+                .deps
+                .degradation_mapper
+                .handoff_intent_delivered_without_receipt(
+                    access.clone(),
+                    intent.handoff_intent_ref.clone(),
+                );
+            return Ok(IdentityQueryResponse {
+                query_name: request.query_name,
+                surface: self.degraded_surface_from_material(degradation)?,
+                body: None,
+            });
+        }
+
+        Ok(IdentityQueryResponse {
+            query_name: request.query_name,
+            surface: self.visible_surface_for_operations(&access, true)?,
+            body: Some(self.trace_handoff_state_view(&access, &intent)),
+        })
+    }
+
     fn resolve_member_access(
         &self,
         member_ref: GlobalMemberRef,
@@ -1408,6 +2357,213 @@ impl<'a> IdentityQueryService<'a> {
             view_ref: Some(view.view_ref.clone()),
             view: Some(view),
         })
+    }
+
+    fn visible_surface_for_operations(
+        &self,
+        access: &IdentityVisibilityAccessSummary,
+        found: bool,
+    ) -> Result<IdentityQuerySurface, ApplicationError> {
+        let disposition = if matches!(access.access_state, IdentityVisibilityAccessState::Redacted)
+        {
+            IdentityReadDispositionKind::Redacted
+        } else {
+            IdentityReadDispositionKind::Visible
+        };
+        self.surface_from_access(access, disposition, None, found)
+    }
+
+    fn degraded_operations_surface(
+        &self,
+        access: &IdentityVisibilityAccessSummary,
+        found: bool,
+    ) -> Result<IdentityQuerySurface, ApplicationError> {
+        let mut surface = self.visible_surface_for_operations(access, found)?;
+        surface.disposition = IdentityQueryDisposition::Degraded;
+        surface.visibility.read_surface_kind = IdentityReadSurfaceKind::Degraded;
+        surface.projection_freshness_ref = None;
+        Ok(surface)
+    }
+
+    fn rebuilding_surface(
+        &self,
+        access: &IdentityVisibilityAccessSummary,
+    ) -> Result<IdentityQuerySurface, ApplicationError> {
+        let mut surface = self.visible_surface_for_operations(access, false)?;
+        surface.disposition = IdentityQueryDisposition::Rebuilding;
+        surface.visibility.read_surface_kind = IdentityReadSurfaceKind::Degraded;
+        surface.projection_freshness_ref = None;
+        surface.degraded = None;
+        Ok(surface)
+    }
+
+    fn projection_freshness_marker(
+        &self,
+        state: &ProjectionState,
+    ) -> identity_contracts::refs::ProjectionFreshnessMarkerRef {
+        identity_contracts::refs::ProjectionFreshnessMarkerRef {
+            projection_ref: state.projection_ref.clone(),
+            state_kind: self
+                .public_projection_state_token(state.state_kind)
+                .to_owned(),
+        }
+    }
+
+    fn public_projection_state_token(&self, state: ProjectionStateKind) -> &'static str {
+        match state {
+            ProjectionStateKind::Fresh => "fresh",
+            ProjectionStateKind::Stale => "stale",
+            ProjectionStateKind::RebuildPending => "rebuild_pending",
+            ProjectionStateKind::Rebuilt => "rebuilt",
+            ProjectionStateKind::Degraded => "degraded",
+            ProjectionStateKind::RebuildFailed => "rebuild_failed",
+        }
+    }
+
+    fn projection_state_view(
+        &self,
+        access: &IdentityVisibilityAccessSummary,
+        state: &ProjectionState,
+    ) -> ProjectionStateView {
+        ProjectionStateView {
+            projection_state_ref: Some(state.projection_state_ref.clone()),
+            projection_ref: state.projection_ref.clone(),
+            member_ref: state.member_ref.clone(),
+            state_kind: Some(map_projection_state_kind(state.state_kind)),
+            source_cursor_ref: state.source_cursor_ref.clone(),
+            maintenance_scope_ref: state.maintenance_scope_ref.clone(),
+            issue_ref: state.issue_ref.clone(),
+            checked_at: Some(state.checked_at),
+            visibility_result_ref: access.visibility_result_ref.clone(),
+        }
+    }
+
+    fn reference_sidecar_refs_view(
+        &self,
+        sidecars: &crate::ports::ExternalReferenceTypedSidecarRefs,
+    ) -> Option<ReferenceResolutionSidecarRefsView> {
+        let view = ReferenceResolutionSidecarRefsView {
+            role_capability_safe_summary_ref: sidecars.role_capability_safe_summary_ref.clone(),
+            career_safe_summary_ref: sidecars.career_safe_summary_ref.clone(),
+            memory_safe_summary_ref: sidecars.memory_safe_summary_ref.clone(),
+            governance_basis_summary_ref: sidecars.governance_basis_summary_ref.clone(),
+            evidence_summary_ref: sidecars.evidence_summary_ref.clone(),
+            source_version_ref: sidecars.source_version_ref.clone(),
+        };
+        if view.role_capability_safe_summary_ref.is_none()
+            && view.career_safe_summary_ref.is_none()
+            && view.memory_safe_summary_ref.is_none()
+            && view.governance_basis_summary_ref.is_none()
+            && view.evidence_summary_ref.is_none()
+            && view.source_version_ref.is_none()
+        {
+            None
+        } else {
+            Some(view)
+        }
+    }
+
+    fn reference_resolution_state_view(
+        &self,
+        access: &IdentityVisibilityAccessSummary,
+        state: &ReferenceResolutionState,
+        sidecars: crate::ports::ExternalReferenceTypedSidecarRefs,
+    ) -> ReferenceResolutionStateView {
+        ReferenceResolutionStateView {
+            resolution_state_ref: Some(state.resolution_state_ref.clone()),
+            external_reference_ref: state.external_reference_ref.clone(),
+            owner_ref: Some(state.reference_owner_ref.clone()),
+            state_kind: Some(map_reference_state_kind(state.state_kind)),
+            source_version_ref: state.source_version_ref.clone(),
+            safe_summary_ref: state.safe_summary_ref.clone(),
+            sidecar_refs: self.reference_sidecar_refs_view(&sidecars),
+            issue_ref: state.issue_ref.clone(),
+            checked_at: Some(state.checked_at),
+            visibility_result_ref: access.visibility_result_ref.clone(),
+        }
+    }
+
+    fn reconciliation_report_view(
+        &self,
+        access: &IdentityVisibilityAccessSummary,
+        report: &ReconciliationReport,
+    ) -> ReconciliationReportView {
+        ReconciliationReportView {
+            report_ref: report.report_ref.clone(),
+            maintenance_scope_ref: report.maintenance_scope_ref.clone(),
+            target_refs: report.target_refs.clone(),
+            finding_refs: report.finding_refs.clone(),
+            issue_refs: report.issue_refs.clone(),
+            report_state: map_reconciliation_report_state_kind(report.report_state),
+            generated_by_ref: report.generated_by_ref.clone(),
+            generated_at: report.generated_at,
+            visibility_result_ref: access.visibility_result_ref.clone(),
+        }
+    }
+
+    fn identity_outbox_record_view(
+        &self,
+        access: &IdentityVisibilityAccessSummary,
+        record: &IdentityOutboxRecord,
+    ) -> IdentityOutboxRecordView {
+        IdentityOutboxRecordView {
+            outbox_record_ref: record.outbox_record_ref.clone(),
+            member_ref: record.member_ref.clone(),
+            subject_ref: record.subject_ref.clone(),
+            change_kind_ref: record.change_kind_ref.clone(),
+            payload_marker_ref: record.payload_marker_ref.clone(),
+            topic_key_ref: record.topic_key_ref.clone(),
+            trace_record_ref: record.trace_record_ref.clone(),
+            outbox_state_kind: map_outbox_state_kind(record.outbox_state.state_kind),
+            attempt_ref: record.outbox_state.attempt_ref.clone(),
+            issue_ref: record.outbox_state.issue_ref.clone(),
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            visibility_result_ref: access.visibility_result_ref.clone(),
+        }
+    }
+
+    fn identity_outbox_state_view(
+        &self,
+        access: &IdentityVisibilityAccessSummary,
+        record: &IdentityOutboxRecord,
+    ) -> IdentityOutboxStateView {
+        IdentityOutboxStateView {
+            outbox_record_ref: record.outbox_record_ref.clone(),
+            subject_ref: record.subject_ref.clone(),
+            topic_key_ref: record.topic_key_ref.clone(),
+            trace_record_ref: record.trace_record_ref.clone(),
+            outbox_state_kind: map_outbox_state_kind(record.outbox_state.state_kind),
+            attempt_ref: record.outbox_state.attempt_ref.clone(),
+            issue_ref: record.outbox_state.issue_ref.clone(),
+            payload_marker_ref: record.payload_marker_ref.clone(),
+            changed_at: record.outbox_state.changed_at,
+            visibility_result_ref: access.visibility_result_ref.clone(),
+        }
+    }
+
+    fn trace_handoff_state_view(
+        &self,
+        access: &IdentityVisibilityAccessSummary,
+        intent: &TraceHandoffIntent,
+    ) -> TraceHandoffStateView {
+        TraceHandoffStateView {
+            handoff_intent_ref: intent.handoff_intent_ref.clone(),
+            member_ref: intent.member_ref.clone(),
+            trace_record_refs: intent.trace_record_refs.clone(),
+            audit_trail_ref: intent.audit_trail_ref.clone(),
+            handoff_target_ref: intent.handoff_target_ref.clone(),
+            handoff_scope_ref: intent.handoff_scope_ref.clone(),
+            safe_material_ref: intent.safe_material_ref.clone(),
+            handoff_state_kind: map_handoff_state_kind(intent.handoff_state.state_kind),
+            attempt_ref: intent.handoff_state.attempt_ref.clone(),
+            receipt_ref: intent.handoff_state.receipt_ref.clone(),
+            issue_ref: intent.handoff_state.issue_ref.clone(),
+            created_at: intent.created_at,
+            updated_at: intent.updated_at,
+            changed_at: intent.handoff_state.changed_at,
+            visibility_result_ref: access.visibility_result_ref.clone(),
+        }
     }
 
     fn surface_for_access(
@@ -1689,14 +2845,8 @@ impl<'a> IdentityQueryService<'a> {
                 access.scope_ref.clone(),
                 access.visibility_result_ref.clone(),
                 surface_kind,
-                access.degraded_marker_ref.clone().ok_or_else(|| {
-                    ApplicationError::consistency_defect(
-                        "stale-visible query surface requires a formal degraded marker",
-                    )
-                })?,
-                access
-                    .degraded_kind
-                    .unwrap_or(IdentityDegradedKind::ProjectionStale),
+                access.degraded_marker_ref.clone(),
+                access.degraded_kind,
                 decided_at,
             ),
         })
@@ -1989,6 +3139,72 @@ fn map_memory_state_kind(state: MemoryReferenceStateKind) -> PublicMemoryReferen
         MemoryReferenceStateKind::Archived => PublicMemoryReferenceStateKind::Archived,
         MemoryReferenceStateKind::HandoffPending => PublicMemoryReferenceStateKind::HandoffPending,
         MemoryReferenceStateKind::HandoffFailed => PublicMemoryReferenceStateKind::HandoffFailed,
+    }
+}
+
+fn map_projection_state_kind(state: ProjectionStateKind) -> PublicProjectionStateKind {
+    match state {
+        ProjectionStateKind::Fresh => PublicProjectionStateKind::Fresh,
+        ProjectionStateKind::Stale => PublicProjectionStateKind::Stale,
+        ProjectionStateKind::RebuildPending => PublicProjectionStateKind::RebuildPending,
+        ProjectionStateKind::Rebuilt => PublicProjectionStateKind::Rebuilt,
+        ProjectionStateKind::Degraded => PublicProjectionStateKind::Degraded,
+        ProjectionStateKind::RebuildFailed => PublicProjectionStateKind::RebuildFailed,
+    }
+}
+
+fn map_reference_state_kind(
+    state: ReferenceResolutionStateKind,
+) -> PublicReferenceResolutionStateKind {
+    match state {
+        ReferenceResolutionStateKind::Resolved => PublicReferenceResolutionStateKind::Resolved,
+        ReferenceResolutionStateKind::Stale => PublicReferenceResolutionStateKind::Stale,
+        ReferenceResolutionStateKind::Unavailable => {
+            PublicReferenceResolutionStateKind::Unavailable
+        }
+        ReferenceResolutionStateKind::Unrecognized => {
+            PublicReferenceResolutionStateKind::Unrecognized
+        }
+        ReferenceResolutionStateKind::PendingReconciliation => {
+            PublicReferenceResolutionStateKind::PendingReconciliation
+        }
+        ReferenceResolutionStateKind::RefreshFailed => {
+            PublicReferenceResolutionStateKind::RefreshFailed
+        }
+    }
+}
+
+fn map_reconciliation_report_state_kind(
+    state: ReconciliationReportStateKind,
+) -> PublicReconciliationReportStateKind {
+    match state {
+        ReconciliationReportStateKind::Generated => PublicReconciliationReportStateKind::Generated,
+        ReconciliationReportStateKind::NoFinding => PublicReconciliationReportStateKind::NoFinding,
+        ReconciliationReportStateKind::FindingDetected => {
+            PublicReconciliationReportStateKind::FindingDetected
+        }
+        ReconciliationReportStateKind::Partial => PublicReconciliationReportStateKind::Partial,
+        ReconciliationReportStateKind::Failed => PublicReconciliationReportStateKind::Failed,
+    }
+}
+
+fn map_outbox_state_kind(state: OutboxStateKind) -> PublicOutboxStateKind {
+    match state {
+        OutboxStateKind::PendingPublish => PublicOutboxStateKind::PendingPublish,
+        OutboxStateKind::Published => PublicOutboxStateKind::Published,
+        OutboxStateKind::RetryableFailed => PublicOutboxStateKind::RetryableFailed,
+        OutboxStateKind::Failed => PublicOutboxStateKind::Failed,
+        OutboxStateKind::SkippedByPolicy => PublicOutboxStateKind::SkippedByPolicy,
+    }
+}
+
+fn map_handoff_state_kind(state: HandoffStateKind) -> PublicHandoffStateKind {
+    match state {
+        HandoffStateKind::PendingHandoff => PublicHandoffStateKind::PendingHandoff,
+        HandoffStateKind::Delivered => PublicHandoffStateKind::Delivered,
+        HandoffStateKind::RetryableFailed => PublicHandoffStateKind::RetryableFailed,
+        HandoffStateKind::Failed => PublicHandoffStateKind::Failed,
+        HandoffStateKind::Cancelled => PublicHandoffStateKind::Cancelled,
     }
 }
 

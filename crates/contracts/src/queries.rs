@@ -5,9 +5,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::metadata::{IdentityQueryMetadata, IdentityQuerySurface};
 use crate::protocol::IdentityQueryName;
+use crate::receipts::TraceHandoffIntentRef;
 use crate::refs::{
-    AuditCursorRef, AuditScopeRef, ConsumerRef, GlobalMemberRef, IdentityChangeKindRef,
-    IdentityTraceSubjectRef, IdentityTruthCursor, RoleCapabilitySummaryRef,
+    AuditCursorRef, AuditScopeRef, ConsumerRef, ExternalReferenceRef, GlobalMemberRef,
+    IdentityChangeKindRef, IdentityOutboxRecordRef, IdentityOutboxSubjectRef,
+    IdentityProjectionRef, IdentityReferenceOwnerRef, IdentityTraceRecordRef,
+    IdentityTraceSubjectRef, IdentityTruthCursor, MaintenanceScopeRef, ProjectionStateRef,
+    ReconciliationReportRef, RoleCapabilitySummaryRef, TopicKeyRef,
 };
 
 /// Public query request envelope.
@@ -180,5 +184,85 @@ pub struct ReadAuditTrailRequest {
     /// Optional audit cursor. This is not a truth cursor and not a page cursor.
     pub audit_cursor_ref: Option<AuditCursorRef>,
     /// Boundary consumer requesting audit material.
+    pub consumer_ref: ConsumerRef,
+}
+
+/// Request body for reading projection freshness without triggering rebuild.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GetProjectionStateRequest {
+    /// Projection or derived view being inspected.
+    pub projection_ref: IdentityProjectionRef,
+    /// Optional stable projection state ref supplied by a previous lookup or result.
+    pub projection_state_ref: Option<ProjectionStateRef>,
+    /// Boundary consumer requesting operations state.
+    pub consumer_ref: ConsumerRef,
+}
+
+/// Request body for reading stored external reference resolution state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GetReferenceResolutionStateRequest {
+    /// External reference bundle being inspected.
+    pub external_reference_ref: ExternalReferenceRef,
+    /// Optional expected local owner for the reference.
+    pub owner_ref: Option<IdentityReferenceOwnerRef>,
+    /// Boundary consumer requesting reference state.
+    pub consumer_ref: ConsumerRef,
+}
+
+/// Request body for reading report-only reconciliation reports.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReadReconciliationReportRequest {
+    /// Maintenance scope whose reports are being read.
+    pub maintenance_scope_ref: MaintenanceScopeRef,
+    /// Optional exact report ref. When present the response page contains at most one item.
+    pub report_ref: Option<ReconciliationReportRef>,
+    /// Boundary consumer requesting report material.
+    pub consumer_ref: ConsumerRef,
+}
+
+/// Supported outbox list selectors.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityOutboxListSelector {
+    /// List pending publish records, optionally by topic.
+    Pending { topic_key_ref: Option<TopicKeyRef> },
+    /// List retryable failed records, optionally by topic.
+    Retryable { topic_key_ref: Option<TopicKeyRef> },
+    /// List records by formal outbox subject.
+    BySubject {
+        subject_ref: IdentityOutboxSubjectRef,
+    },
+    /// List member records through the formal accepted subject mapper.
+    ByMember { member_ref: GlobalMemberRef },
+    /// List outbox records linked to an accepted trace record.
+    ByTrace {
+        trace_record_ref: IdentityTraceRecordRef,
+    },
+}
+
+/// Request body for listing body-free identity outbox state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ListPendingIdentityOutboxRequest {
+    /// Selector mapped to a Step 7 outbox repository read surface.
+    pub selector: IdentityOutboxListSelector,
+    /// Boundary consumer requesting outbox material.
+    pub consumer_ref: ConsumerRef,
+}
+
+/// Request body for reading one outbox record state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GetIdentityOutboxStateRequest {
+    /// Outbox record being inspected.
+    pub outbox_record_ref: IdentityOutboxRecordRef,
+    /// Boundary consumer requesting outbox state.
+    pub consumer_ref: ConsumerRef,
+}
+
+/// Request body for reading trace handoff state without delivery side effects.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GetTraceHandoffStateRequest {
+    /// Handoff intent being inspected.
+    pub handoff_intent_ref: TraceHandoffIntentRef,
+    /// Boundary consumer requesting handoff state.
     pub consumer_ref: ConsumerRef,
 }

@@ -478,6 +478,77 @@ pub trait IdentityQueryMaterialDegradationMapper {
         audit_trail_ref: AuditTrailRef,
         audit_scope_ref: AuditScopeRef,
     ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for a projection state ref mismatch.
+    fn projection_state_ref_mismatch(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        projection_ref: IdentityProjectionRef,
+        requested_state_ref: ProjectionStateRef,
+        loaded_state_ref: ProjectionStateRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for a reference owner mismatch.
+    fn reference_state_owner_mismatch(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        reference_ref: ExternalReferenceRef,
+        expected_owner_ref: IdentityReferenceOwnerRef,
+        loaded_owner_ref: IdentityReferenceOwnerRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for missing or unavailable typed sidecar refs.
+    fn reference_sidecar_degraded(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        reference_ref: ExternalReferenceRef,
+        resolution_state_ref: Option<ReferenceResolutionStateRef>,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for a reconciliation report scope mismatch.
+    fn reconciliation_report_scope_mismatch(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        report_ref: ReconciliationReportRef,
+        expected_scope_ref: MaintenanceScopeRef,
+        loaded_scope_ref: MaintenanceScopeRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for a missing reconciliation report after list.
+    fn reconciliation_report_item_missing_after_list(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        report_ref: ReconciliationReportRef,
+        expected_scope_ref: MaintenanceScopeRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for a missing outbox record after list.
+    fn outbox_record_item_missing_after_list(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        outbox_ref: IdentityOutboxRecordRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for an outbox record that fails selector guards.
+    fn outbox_record_selector_mismatch(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        outbox_ref: IdentityOutboxRecordRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for a handoff intent with empty trace refs.
+    fn handoff_intent_empty_trace_refs(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        intent_ref: TraceHandoffIntentRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
+
+    /// Returns a degraded summary for a delivered handoff without receipt marker.
+    fn handoff_intent_delivered_without_receipt(
+        &self,
+        access: IdentityVisibilityAccessSummary,
+        intent_ref: TraceHandoffIntentRef,
+    ) -> IdentityQueryMaterialDegradationSummary;
 }
 
 /// Maps maintenance and propagation issues into safe maintenance issue refs.
@@ -1128,6 +1199,14 @@ pub trait IdentityReadVisibilityRepository {
         outbox_ref: Option<IdentityOutboxRecordRef>,
         subject_ref: Option<IdentityOutboxSubjectRef>,
         topic_key_ref: Option<TopicKeyRef>,
+        consumer_ref: ConsumerRef,
+        visibility_context_ref: VisibilityContextRef,
+    ) -> Result<Option<IdentityVisibilityAccessSummary>, ApplicationError>;
+
+    /// Resolves an outbox-by-trace page read request into prepared visibility input.
+    fn resolve_outbox_trace_page_read(
+        &self,
+        trace_record_ref: IdentityTraceRecordRef,
         consumer_ref: ConsumerRef,
         visibility_context_ref: VisibilityContextRef,
     ) -> Result<Option<IdentityVisibilityAccessSummary>, ApplicationError>;
