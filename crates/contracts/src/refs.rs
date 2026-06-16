@@ -2108,6 +2108,7 @@ string_newtype!(
     IdentityConsumerReceiptRef,
     "Public consumer receipt reference."
 );
+string_newtype!(IdentityReadSubjectRef, "Canonical read subject reference.");
 string_newtype!(IdentityDegradedMarkerRef, "Safe degraded marker reference.");
 string_newtype!(
     IdentityEventEnvelopeMarkerRef,

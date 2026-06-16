@@ -260,6 +260,24 @@ impl IdentityInMemoryRuntimeBuilder {
         self
     }
 
+    pub fn seed_member_summary_view_with_lookup_scope(
+        mut self,
+        lookup_member_ref: GlobalMemberRef,
+        lookup_scope_ref: VisibilityScopeRef,
+        view: MemberSummaryView,
+        version: IdentityVersion,
+    ) -> Self {
+        self.store.member_scope_index.insert(
+            member_scope_key(&lookup_member_ref, &lookup_scope_ref),
+            view.view_ref.as_str().to_owned(),
+        );
+        self.store.member_summary_views.insert(
+            view.view_ref.as_str().to_owned(),
+            StoredMemberSummaryView { view, version },
+        );
+        self
+    }
+
     pub fn seed_projection_state(
         mut self,
         state: ProjectionState,
@@ -508,6 +526,20 @@ impl IdentityInMemoryRuntime {
 
     pub fn read_visibility_repository(&self) -> &Self {
         self
+    }
+
+    pub fn active_write_transactions(&self) -> Result<usize, ApplicationError> {
+        let staged = self.shared.staged_by_tx.lock().map_err(|_| {
+            ApplicationError::consistency_defect("staged transaction map lock poisoned")
+        })?;
+        Ok(staged.len())
+    }
+
+    pub fn staged_write_count(&self) -> Result<usize, ApplicationError> {
+        let staged = self.shared.staged_by_tx.lock().map_err(|_| {
+            ApplicationError::consistency_defect("staged transaction map lock poisoned")
+        })?;
+        Ok(staged.values().map(Vec::len).sum())
     }
 
     fn stage(
@@ -5819,11 +5851,14 @@ mod tests {
         UpdateGlobalLifecycleStateRequest,
     };
     use identity_contracts::events::{IdentityConsumerOutcome, IdentityConsumerReceipt};
-    use identity_contracts::metadata::{IdentityCommandMetadata, IdentityRequestDigestMarker};
+    use identity_contracts::metadata::{
+        IdentityCommandMetadata, IdentityQueryMetadata, IdentityRequestDigestMarker,
+    };
     use identity_contracts::protocol::{
         IdentityCommandName, IdentityDigestAlgorithmMarkerRef, IdentityInboundConsumerName,
-        IdentityJobName, IdentityProtocolSchemaVersionRef,
+        IdentityJobName, IdentityProtocolSchemaVersionRef, IdentityQueryName,
     };
+    use identity_contracts::queries::IdentityQueryRequest;
     use identity_contracts::receipts::MaintenanceIssueRef;
     use identity_contracts::refs::{
         ArchiveHandoffRef, ArchiveRef, CapabilityEvidenceKind, CapabilityEvidenceRef,
@@ -5835,26 +5870,28 @@ mod tests {
         HandoffStateKind as PublicHandoffStateKind, HandoffTargetRef, IdentityApiRequestMarkerRef,
         IdentityCanonicalRequestMarkerRef, IdentityChangeKind, IdentityConsumerReceiptRef,
         IdentityJobReportRef, IdentityJobRunRef, IdentityJobScopeMarkerRef,
-        IdentityOperationChannel, IdentityOutboxPayloadMarkerRef, IdentityRequestDigestValue,
-        IdentityStoredResultRef, IdentityTimestamp, LifecycleReasonKind, LifecycleReasonRef,
-        MemoryRef, MemoryReferenceChangeIntent, MemoryReferenceChangeMaterialKind,
-        MemoryReferenceChangeMaterialMarker, MemoryReferenceReasonKind, MemoryReferenceReasonRef,
-        MemoryReferenceSourceKind, MemoryReferenceSourceRef,
-        MemoryReferenceStateKind as PublicMemoryReferenceStateKind, ProjectParticipationRef,
-        RoleCapabilityChangeMaterialKind, RoleCapabilityChangeMaterialMarker,
-        RoleCapabilityChangeReasonKind, RoleCapabilityChangeReasonRef, RoleCapabilitySourceKind,
+        IdentityOperationChannel, IdentityOutboxPayloadMarkerRef, IdentityReadSubjectRef,
+        IdentityRequestDigestValue, IdentityStoredResultRef, IdentityTimestamp,
+        LifecycleReasonKind, LifecycleReasonRef, MemoryRef, MemoryReferenceChangeIntent,
+        MemoryReferenceChangeMaterialKind, MemoryReferenceChangeMaterialMarker,
+        MemoryReferenceReasonKind, MemoryReferenceReasonRef, MemoryReferenceSourceKind,
+        MemoryReferenceSourceRef, MemoryReferenceStateKind as PublicMemoryReferenceStateKind,
+        ProjectParticipationRef, RoleCapabilityChangeMaterialKind,
+        RoleCapabilityChangeMaterialMarker, RoleCapabilityChangeReasonKind,
+        RoleCapabilityChangeReasonRef, RoleCapabilitySourceKind,
         RoleCapabilitySummaryStateKind as PublicRoleCapabilitySummaryStateKind, RoleSourceRef,
         TopicKeyRef, TraceHandoffSafeMaterialRef, VisibilityContextRef, WorkSourceKind,
         WorkSourceRef,
     };
     use identity_contracts::views::{
-        IdentityReadMaterialKind, IdentityReadMaterialMarker, MemberSummarySliceKind,
-        MemberSummarySliceRef,
+        IdentityReadMaterialKind, IdentityReadMaterialMarker, IdentityVisibilityAccessState,
+        MemberSummarySliceKind, MemberSummarySliceRef,
     };
     use identity_domain::handoff::HandoffState;
     use identity_domain::outbox::{IdentityOutboxRecord, OutboxState};
 
     use super::*;
+    use identity_application::query::{IdentityQueryService, IdentityQueryServiceDeps};
 
     fn timestamp(value: i64) -> IdentityTimestamp {
         IdentityTimestamp::from_clock(value).expect("valid timestamp")
@@ -7297,6 +7334,9 @@ mod tests {
             .seed_member_summary_access(
                 member_ref("member-1"),
                 IdentityVisibilityAccessSummary {
+                    read_subject_ref: identity_contracts::refs::IdentityReadSubjectRef::new(
+                        "read-subject:member-1",
+                    ),
                     consumer_ref: ConsumerRef::new("consumer-1"),
                     actor_ref: Some(ActorRef::new("actor-1", ActorKind::Human)),
                     visibility_context_ref: VisibilityContextRef::new("context-1"),
@@ -7318,6 +7358,182 @@ mod tests {
             .expect("resolve")
             .expect("summary access");
         assert_eq!(access.scope_ref, scope_ref("scope-a"));
+        assert_eq!(
+            access.read_subject_ref,
+            IdentityReadSubjectRef::new("read-subject:member-1")
+        );
+    }
+
+    fn query_service<'a>(runtime: &'a IdentityInMemoryRuntime) -> IdentityQueryService<'a> {
+        IdentityQueryService::new(IdentityQueryServiceDeps {
+            clock: runtime,
+            id_generator: runtime,
+            operation_context_factory: runtime,
+            read_visibility_repository: runtime,
+            projection_repository: runtime,
+        })
+    }
+
+    fn query_request() -> IdentityQueryRequest<()> {
+        IdentityQueryRequest {
+            actor_ref: ActorRef::new("actor-1", ActorKind::Human),
+            query_name: IdentityQueryName::new("ReadMemberSummary"),
+            metadata: IdentityQueryMetadata {
+                request_marker_ref: IdentityApiRequestMarkerRef::new("query-request-1"),
+                schema_version_ref: IdentityProtocolSchemaVersionRef::new("identity.query.v1"),
+                visibility_context_ref: VisibilityContextRef::new("context-1"),
+                trace_context_ref: None,
+            },
+            page: None,
+            body: (),
+        }
+    }
+
+    fn query_context() -> IdentityOperationContext {
+        IdentityOperationContext::from_query(
+            IdentityOperationContextRef::new("query-context-1"),
+            IdentityOperationName::new("ReadMemberSummary"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            identity_application::support::IdentityRequestMetadataRef::new("query-metadata-1"),
+            IdentityRequestDigest::from_canonical_marker(
+                IdentityCanonicalRequestMarkerRef::new("canonical-query-1"),
+                IdentityRequestDigestValue::new("digest-query-1"),
+                IdentityProtocolSchemaVersionRef::new("identity.query.v1"),
+                IdentityDigestAlgorithmMarkerRef::new("sha256-v1"),
+            ),
+            None,
+            timestamp(1),
+        )
+    }
+
+    #[test]
+    fn query_context_assertion_rejects_write_channel() {
+        let request = query_request();
+        let context = query_context();
+        IdentityQueryService::assert_query_context(&request, &context)
+            .expect("query context should pass");
+
+        let mismatched = IdentityOperationContext::from_command(
+            IdentityOperationContextRef::new("wrong-context-1"),
+            IdentityOperationName::new("ReadMemberSummary"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            identity_application::support::IdentityRequestMetadataRef::new("query-metadata-1"),
+            None,
+            IdentityRequestDigest::from_canonical_marker(
+                IdentityCanonicalRequestMarkerRef::new("canonical-query-1"),
+                IdentityRequestDigestValue::new("digest-query-1"),
+                IdentityProtocolSchemaVersionRef::new("identity.query.v1"),
+                IdentityDigestAlgorithmMarkerRef::new("sha256-v1"),
+            ),
+            None,
+            timestamp(1),
+        );
+        let error = IdentityQueryService::assert_query_context(&request, &mismatched)
+            .expect_err("command context must fail query validation");
+        assert_eq!(error.kind, ApplicationErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn member_summary_preflight_uses_formal_subject_scope_and_stable_lookup() {
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member_summary_view(summary_view("scope-a"), IdentityVersion::new(1))
+            .seed_member_summary_access(
+                member_ref("member-1"),
+                IdentityVisibilityAccessSummary {
+                    read_subject_ref: IdentityReadSubjectRef::new("read-subject:member-1"),
+                    consumer_ref: ConsumerRef::new("consumer-1"),
+                    actor_ref: Some(ActorRef::new("actor-1", ActorKind::Human)),
+                    visibility_context_ref: VisibilityContextRef::new("context-1"),
+                    scope_ref: scope_ref("scope-a"),
+                    access_state: IdentityVisibilityAccessState::Visible,
+                    redaction_profile_ref: None,
+                    visibility_result_ref: visibility_result("visibility-a"),
+                },
+            )
+            .build();
+        let service = query_service(&runtime);
+
+        let prepared = service
+            .prepare_member_summary_read(
+                member_ref("member-1"),
+                ConsumerRef::new("consumer-1"),
+                VisibilityContextRef::new("context-1"),
+            )
+            .expect("preflight");
+
+        assert_eq!(
+            prepared.access_summary.read_subject_ref,
+            IdentityReadSubjectRef::new("read-subject:member-1")
+        );
+        assert_eq!(prepared.access_summary.scope_ref, scope_ref("scope-a"));
+        assert_eq!(prepared.view_ref, MemberSummaryViewRef::new("view-scope-a"));
+    }
+
+    #[test]
+    fn member_summary_preflight_is_no_write_and_rejects_scope_mismatch() {
+        let mismatched_view = MemberSummaryView::from_projection(
+            MemberSummaryViewRef::new("view-scope-a"),
+            member_ref("member-1"),
+            scope_ref("scope-b"),
+            MemberSummarySliceRef::new(
+                MemberSummarySliceKind::Anchor,
+                member_ref("member-1"),
+                identity_source_ref(IdentitySourceOwner::Identity, "summary-source-1"),
+            ),
+            MemberSummarySliceRef::new(
+                MemberSummarySliceKind::Lifecycle,
+                member_ref("member-1"),
+                identity_source_ref(IdentitySourceOwner::Identity, "summary-source-1"),
+            ),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            visibility_result("visibility-a"),
+            Some(IdentityTruthCursor::new("truth-cursor-1")),
+            IdentityReadMaterialMarker::new(IdentityReadMaterialKind::SafeSummaryRefs, None),
+        )
+        .expect("view");
+
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member_summary_view_with_lookup_scope(
+                member_ref("member-1"),
+                scope_ref("scope-a"),
+                mismatched_view,
+                IdentityVersion::new(1),
+            )
+            .seed_member_summary_access(
+                member_ref("member-1"),
+                IdentityVisibilityAccessSummary {
+                    read_subject_ref: IdentityReadSubjectRef::new("read-subject:member-1"),
+                    consumer_ref: ConsumerRef::new("consumer-1"),
+                    actor_ref: Some(ActorRef::new("actor-1", ActorKind::Human)),
+                    visibility_context_ref: VisibilityContextRef::new("context-1"),
+                    scope_ref: scope_ref("scope-a"),
+                    access_state: IdentityVisibilityAccessState::Visible,
+                    redaction_profile_ref: None,
+                    visibility_result_ref: visibility_result("visibility-a"),
+                },
+            )
+            .build();
+        let service = query_service(&runtime);
+
+        let active_before = runtime.active_write_transactions().expect("active writes");
+        let staged_before = runtime.staged_write_count().expect("staged writes");
+        let error = service
+            .prepare_member_summary_read(
+                member_ref("member-1"),
+                ConsumerRef::new("consumer-1"),
+                VisibilityContextRef::new("context-1"),
+            )
+            .expect_err("scope mismatch must surface as consistency defect");
+        let active_after = runtime.active_write_transactions().expect("active writes");
+        let staged_after = runtime.staged_write_count().expect("staged writes");
+
+        assert_eq!(error.kind, ApplicationErrorKind::ConsistencyDefect);
+        assert_eq!(active_before, 0);
+        assert_eq!(active_after, 0);
+        assert_eq!(staged_before, 0);
+        assert_eq!(staged_after, 0);
     }
 
     #[test]

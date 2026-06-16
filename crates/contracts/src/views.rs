@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::errors::ContractError;
 use crate::refs::{
-    ConsumerRef, GlobalMemberRef, IdentityReadSurfaceKind, IdentitySourceRef, IdentityTruthCursor,
-    MemberSummaryViewRef, RedactionProfileRef, VisibilityContextRef, VisibilityResultRef,
-    VisibilityScopeRef,
+    ConsumerRef, GlobalMemberRef, IdentityReadSubjectRef, IdentityReadSurfaceKind,
+    IdentitySourceRef, IdentityTruthCursor, MemberSummaryViewRef, RedactionProfileRef,
+    VisibilityContextRef, VisibilityResultRef, VisibilityScopeRef,
 };
 
 /// Safe summary marker for the identity anchor slice.
@@ -152,6 +152,8 @@ impl IdentityReadMaterialMarker {
 /// Prepared visibility input consumed by visibility policy.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IdentityVisibilityAccessSummary {
+    /// Canonical read subject resolved for this query target.
+    pub read_subject_ref: IdentityReadSubjectRef,
     /// Consumer requesting the material.
     pub consumer_ref: ConsumerRef,
     /// Optional actor represented by the request.

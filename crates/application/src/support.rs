@@ -21,9 +21,10 @@ use identity_contracts::refs::{
     IdentityDegradedMarkerRef, IdentityEventEnvelopeMarkerRef, IdentityJobCursorRef,
     IdentityJobReportRef, IdentityJobRunMetadataRef, IdentityJobRunRef, IdentityJobScopeMarkerRef,
     IdentityMaintenanceTargetRef, IdentityOutboxRecordRef, IdentityProjectionRef,
-    IdentityRedactionMarkerRef, IdentitySourceEventRef, IdentityStoredResultRef, IdentityTimestamp,
-    IdentityTraceContextRef, IdentityTraceRecordRef, IdentityTraceSubjectRef, IdentityTruthCursor,
-    ReconciliationReportRef, VisibilityContextRef, VisibilityResultRef, VisibilityScopeRef,
+    IdentityReadSubjectRef, IdentityRedactionMarkerRef, IdentitySourceEventRef,
+    IdentityStoredResultRef, IdentityTimestamp, IdentityTraceContextRef, IdentityTraceRecordRef,
+    IdentityTraceSubjectRef, IdentityTruthCursor, ReconciliationReportRef, VisibilityContextRef,
+    VisibilityResultRef, VisibilityScopeRef,
 };
 use serde::{Deserialize, Serialize};
 
@@ -94,7 +95,6 @@ string_newtype!(
     IdentityCommandEffectSummaryRef,
     "Accepted command effect summary reference."
 );
-string_newtype!(IdentityReadSubjectRef, "Canonical read subject marker.");
 string_newtype!(
     IdentityDispatchTargetRef,
     "Application service dispatch target marker."

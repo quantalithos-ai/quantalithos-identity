@@ -6,6 +6,7 @@ pub mod command;
 pub mod errors;
 pub mod mapper;
 pub mod ports;
+pub mod query;
 pub mod support;
 
 pub use crate::command::{
@@ -25,6 +26,9 @@ pub use crate::ports::{
     IdentityOperationContextFactoryPort, IdentityOutboxRepository, IdentityStoredResultRepository,
     IdentityTruthChangeSubjectMapper, IdentityUnitOfWork, IdentityUnitOfWorkManagerPort,
 };
+pub use crate::query::{
+    IdentityMemberSummaryPreflight, IdentityQueryService, IdentityQueryServiceDeps,
+};
 pub use crate::support::{
     ExternalReferenceRefSet, GlobalMemberRefSet, IdempotencyReserveOutcome,
     IdentityAcceptedAuditTrailMarkers, IdentityAcceptedEffectKind, IdentityAcceptedSubjectRefs,
@@ -34,9 +38,10 @@ pub use crate::support::{
     IdentityEntrySurfaceKind, IdentityIdempotencyKey, IdentityIdempotencyRecord,
     IdentityIdempotencyRecordRef, IdentityIdempotencyStateKind, IdentityJobRunReport,
     IdentityOperationContext, IdentityOperationContextRef, IdentityOperationName,
-    IdentityProjectionRefSet, IdentityReadDispositionKind, IdentityReadSubjectRef,
-    IdentityRepositoryCursor, IdentityRepositoryPage, IdentityRequestDigest,
-    IdentityRequestMetadataRef, IdentityStoredResultKind, IdentityStoredSurfaceMarkerRef,
-    IdentityTransactionRef, IdentityTruthRef, IdentityVersion, IdentityVersionedRef,
-    IdentityVisibilityDecision, Page, StoredIdentityOperationResult, Versioned,
+    IdentityProjectionRefSet, IdentityReadDispositionKind, IdentityRepositoryCursor,
+    IdentityRepositoryPage, IdentityRequestDigest, IdentityRequestMetadataRef,
+    IdentityStoredResultKind, IdentityStoredSurfaceMarkerRef, IdentityTransactionRef,
+    IdentityTruthRef, IdentityVersion, IdentityVersionedRef, IdentityVisibilityDecision, Page,
+    StoredIdentityOperationResult, Versioned,
 };
+pub use identity_contracts::refs::IdentityReadSubjectRef;
