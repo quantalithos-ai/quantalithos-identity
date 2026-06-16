@@ -29,10 +29,12 @@ mod tests {
         UpdateGlobalLifecycleStateRequest,
     };
     use crate::events::{
-        GlobalLifecycleChangedPayload, GlobalMemberAvailabilityChangedPayload,
-        GlobalMemberEstablishedPayload, IdentityAnchorChangedPayload, IdentityConsumerOutcome,
-        IdentityConsumerReceipt, IdentityInboundEventEnvelope, IdentityOutboundEventEnvelope,
-        IdentityOutboundEventRef,
+        ArchiveHandoffResultPayload, GlobalLifecycleChangedPayload,
+        GlobalMemberAvailabilityChangedPayload, GlobalMemberEstablishedPayload,
+        IdentityAnchorChangedPayload, IdentityConsumerOutcome, IdentityConsumerReceipt,
+        IdentityInboundEventEnvelope, IdentityOutboundEventEnvelope, IdentityOutboundEventRef,
+        MemoryReferenceSourceStateChangedPayload, RoleCapabilitySourceChangedPayload,
+        TraceHandoffResultKind, TraceHandoffResultPayload, WorkParticipationAcceptedPayload,
     };
     use crate::jobs::{
         IdentityJobReportSurface, IdentityJobRequest, IdentityJobResponse, IdentityJobResultKind,
@@ -96,10 +98,10 @@ mod tests {
         RoleCapabilityChangeReasonKind, RoleCapabilityChangeReasonRef,
         RoleCapabilitySafeSummaryRef, RoleCapabilitySourceKind, RoleCapabilitySourceRef,
         RoleCapabilitySourceSnapshotId, RoleCapabilitySourceSnapshotRef,
-        RoleCapabilitySourceStateKind, RoleCapabilitySummaryId, RoleCapabilitySummaryRef,
-        RoleCapabilitySummaryStateKind, RoleSourceRef, TopicKeyRef, TraceHandoffSafeMaterialRef,
-        VisibilityContextRef, VisibilityResultRef, VisibilityScopeRef, WorkSourceKind,
-        WorkSourceRef,
+        RoleCapabilitySourceStateKind, RoleCapabilitySourceVersionRef, RoleCapabilitySummaryId,
+        RoleCapabilitySummaryRef, RoleCapabilitySummaryStateKind, RoleSourceRef, TopicKeyRef,
+        TraceHandoffSafeMaterialRef, VisibilityContextRef, VisibilityResultRef, VisibilityScopeRef,
+        WorkSourceKind, WorkSourceRef,
     };
     use crate::views::{
         AuditTrailEntryView, CareerRecordView, GlobalLifecycleSummaryView, GlobalMemberAnchorView,
@@ -211,6 +213,20 @@ mod tests {
             sample_memory_source_ref("memory-source-1"),
         )
         .expect("sample memory source ref")
+    }
+
+    fn sample_external_reference() -> ExternalReferenceRef {
+        ExternalReferenceRef::new(
+            ExternalReferenceKind::MethodSource,
+            sample_method_source_ref("external-reference-1"),
+        )
+    }
+
+    fn sample_reference_owner() -> IdentityReferenceOwnerRef {
+        IdentityReferenceOwnerRef::new(
+            IdentityReferenceOwnerKind::RoleCapability,
+            sample_identity_source_ref(),
+        )
     }
 
     fn sample_member_summary_slice_ref(kind: MemberSummarySliceKind) -> MemberSummarySliceRef {
@@ -1150,6 +1166,148 @@ mod tests {
         roundtrip(&anchor_changed);
         roundtrip(&lifecycle_changed);
         roundtrip(&availability_changed);
+    }
+
+    #[test]
+    fn inbound_consumer_callback_payloads_roundtrip() {
+        let role_source = sample_role_source_ref();
+        let work_source = sample_work_source_ref_typed();
+        let memory_source = sample_memory_reference_source_ref();
+        let archive_handoff_ref =
+            ArchiveHandoffRef::new(sample_memory_source_ref("handoff-1"), "handoff-1")
+                .expect("archive handoff");
+
+        let role_payload = RoleCapabilitySourceChangedPayload {
+            member_ref: sample_member_ref(),
+            source_ref: role_source.clone(),
+            source_version_ref: RoleCapabilitySourceVersionRef::new(role_source.clone(), "v1")
+                .expect("role source version"),
+            source_state_kind: RoleCapabilitySourceStateKind::SourceResolved,
+            safe_summary_ref: Some(
+                RoleCapabilitySafeSummaryRef::new(role_source.clone(), "safe-role-summary-1")
+                    .expect("role safe summary"),
+            ),
+            evidence_refs: vec![
+                CapabilityEvidenceRef::new(
+                    CapabilityEvidenceKind::MethodArtifact,
+                    role_source.source_ref.clone(),
+                )
+                .expect("role evidence"),
+            ],
+            external_reference_ref: Some(sample_external_reference()),
+            reference_owner_ref: Some(sample_reference_owner()),
+            change_reason_ref: Some(
+                RoleCapabilityChangeReasonRef::new(
+                    RoleCapabilityChangeReasonKind::SourceChanged,
+                    sample_identity_source_ref(),
+                )
+                .expect("role change reason"),
+            ),
+            material_marker: RoleCapabilityChangeMaterialMarker::new(
+                RoleCapabilityChangeMaterialKind::SafeSummaryMarker,
+                Some(role_source.source_ref.clone()),
+            ),
+        };
+
+        let work_payload = WorkParticipationAcceptedPayload {
+            member_ref: sample_member_ref(),
+            project_participation_ref: ProjectParticipationRef::from_work_source(
+                work_source.source_ref.clone(),
+            )
+            .expect("project participation"),
+            work_source_ref: work_source.clone(),
+            career_source_marker_ref: CareerSourceMarkerRef::new(
+                sample_member_ref(),
+                work_source.clone(),
+                "career-marker-1",
+            )
+            .expect("career source marker"),
+            safe_summary_ref: CareerSafeSummaryRef::new(work_source.clone(), "career-safe-1")
+                .expect("career safe summary"),
+            append_reason_ref: Some(
+                CareerAppendReasonRef::new(
+                    CareerAppendReasonKind::ManualAppend,
+                    sample_identity_source_ref(),
+                )
+                .expect("career reason"),
+            ),
+            material_marker: CareerAppendMaterialMarker {
+                material_kind: CareerAppendMaterialKind::SafeSummaryMarker,
+                source_ref: Some(work_source.source_ref.clone()),
+            },
+        };
+
+        let memory_payload = MemoryReferenceSourceStateChangedPayload {
+            member_ref: sample_member_ref(),
+            memory_reference_ref: Some(MemoryReferenceRef::from_id(
+                MemoryReferenceId::new("memory-reference-1".to_owned())
+                    .expect("memory reference id"),
+            )),
+            source_ref: memory_source.clone(),
+            memory_ref: Some(
+                MemoryRef::from_source(sample_memory_source_ref("memory-1")).expect("memory ref"),
+            ),
+            archive_ref: Some(
+                ArchiveRef::from_source(sample_memory_source_ref("archive-1"))
+                    .expect("archive ref"),
+            ),
+            target_state_kind: MemoryReferenceStateKind::Archived,
+            safe_summary_ref: Some(
+                MemorySafeSummaryRef::new(memory_source.clone(), "memory-safe-1")
+                    .expect("memory safe summary"),
+            ),
+            external_reference_ref: Some(sample_external_reference()),
+            reference_owner_ref: Some(sample_reference_owner()),
+            reason_ref: Some(
+                MemoryReferenceReasonRef::new(
+                    MemoryReferenceReasonKind::SourceStateChanged,
+                    sample_identity_source_ref(),
+                )
+                .expect("memory reason"),
+            ),
+            material_marker: MemoryReferenceChangeMaterialMarker {
+                material_kind: MemoryReferenceChangeMaterialKind::ReferenceMarkersOnly,
+                source_ref: Some(memory_source.source_ref.clone()),
+            },
+        };
+
+        let archive_payload = ArchiveHandoffResultPayload {
+            member_ref: sample_member_ref(),
+            memory_reference_ref: None,
+            archive_ref: ArchiveRef::from_source(sample_memory_source_ref("archive-2"))
+                .expect("archive ref"),
+            archive_handoff_ref: archive_handoff_ref.clone(),
+            target_state_kind: MemoryReferenceStateKind::HandoffFailed,
+            reason_ref: Some(
+                MemoryReferenceReasonRef::new(
+                    MemoryReferenceReasonKind::ArchiveHandoffResult,
+                    sample_identity_source_ref(),
+                )
+                .expect("archive reason"),
+            ),
+            issue_ref: Some(HandoffIssueRef::new(sample_identity_source_ref())),
+            material_marker: MemoryReferenceChangeMaterialMarker {
+                material_kind: MemoryReferenceChangeMaterialKind::HandoffMarkerOnly,
+                source_ref: Some(archive_handoff_ref.source_ref.clone()),
+            },
+        };
+
+        let trace_payload = TraceHandoffResultPayload {
+            handoff_intent_ref: TraceHandoffIntentRef::new("handoff-1"),
+            handoff_target_ref: HandoffTargetRef::new("target-1"),
+            handoff_scope_ref: Some(HandoffScopeRef::new("scope-1")),
+            attempt_ref: HandoffAttemptRef::new(sample_identity_source_ref()),
+            result_kind: TraceHandoffResultKind::Delivered,
+            receipt_ref: Some(HandoffReceiptRef::new("receipt-1")),
+            issue_ref: None,
+        };
+
+        roundtrip(&role_payload);
+        roundtrip(&work_payload);
+        roundtrip(&memory_payload);
+        roundtrip(&archive_payload);
+        roundtrip(&trace_payload);
+        roundtrip(&TraceHandoffResultKind::RetryableFailed);
     }
 
     #[test]

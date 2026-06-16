@@ -6,13 +6,21 @@ use crate::metadata::IdentityProtocolValidationIssueRef;
 use crate::protocol::{
     IdentityInboundConsumerName, IdentityOutboundEventName, IdentityProtocolSchemaVersionRef,
 };
+use crate::receipts::TraceHandoffIntentRef;
 use crate::refs::{
-    GlobalLifecycleStateKind, GlobalMemberRef, GovernanceBasisRef, IdentityAnchorReasonRef,
-    IdentityAnchorStateKind, IdentityConsumerBindingRef, IdentityConsumerReceiptRef,
-    IdentityEventEnvelopeMarkerRef, IdentityOutboxPayloadMarkerRef, IdentityOutboxRecordRef,
-    IdentityOutboxSubjectRef, IdentitySourceEventRef, IdentitySourceRef, IdentityStoredResultRef,
+    ArchiveHandoffRef, ArchiveRef, CapabilityEvidenceRef, CareerAppendMaterialMarker,
+    CareerAppendReasonRef, CareerSafeSummaryRef, CareerSourceMarkerRef, GlobalLifecycleStateKind,
+    GlobalMemberRef, GovernanceBasisRef, HandoffAttemptRef, HandoffIssueRef, HandoffReceiptRef,
+    HandoffScopeRef, HandoffTargetRef, IdentityAnchorReasonRef, IdentityAnchorStateKind,
+    IdentityConsumerBindingRef, IdentityConsumerReceiptRef, IdentityEventEnvelopeMarkerRef,
+    IdentityOutboxPayloadMarkerRef, IdentityOutboxRecordRef, IdentityOutboxSubjectRef,
+    IdentityReferenceOwnerRef, IdentitySourceEventRef, IdentitySourceRef, IdentityStoredResultRef,
     IdentityTimestamp, IdentityTraceContextRef, IdentityTraceRecordRef, IdentityTruthCursor,
-    LifecycleReasonRef, TopicKeyRef,
+    LifecycleReasonRef, MemoryRef, MemoryReferenceChangeMaterialMarker, MemoryReferenceReasonRef,
+    MemoryReferenceRef, MemoryReferenceSourceRef, MemoryReferenceStateKind, MemorySafeSummaryRef,
+    ProjectParticipationRef, RoleCapabilityChangeMaterialMarker, RoleCapabilityChangeReasonRef,
+    RoleCapabilitySafeSummaryRef, RoleCapabilitySourceRef, RoleCapabilitySourceStateKind,
+    RoleCapabilitySourceVersionRef, TopicKeyRef, WorkSourceRef,
 };
 
 /// Public inbound event or callback envelope.
@@ -77,6 +85,131 @@ pub enum IdentityConsumerOutcome {
     Noop,
     /// Schema version was unsupported.
     UnsupportedVersion,
+}
+
+/// Body-free method-library role/capability source change payload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RoleCapabilitySourceChangedPayload {
+    /// Member whose role-capability source snapshot changed.
+    pub member_ref: GlobalMemberRef,
+    /// Canonical role-capability source marker.
+    pub source_ref: RoleCapabilitySourceRef,
+    /// Formal source version marker.
+    pub source_version_ref: RoleCapabilitySourceVersionRef,
+    /// Source state reported by the upstream change.
+    pub source_state_kind: RoleCapabilitySourceStateKind,
+    /// Optional redaction-safe summary marker for resolved sources.
+    pub safe_summary_ref: Option<RoleCapabilitySafeSummaryRef>,
+    /// Evidence refs retained by the source snapshot.
+    pub evidence_refs: Vec<CapabilityEvidenceRef>,
+    /// Optional external reference bundle marker.
+    pub external_reference_ref: Option<crate::refs::ExternalReferenceRef>,
+    /// Optional identity owner marker for the external reference bundle.
+    pub reference_owner_ref: Option<IdentityReferenceOwnerRef>,
+    /// Optional body-free source change reason marker.
+    pub change_reason_ref: Option<RoleCapabilityChangeReasonRef>,
+    /// Material guard for forbidden method/evidence body.
+    pub material_marker: RoleCapabilityChangeMaterialMarker,
+}
+
+/// Body-free work participation accepted payload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkParticipationAcceptedPayload {
+    /// Member whose career history may be appended.
+    pub member_ref: GlobalMemberRef,
+    /// Formal project participation marker.
+    pub project_participation_ref: ProjectParticipationRef,
+    /// Formal work source marker.
+    pub work_source_ref: WorkSourceRef,
+    /// Stable duplicate-source marker.
+    pub career_source_marker_ref: CareerSourceMarkerRef,
+    /// Required body-free career safe summary marker.
+    pub safe_summary_ref: CareerSafeSummaryRef,
+    /// Optional append reason marker.
+    pub append_reason_ref: Option<CareerAppendReasonRef>,
+    /// Material guard for forbidden work/project body.
+    pub material_marker: CareerAppendMaterialMarker,
+}
+
+/// Body-free memory/archive carrier source state payload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MemoryReferenceSourceStateChangedPayload {
+    /// Member that owns the memory/archive relation.
+    pub member_ref: GlobalMemberRef,
+    /// Optional direct local relation ref.
+    pub memory_reference_ref: Option<MemoryReferenceRef>,
+    /// Formal memory/archive source marker.
+    pub source_ref: MemoryReferenceSourceRef,
+    /// Optional external memory carrier ref.
+    pub memory_ref: Option<MemoryRef>,
+    /// Optional external archive carrier ref.
+    pub archive_ref: Option<ArchiveRef>,
+    /// Target relation state kind requested by the source event.
+    pub target_state_kind: MemoryReferenceStateKind,
+    /// Optional body-free summary marker for usable states.
+    pub safe_summary_ref: Option<MemorySafeSummaryRef>,
+    /// Optional external reference bundle marker.
+    pub external_reference_ref: Option<crate::refs::ExternalReferenceRef>,
+    /// Optional identity owner marker for the external reference bundle.
+    pub reference_owner_ref: Option<IdentityReferenceOwnerRef>,
+    /// Optional body-free reason marker.
+    pub reason_ref: Option<MemoryReferenceReasonRef>,
+    /// Material guard for forbidden memory/archive body.
+    pub material_marker: MemoryReferenceChangeMaterialMarker,
+}
+
+/// Body-free archive/memory handoff result payload for memory reference state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveHandoffResultPayload {
+    /// Member that owns the memory/archive relation.
+    pub member_ref: GlobalMemberRef,
+    /// Optional direct local relation ref.
+    pub memory_reference_ref: Option<MemoryReferenceRef>,
+    /// Formal archive carrier ref.
+    pub archive_ref: ArchiveRef,
+    /// Formal archive handoff marker.
+    pub archive_handoff_ref: ArchiveHandoffRef,
+    /// Target relation state kind requested by the callback.
+    pub target_state_kind: MemoryReferenceStateKind,
+    /// Optional body-free reason marker.
+    pub reason_ref: Option<MemoryReferenceReasonRef>,
+    /// Optional safe handoff issue marker.
+    pub issue_ref: Option<HandoffIssueRef>,
+    /// Material guard for forbidden receipt/archive body.
+    pub material_marker: MemoryReferenceChangeMaterialMarker,
+}
+
+/// Trace handoff callback result classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceHandoffResultKind {
+    /// Callback confirms formal delivery with a receipt marker.
+    Delivered,
+    /// Callback reports a retryable failure.
+    RetryableFailed,
+    /// Callback reports a terminal failure.
+    Failed,
+    /// Callback reports a policy or target cancellation.
+    Cancelled,
+}
+
+/// Body-free trace handoff receipt or failure payload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TraceHandoffResultPayload {
+    /// Existing handoff intent ref.
+    pub handoff_intent_ref: TraceHandoffIntentRef,
+    /// Formal handoff target marker.
+    pub handoff_target_ref: HandoffTargetRef,
+    /// Optional handoff scope marker for target consistency checks.
+    pub handoff_scope_ref: Option<HandoffScopeRef>,
+    /// Formal delivery attempt marker.
+    pub attempt_ref: HandoffAttemptRef,
+    /// Callback result classification.
+    pub result_kind: TraceHandoffResultKind,
+    /// Formal receipt marker required for delivered results.
+    pub receipt_ref: Option<HandoffReceiptRef>,
+    /// Safe issue marker required for failed or cancelled results.
+    pub issue_ref: Option<HandoffIssueRef>,
 }
 
 /// Public outbound event envelope shell.
