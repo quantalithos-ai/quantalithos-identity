@@ -17,12 +17,12 @@ use identity_contracts::refs::{
     IdentityTraceRecordRef, IdentityTraceSubjectRef, IdentityTruthCursor,
     IdentityVisibilityDecisionRef, LifecycleRiskRef, MaintenanceScopeRef, MemberSummaryViewRef,
     MemoryRef, MemoryReferenceId, MemoryReferenceRef, MemoryReferenceSourceRef,
-    OutboxDeliveryAttemptRef, OutboxDeliveryIssueRef, ProjectionStateRef, ReconciliationReportRef,
-    ReferenceResolutionStateRef, RoleCapabilitySafeSummaryRef, RoleCapabilitySourceRef,
-    RoleCapabilitySourceSnapshotId, RoleCapabilitySourceSnapshotRef,
-    RoleCapabilitySourceVersionRef, RoleCapabilitySummaryId, RoleCapabilitySummaryRef, TopicKeyRef,
-    TraceHandoffSafeMaterialRef, VisibilityContextRef, VisibilityResultRef, VisibilityScopeRef,
-    WorkParticipationSourceSummary, WorkSourceRef,
+    OutboxDeliveryAttemptRef, OutboxDeliveryIssueRef, ProjectionStateRef, ReconciliationFindingRef,
+    ReconciliationReportId, ReconciliationReportRef, ReferenceResolutionStateRef,
+    RoleCapabilitySafeSummaryRef, RoleCapabilitySourceRef, RoleCapabilitySourceSnapshotId,
+    RoleCapabilitySourceSnapshotRef, RoleCapabilitySourceVersionRef, RoleCapabilitySummaryId,
+    RoleCapabilitySummaryRef, TopicKeyRef, TraceHandoffSafeMaterialRef, VisibilityContextRef,
+    VisibilityResultRef, VisibilityScopeRef, WorkParticipationSourceSummary, WorkSourceRef,
 };
 use identity_contracts::views::{IdentityVisibilityAccessSummary, MemberSummaryView};
 use identity_domain::audit::{AuditTrail, AuditTrailEntry};
@@ -54,8 +54,7 @@ use crate::support::{
     IdentityRepositoryPage, IdentityRequestDigest, IdentityRequestMetadataRef,
     IdentityRuntimeAssemblyRef, IdentityStoredSurfaceMarkerRef, IdentityTraceRecordId,
     IdentityTransactionRef, IdentityVersion, IdentityVersionedRef, IdentityWorkerDispatchRef,
-    IdentityWorkerEntryRef, MemberSummaryViewId, Page, ReconciliationReportId,
-    StoredIdentityOperationResult, Versioned,
+    IdentityWorkerEntryRef, MemberSummaryViewId, Page, StoredIdentityOperationResult, Versioned,
 };
 
 /// Shared unit-of-work handle used by all write-side application flows.
@@ -118,6 +117,9 @@ pub trait IdentityIdGeneratorPort {
 
     /// Generates a new reconciliation report id.
     fn new_reconciliation_report_id(&self) -> Result<ReconciliationReportId, ApplicationError>;
+
+    /// Generates a new reconciliation finding ref.
+    fn new_reconciliation_finding_ref(&self) -> Result<ReconciliationFindingRef, ApplicationError>;
 
     /// Generates a new outbox record ref.
     fn new_identity_outbox_record_ref(&self) -> Result<IdentityOutboxRecordRef, ApplicationError>;

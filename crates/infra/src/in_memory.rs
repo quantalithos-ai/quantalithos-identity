@@ -1546,13 +1546,24 @@ impl IdentityIdGeneratorPort for IdentityInMemoryRuntime {
 
     fn new_reconciliation_report_id(
         &self,
-    ) -> Result<identity_application::support::ReconciliationReportId, ApplicationError> {
+    ) -> Result<identity_contracts::refs::ReconciliationReportId, ApplicationError> {
         let next = self
             .shared
             .next_transaction_id
             .fetch_add(1, Ordering::SeqCst);
-        Ok(identity_application::support::ReconciliationReportId::new(
-            format!("report-{next}"),
+        identity_contracts::refs::ReconciliationReportId::new(format!("report-{next}"))
+            .map_err(ApplicationError::from)
+    }
+
+    fn new_reconciliation_finding_ref(
+        &self,
+    ) -> Result<identity_contracts::refs::ReconciliationFindingRef, ApplicationError> {
+        let next = self
+            .shared
+            .next_transaction_id
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(identity_contracts::refs::ReconciliationFindingRef::new(
+            identity_source_ref(IdentitySourceOwner::Identity, &format!("finding-{next}")),
         ))
     }
 
@@ -3388,20 +3399,28 @@ impl IdentityExternalReferenceResolverPort for IdentityInMemoryRuntime {
         let resolution_state_ref = runtime_reference_state_ref(&reference_ref)?;
         let checked_at = runtime_timestamp(1)?;
         if token.contains("unavailable") {
+            let issue_source_ref = reference_ref.source_ref.clone();
             return Ok(ReferenceResolutionState::unavailable(
                 resolution_state_ref,
                 reference_ref,
                 owner_ref,
-                MaintenanceIssueRef::new(format!("reference-unavailable:{token}")),
+                MaintenanceIssueRef::new(
+                    identity_contracts::receipts::MaintenanceIssueKind::Unavailable,
+                    issue_source_ref,
+                ),
                 checked_at,
             ));
         }
         if token.contains("unrecognized") {
+            let issue_source_ref = reference_ref.source_ref.clone();
             return Ok(ReferenceResolutionState::unrecognized(
                 resolution_state_ref,
                 reference_ref,
                 owner_ref,
-                MaintenanceIssueRef::new(format!("reference-unrecognized:{token}")),
+                MaintenanceIssueRef::new(
+                    identity_contracts::receipts::MaintenanceIssueKind::Unrecognized,
+                    issue_source_ref,
+                ),
                 checked_at,
             ));
         }

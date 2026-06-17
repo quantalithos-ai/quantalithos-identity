@@ -4,6 +4,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::refs::IdentitySourceRef;
+
 macro_rules! string_newtype {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
@@ -43,5 +45,43 @@ macro_rules! string_newtype {
     };
 }
 
-string_newtype!(MaintenanceIssueRef, "Safe maintenance issue marker.");
+/// Maintenance issue category.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceIssueKind {
+    /// Projection or reference is stale.
+    Stale,
+    /// External dependency is unavailable.
+    Unavailable,
+    /// External reference cannot be recognized.
+    Unrecognized,
+    /// Derived material is incomplete.
+    Partial,
+    /// Drift was detected.
+    DriftDetected,
+    /// Maintenance execution failed.
+    Failed,
+    /// Forbidden material was detected.
+    ForbiddenBody,
+}
+
+/// Body-free maintenance issue marker.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct MaintenanceIssueRef {
+    /// Issue category.
+    pub issue_kind: MaintenanceIssueKind,
+    /// Opaque issue source marker.
+    pub issue_ref: IdentitySourceRef,
+}
+
+impl MaintenanceIssueRef {
+    /// Creates a new body-free maintenance issue marker.
+    pub fn new(issue_kind: MaintenanceIssueKind, issue_ref: IdentitySourceRef) -> Self {
+        Self {
+            issue_kind,
+            issue_ref,
+        }
+    }
+}
+
 string_newtype!(TraceHandoffIntentRef, "Trace handoff intent reference.");

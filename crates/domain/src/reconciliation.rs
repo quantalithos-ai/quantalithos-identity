@@ -3,13 +3,13 @@
 use core_contracts::actor::ActorRef;
 use identity_contracts::receipts::MaintenanceIssueRef;
 use identity_contracts::refs::{
-    IdentityMaintenanceTargetRef, IdentityOperationChannel, IdentityProjectionRef,
-    IdentityTimestamp, MaintenanceScopeRef, ReconciliationFindingIntentRef,
-    ReconciliationFindingRef, ReconciliationReportRef,
+    ExternalReferenceRef, IdentityMaintenanceTargetKind, IdentityMaintenanceTargetRef,
+    IdentityOperationChannel, IdentityProjectionRef, IdentityTimestamp, MaintenanceScopeRef,
+    ReconciliationFindingIntentRef, ReconciliationFindingMaterial,
+    ReconciliationFindingMaterialKind, ReconciliationFindingRef, ReconciliationReportRef,
 };
 
 use crate::errors::IdentityDomainError;
-use identity_contracts::refs::ExternalReferenceRef;
 
 /// Maintenance intent category.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,28 +24,6 @@ pub enum IdentityMaintenanceIntent {
     RepairIdentityTruth,
     /// Attempt to repair external truth.
     RepairExternalTruth,
-}
-
-/// Material kind carried by a reconciliation finding.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReconciliationFindingMaterialKind {
-    /// Safe refs only.
-    SafeRefsOnly,
-    /// Safe maintenance issue refs only.
-    IssueRefsOnly,
-    /// Forbidden external body.
-    ForbiddenExternalBody,
-    /// Forbidden raw diagnostic body.
-    ForbiddenDiagnosticBody,
-    /// Forbidden secret or credential material.
-    ForbiddenSecret,
-}
-
-/// Material marker consumed by reconciliation policy.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReconciliationFindingMaterial {
-    /// Finding material category.
-    pub material_kind: ReconciliationFindingMaterialKind,
 }
 
 /// Report-only reconciliation report state kind.
@@ -94,7 +72,10 @@ impl ReconciliationPolicy {
             maintenance_scope_ref,
             operation_channel,
             actor_ref,
-            target_ref: IdentityMaintenanceTargetRef::new(projection_ref.as_str()),
+            target_ref: IdentityMaintenanceTargetRef::new(
+                IdentityMaintenanceTargetKind::Projection,
+                projection_ref.projection_ref,
+            ),
             maintenance_intent: IdentityMaintenanceIntent::RebuildProjection,
             finding_intent_ref: None,
             finding_material: None,
@@ -113,7 +94,8 @@ impl ReconciliationPolicy {
             operation_channel,
             actor_ref,
             target_ref: IdentityMaintenanceTargetRef::new(
-                external_reference_ref.source_ref.external_ref.as_str(),
+                IdentityMaintenanceTargetKind::ReferenceResolution,
+                external_reference_ref.source_ref,
             ),
             maintenance_intent: IdentityMaintenanceIntent::RefreshReference,
             finding_intent_ref: None,

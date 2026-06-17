@@ -152,6 +152,11 @@ validated_string_newtype!(
     "reference_resolution_state_id",
     "Stable opaque identifier for an identity reference resolution state."
 );
+validated_string_newtype!(
+    ReconciliationReportId,
+    "reconciliation_report_id",
+    "Stable opaque identifier for an identity reconciliation report."
+);
 
 /// Entry channel that explains why identity code is executing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2190,7 +2195,6 @@ string_newtype!(
 );
 string_newtype!(IdentityJobRunRef, "Operations job run reference.");
 string_newtype!(IdentityJobScopeMarkerRef, "Operations job scope marker.");
-string_newtype!(IdentityMaintenanceTargetRef, "Maintenance target marker.");
 string_newtype!(
     MemberSummaryViewRef,
     "Stable member summary view reference."
@@ -2204,7 +2208,6 @@ string_newtype!(
     IdentityOutboxSubjectRef,
     "Canonical outbound subject reference."
 );
-string_newtype!(IdentityProjectionRef, "Projection reference.");
 string_newtype!(
     IdentityRedactionMarkerRef,
     "Safe redaction marker reference."
@@ -2225,15 +2228,6 @@ string_newtype!(
     IdentityTruthCursor,
     "Committed identity truth cursor marker."
 );
-string_newtype!(
-    ReconciliationFindingIntentRef,
-    "Reconciliation finding intent marker."
-);
-string_newtype!(
-    ReconciliationFindingRef,
-    "Reconciliation finding reference."
-);
-string_newtype!(ReconciliationReportRef, "Reconciliation report reference.");
 string_newtype!(TopicKeyRef, "Topic binding key marker.");
 string_newtype!(RedactionProfileRef, "Safe redaction profile marker.");
 string_newtype!(VisibilityContextRef, "Visibility context marker.");
@@ -2245,7 +2239,172 @@ string_newtype!(
 );
 string_newtype!(HandoffReceiptRef, "Formal handoff receipt reference.");
 
-pub use crate::receipts::{MaintenanceIssueRef, TraceHandoffIntentRef};
+pub use crate::receipts::{MaintenanceIssueKind, MaintenanceIssueRef, TraceHandoffIntentRef};
+
+/// Identity projection category.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityProjectionKind {
+    /// Member summary read model.
+    MemberSummary,
+    /// Consumer-facing identity projection.
+    ConsumerProjection,
+    /// Trace or audit read projection.
+    TraceAuditProjection,
+    /// Maintenance report projection.
+    MaintenanceReportProjection,
+}
+
+/// Body-free reference to an identity-owned projection or derived view.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct IdentityProjectionRef {
+    /// Projection category.
+    pub projection_kind: IdentityProjectionKind,
+    /// Opaque projection marker.
+    pub projection_ref: IdentitySourceRef,
+}
+
+impl IdentityProjectionRef {
+    /// Creates a new projection ref from a formal kind and body-free marker.
+    pub fn new(
+        projection_kind: IdentityProjectionKind,
+        projection_ref: IdentitySourceRef,
+    ) -> Result<Self, ContractError> {
+        ensure_source_owner(
+            "projection_ref",
+            &projection_ref,
+            &[IdentitySourceOwner::Identity],
+        )?;
+        Ok(Self {
+            projection_kind,
+            projection_ref,
+        })
+    }
+
+    /// Returns the underlying projection marker string.
+    pub fn as_str(&self) -> &str {
+        self.projection_ref.external_ref.as_str()
+    }
+}
+
+/// Maintenance target category.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityMaintenanceTargetKind {
+    /// Projection target.
+    Projection,
+    /// Reference resolution target.
+    ReferenceResolution,
+    /// Reconciliation report target.
+    ReconciliationReport,
+}
+
+/// Body-free maintenance target marker.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct IdentityMaintenanceTargetRef {
+    /// Target category.
+    pub target_kind: IdentityMaintenanceTargetKind,
+    /// Opaque target marker.
+    pub target_ref: IdentitySourceRef,
+}
+
+impl IdentityMaintenanceTargetRef {
+    /// Creates a new maintenance target ref from a formal kind and body-free marker.
+    pub fn new(target_kind: IdentityMaintenanceTargetKind, target_ref: IdentitySourceRef) -> Self {
+        Self {
+            target_kind,
+            target_ref,
+        }
+    }
+
+    /// Returns the underlying maintenance target marker string.
+    pub fn as_str(&self) -> &str {
+        self.target_ref.external_ref.as_str()
+    }
+}
+
+/// Body-free finding intent marker.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ReconciliationFindingIntentRef {
+    /// Opaque finding intent marker.
+    pub intent_ref: IdentitySourceRef,
+}
+
+impl ReconciliationFindingIntentRef {
+    /// Creates a new body-free finding intent marker.
+    pub fn new(intent_ref: IdentitySourceRef) -> Self {
+        Self { intent_ref }
+    }
+}
+
+/// Material kind carried by a reconciliation finding.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationFindingMaterialKind {
+    /// Safe refs only.
+    SafeRefsOnly,
+    /// Safe maintenance issue refs only.
+    IssueRefsOnly,
+    /// Forbidden external body.
+    ForbiddenExternalBody,
+    /// Forbidden raw diagnostic body.
+    ForbiddenDiagnosticBody,
+    /// Forbidden secret or credential material.
+    ForbiddenSecret,
+}
+
+/// Material marker consumed by reconciliation policy and public job shells.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ReconciliationFindingMaterial {
+    /// Finding material category.
+    pub material_kind: ReconciliationFindingMaterialKind,
+    /// Optional body-free source marker.
+    pub source_ref: Option<IdentitySourceRef>,
+}
+
+/// Typed reference to an identity reconciliation report.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ReconciliationReportRef {
+    /// Stable report id.
+    pub report_id: ReconciliationReportId,
+}
+
+impl ReconciliationReportRef {
+    /// Creates a typed ref from a validated reconciliation report id.
+    pub fn from_id(report_id: ReconciliationReportId) -> Self {
+        Self { report_id }
+    }
+
+    /// Returns the contained report identifier.
+    pub fn as_str(&self) -> &str {
+        self.report_id.as_str()
+    }
+}
+
+impl fmt::Display for ReconciliationReportRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Body-free reference to a reconciliation finding.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ReconciliationFindingRef {
+    /// Opaque finding marker.
+    pub finding_ref: IdentitySourceRef,
+}
+
+impl ReconciliationFindingRef {
+    /// Creates a new body-free finding ref.
+    pub fn new(finding_ref: IdentitySourceRef) -> Self {
+        Self { finding_ref }
+    }
+
+    /// Returns the underlying finding marker string.
+    pub fn as_str(&self) -> &str {
+        self.finding_ref.external_ref.as_str()
+    }
+}
 
 /// Identity-side timestamp captured from the configured clock source.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

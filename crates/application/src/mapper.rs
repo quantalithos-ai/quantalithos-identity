@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use identity_contracts::metadata::IdentityDegradedKind;
 use identity_contracts::protocol::IdentityJobName;
-use identity_contracts::receipts::{MaintenanceIssueRef, TraceHandoffIntentRef};
+use identity_contracts::receipts::{
+    MaintenanceIssueKind, MaintenanceIssueRef, TraceHandoffIntentRef,
+};
 use identity_contracts::refs::{
     AuditScopeRef, AuditTrailRef, CareerRecordRef, ExternalReferenceRef, GlobalMemberRef,
     HandoffIssueRef, HandoffReceiptRef, IdentityAuditSubjectRef, IdentityConsumerBindingRef,
@@ -620,8 +622,11 @@ impl IdentityQueryMaterialDegradationMapper for DefaultIdentityQueryMaterialDegr
 pub struct DefaultIdentityMaintenanceIssueMapper;
 
 impl DefaultIdentityMaintenanceIssueMapper {
-    fn issue_from_marker(marker: IdentitySourceRef, suffix: &str) -> MaintenanceIssueRef {
-        MaintenanceIssueRef::new(format!("{suffix}:{}", marker.external_ref.as_str()))
+    fn issue_from_marker(
+        marker: IdentitySourceRef,
+        issue_kind: MaintenanceIssueKind,
+    ) -> MaintenanceIssueRef {
+        MaintenanceIssueRef::new(issue_kind, marker)
     }
 }
 
@@ -630,79 +635,70 @@ impl IdentityMaintenanceIssueMapper for DefaultIdentityMaintenanceIssueMapper {
         &self,
         projection_ref: IdentityProjectionRef,
     ) -> MaintenanceIssueRef {
-        MaintenanceIssueRef::new(format!(
-            "projection-missing-state:{}",
-            projection_ref.as_str()
-        ))
+        MaintenanceIssueRef::new(MaintenanceIssueKind::Failed, projection_ref.projection_ref)
     }
 
     fn projection_missing_cursor_issue(
         &self,
         projection_ref: IdentityProjectionRef,
     ) -> MaintenanceIssueRef {
-        MaintenanceIssueRef::new(format!(
-            "projection-missing-cursor:{}",
-            projection_ref.as_str()
-        ))
+        MaintenanceIssueRef::new(MaintenanceIssueKind::Partial, projection_ref.projection_ref)
     }
 
     fn projection_unsupported_writer_issue(
         &self,
         projection_ref: IdentityProjectionRef,
     ) -> MaintenanceIssueRef {
-        MaintenanceIssueRef::new(format!(
-            "projection-unsupported-writer:{}",
-            projection_ref.as_str()
-        ))
+        MaintenanceIssueRef::new(MaintenanceIssueKind::Failed, projection_ref.projection_ref)
     }
 
     fn reference_missing_state_issue(
         &self,
         reference_ref: ExternalReferenceRef,
     ) -> MaintenanceIssueRef {
-        Self::issue_from_marker(reference_ref.source_ref, "reference-missing-state")
+        Self::issue_from_marker(reference_ref.source_ref, MaintenanceIssueKind::Failed)
     }
 
     fn reference_refresh_failed_issue(
         &self,
         reference_ref: ExternalReferenceRef,
     ) -> MaintenanceIssueRef {
-        Self::issue_from_marker(reference_ref.source_ref, "reference-refresh-failed")
+        Self::issue_from_marker(reference_ref.source_ref, MaintenanceIssueKind::Failed)
     }
 
     fn outbox_retryable_issue(&self, issue_ref: OutboxDeliveryIssueRef) -> MaintenanceIssueRef {
-        Self::issue_from_marker(issue_ref.issue_ref, "outbox-retryable")
+        Self::issue_from_marker(issue_ref.issue_ref, MaintenanceIssueKind::Failed)
     }
 
     fn outbox_permanent_issue(&self, issue_ref: OutboxDeliveryIssueRef) -> MaintenanceIssueRef {
-        Self::issue_from_marker(issue_ref.issue_ref, "outbox-permanent")
+        Self::issue_from_marker(issue_ref.issue_ref, MaintenanceIssueKind::Failed)
     }
 
     fn outbox_skipped_issue(&self, issue_ref: OutboxDeliveryIssueRef) -> MaintenanceIssueRef {
-        Self::issue_from_marker(issue_ref.issue_ref, "outbox-skipped")
+        Self::issue_from_marker(issue_ref.issue_ref, MaintenanceIssueKind::Partial)
     }
 
     fn outbox_unsupported_topic_issue(
         &self,
         issue_ref: OutboxDeliveryIssueRef,
     ) -> MaintenanceIssueRef {
-        Self::issue_from_marker(issue_ref.issue_ref, "outbox-unsupported-topic")
+        Self::issue_from_marker(issue_ref.issue_ref, MaintenanceIssueKind::Failed)
     }
 
     fn handoff_retryable_issue(&self, issue_ref: HandoffIssueRef) -> MaintenanceIssueRef {
-        Self::issue_from_marker(issue_ref.issue_ref, "handoff-retryable")
+        Self::issue_from_marker(issue_ref.issue_ref, MaintenanceIssueKind::Failed)
     }
 
     fn handoff_permanent_issue(&self, issue_ref: HandoffIssueRef) -> MaintenanceIssueRef {
-        Self::issue_from_marker(issue_ref.issue_ref, "handoff-permanent")
+        Self::issue_from_marker(issue_ref.issue_ref, MaintenanceIssueKind::Failed)
     }
 
     fn handoff_cancelled_issue(&self, issue_ref: HandoffIssueRef) -> MaintenanceIssueRef {
-        Self::issue_from_marker(issue_ref.issue_ref, "handoff-cancelled")
+        Self::issue_from_marker(issue_ref.issue_ref, MaintenanceIssueKind::Partial)
     }
 
     fn handoff_unsupported_target_issue(&self, issue_ref: HandoffIssueRef) -> MaintenanceIssueRef {
-        Self::issue_from_marker(issue_ref.issue_ref, "handoff-unsupported-target")
+        Self::issue_from_marker(issue_ref.issue_ref, MaintenanceIssueKind::Failed)
     }
 }
 
