@@ -8,6 +8,7 @@ use identity_application::mapper::{
     DefaultIdentityAcceptedAuditTrailMarkerMapper, DefaultIdentityMarkerSubjectMapper,
     DefaultIdentityTruthChangeSubjectMapper,
 };
+use identity_application::outbound_material::AcceptedOutboundMaterialKind;
 use identity_application::ports::{
     CareerRecordRepository, ExternalReferenceTypedSidecarRefs, GlobalLifecycleRepository,
     GlobalMemberRepository, HandoffDeliveryOutcome, HandoffReceiptResolution,
@@ -38,7 +39,9 @@ use identity_application::support::{
     IdentityVersionedRef, Page, StoredIdentityOperationResult, Versioned,
 };
 use identity_contracts::jobs::IdentityJobResultKind;
-use identity_contracts::protocol::IdentityJobName;
+use identity_contracts::protocol::{
+    IdentityJobName, IdentityOutboundEventName, IdentityProtocolSchemaVersionRef,
+};
 use identity_contracts::receipts::{MaintenanceIssueRef, TraceHandoffIntentRef};
 use identity_contracts::refs::{
     ArchiveHandoffRef, ArchiveRef, AuditCursorRef, AuditScopeRef, AuditTrailRef, CareerRecordId,
@@ -47,11 +50,11 @@ use identity_contracts::refs::{
     GlobalMemberRef, GovernanceBasisRef, GovernanceBasisState, GovernanceBasisSummary,
     HandoffIssueRef, HandoffReceiptRef, HandoffScopeRef, HandoffTargetRef, IdentityAuditSubjectRef,
     IdentityChangeKindRef, IdentityJobRunRef, IdentityMaintenanceTargetRef,
-    IdentityOutboxRecordRef, IdentityOutboxSubjectRef, IdentityProjectionCursorRef,
-    IdentityProjectionRef, IdentityReferenceOwnerKind, IdentityReferenceOwnerRef,
-    IdentitySourceOwner, IdentitySourceRef, IdentityTimestamp, IdentityTraceRecordRef,
-    IdentityTraceSubjectRef, IdentityTruthCursor, LifecycleRiskRef, MaintenanceScopeRef,
-    MemberSummaryViewRef, MemoryRef, MemoryReferenceId, MemoryReferenceRef,
+    IdentityOutboxPayloadMarkerRef, IdentityOutboxRecordRef, IdentityOutboxSubjectRef,
+    IdentityProjectionCursorRef, IdentityProjectionRef, IdentityReferenceOwnerKind,
+    IdentityReferenceOwnerRef, IdentitySourceOwner, IdentitySourceRef, IdentityTimestamp,
+    IdentityTraceRecordRef, IdentityTraceSubjectRef, IdentityTruthCursor, LifecycleRiskRef,
+    MaintenanceScopeRef, MemberSummaryViewRef, MemoryRef, MemoryReferenceId, MemoryReferenceRef,
     MemoryReferenceSourceState, ProjectParticipationRef, ProjectionStateRef,
     ReconciliationReportRef, ReferenceResolutionStateId, ReferenceResolutionStateRef,
     RoleCapabilitySourceRef, RoleCapabilitySourceSnapshotRef, RoleCapabilitySummaryRef,
@@ -360,6 +363,8 @@ impl IdentityInMemoryRuntimeBuilder {
             outbox_trace_key(&record.trace_record_ref, &record.outbox_record_ref),
             key.clone(),
         );
+        seed_outbox_payload_marker_snapshot(&mut self.store, &record)
+            .expect("seeded outbox record must use a canonical accepted outbound material");
         self.store
             .outbox_records
             .insert(key, StoredOutboxRecord { record, version });
@@ -1067,8 +1072,10 @@ struct RuntimeStore {
     reconciliation_reports: HashMap<String, StoredReconciliationReport>,
     handoff_intents: HashMap<String, StoredHandoffIntent>,
     outbox_records: HashMap<String, StoredOutboxRecord>,
+    outbox_payload_markers: HashMap<String, StoredOutboxPayloadMarker>,
     outbox_subject_index: HashMap<String, String>,
     outbox_trace_index: HashMap<String, String>,
+    outbox_trace_event_index: HashMap<String, String>,
     idempotency_records: HashMap<String, StoredIdempotencyRecord>,
     idempotency_key_index: HashMap<String, String>,
     stored_results: HashMap<String, StoredIdentityOperationResult>,
@@ -1184,6 +1191,15 @@ struct StoredHandoffIntent {
 struct StoredOutboxRecord {
     record: IdentityOutboxRecord,
     version: IdentityVersion,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoredOutboxPayloadMarker {
+    payload_marker_ref: IdentityOutboxPayloadMarkerRef,
+    event_name: IdentityOutboundEventName,
+    schema_version_ref: IdentityProtocolSchemaVersionRef,
+    subject_ref: IdentityOutboxSubjectRef,
+    trace_record_ref: IdentityTraceRecordRef,
 }
 
 #[derive(Clone, Debug)]
@@ -5763,6 +5779,8 @@ fn apply_save_outbox_record(
         ));
     }
 
+    let material_kind = outbox_material_kind(&record)?;
+
     match (
         store.outbox_records.get(record.outbox_record_ref.as_str()),
         expected_version,
@@ -5777,7 +5795,24 @@ fn apply_save_outbox_record(
                     "outbox record already exists",
                 ));
             }
+            if !store
+                .trace_records
+                .contains_key(record.trace_record_ref.as_str())
+            {
+                return Err(ApplicationError::consistency_defect(
+                    "accepted outbox requires a persisted accepted trace record",
+                ));
+            }
             let key = record.outbox_record_ref.as_str().to_owned();
+            let trace_event_key = outbox_trace_event_key(&record.trace_record_ref, material_kind);
+            if let Some(existing) = store.outbox_trace_event_index.get(&trace_event_key) {
+                if existing != &key {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::FormalUniqueConflict,
+                        "accepted outbox trace and event kind must remain unique",
+                    ));
+                }
+            }
             store.outbox_subject_index.insert(
                 outbox_subject_key(&record.subject_ref, &record.outbox_record_ref),
                 key.clone(),
@@ -5786,6 +5821,10 @@ fn apply_save_outbox_record(
                 outbox_trace_key(&record.trace_record_ref, &record.outbox_record_ref),
                 key.clone(),
             );
+            store
+                .outbox_trace_event_index
+                .insert(trace_event_key, key.clone());
+            upsert_outbox_payload_marker_snapshot(store, &record, material_kind)?;
             store.outbox_records.insert(
                 key,
                 StoredOutboxRecord {
@@ -5796,6 +5835,7 @@ fn apply_save_outbox_record(
             Ok(())
         }
         (Some(existing), Some(expected)) if existing.version == expected => {
+            assert_outbox_material_immutable(&existing.record, &record)?;
             let key = record.outbox_record_ref.as_str().to_owned();
             store.outbox_subject_index.retain(|_, value| value != &key);
             store.outbox_trace_index.retain(|_, value| value != &key);
@@ -5807,6 +5847,7 @@ fn apply_save_outbox_record(
                 outbox_trace_key(&record.trace_record_ref, &record.outbox_record_ref),
                 key.clone(),
             );
+            upsert_outbox_payload_marker_snapshot(store, &record, material_kind)?;
             store.outbox_records.insert(
                 key,
                 StoredOutboxRecord {
@@ -5823,6 +5864,76 @@ fn apply_save_outbox_record(
             "outbox record version mismatch",
         )),
     }
+}
+
+fn outbox_material_kind(
+    record: &IdentityOutboxRecord,
+) -> Result<AcceptedOutboundMaterialKind, ApplicationError> {
+    AcceptedOutboundMaterialKind::from_topic_key_ref(&record.topic_key_ref).ok_or_else(|| {
+        ApplicationError::consistency_defect(
+            "accepted outbox record must use a canonical accepted outbound topic key",
+        )
+    })
+}
+
+fn upsert_outbox_payload_marker_snapshot(
+    store: &mut RuntimeStore,
+    record: &IdentityOutboxRecord,
+    material_kind: AcceptedOutboundMaterialKind,
+) -> Result<(), ApplicationError> {
+    let snapshot = StoredOutboxPayloadMarker {
+        payload_marker_ref: record.payload_marker_ref.clone(),
+        event_name: material_kind.event_name(),
+        schema_version_ref: material_kind.schema_version_ref(),
+        subject_ref: record.subject_ref.clone(),
+        trace_record_ref: record.trace_record_ref.clone(),
+    };
+    match store
+        .outbox_payload_markers
+        .get(record.payload_marker_ref.as_str())
+    {
+        Some(existing) if existing != &snapshot => Err(ApplicationError::consistency_defect(
+            "outbox payload marker snapshot is immutable once saved",
+        )),
+        Some(_) => Ok(()),
+        None => {
+            store
+                .outbox_payload_markers
+                .insert(record.payload_marker_ref.as_str().to_owned(), snapshot);
+            Ok(())
+        }
+    }
+}
+
+fn seed_outbox_payload_marker_snapshot(
+    store: &mut RuntimeStore,
+    record: &IdentityOutboxRecord,
+) -> Result<(), ApplicationError> {
+    let material_kind = outbox_material_kind(record)?;
+    store.outbox_trace_event_index.insert(
+        outbox_trace_event_key(&record.trace_record_ref, material_kind),
+        record.outbox_record_ref.as_str().to_owned(),
+    );
+    upsert_outbox_payload_marker_snapshot(store, record, material_kind)
+}
+
+fn assert_outbox_material_immutable(
+    existing: &IdentityOutboxRecord,
+    next: &IdentityOutboxRecord,
+) -> Result<(), ApplicationError> {
+    if existing.member_ref != next.member_ref
+        || existing.subject_ref != next.subject_ref
+        || existing.change_kind_ref != next.change_kind_ref
+        || existing.payload_marker_ref != next.payload_marker_ref
+        || existing.topic_key_ref != next.topic_key_ref
+        || existing.trace_record_ref != next.trace_record_ref
+        || existing.created_at != next.created_at
+    {
+        return Err(ApplicationError::consistency_defect(
+            "outbox accepted material must remain immutable after creation",
+        ));
+    }
+    Ok(())
 }
 
 fn apply_save_idempotency_reservation(
@@ -6447,6 +6558,17 @@ fn outbox_record_access_key(
     format!("{outbox_token}::{subject_token}::{topic_token}")
 }
 
+fn outbox_trace_event_key(
+    trace_record_ref: &IdentityTraceRecordRef,
+    material_kind: AcceptedOutboundMaterialKind,
+) -> String {
+    format!(
+        "{}::{}",
+        trace_record_ref.as_str(),
+        material_kind.event_name().as_str()
+    )
+}
+
 fn identity_source_key(source_ref: &IdentitySourceRef) -> String {
     format!(
         "{:?}::{}",
@@ -6752,6 +6874,7 @@ mod tests {
     use core_contracts::actor::{ActorKind, ActorRef};
     use identity_application::command::{IdentityCommandService, IdentityCommandServiceDeps};
     use identity_application::consumer::{IdentityConsumerService, IdentityConsumerServiceDeps};
+    use identity_application::outbound_material::AcceptedOutboundMaterialKind;
     use identity_contracts::commands::{
         AppendCareerRecordRequest, EstablishGlobalMemberRequest, IdentityCommandOutcome,
         IdentityCommandRequest, MaintainMemoryReferenceRequest,
@@ -6810,8 +6933,7 @@ mod tests {
         RoleCapabilityChangeReasonKind, RoleCapabilityChangeReasonRef,
         RoleCapabilitySafeSummaryRef, RoleCapabilitySourceKind, RoleCapabilitySourceVersionRef,
         RoleCapabilitySummaryStateKind as PublicRoleCapabilitySummaryStateKind, RoleSourceRef,
-        TopicKeyRef, TraceHandoffSafeMaterialRef, VisibilityContextRef, WorkSourceKind,
-        WorkSourceRef,
+        TraceHandoffSafeMaterialRef, VisibilityContextRef, WorkSourceKind, WorkSourceRef,
     };
     use identity_contracts::views::{
         IdentityReadMaterialKind, IdentityReadMaterialMarker, IdentityVisibilityAccessState,
@@ -7850,12 +7972,53 @@ mod tests {
                 None,
             ),
             payload_marker_ref: IdentityOutboxPayloadMarkerRef::new(format!("payload-{token}")),
-            topic_key_ref: TopicKeyRef::new(format!("topic-{token}")),
+            topic_key_ref: identity_application::outbound_material::AcceptedOutboundMaterialKind::GlobalLifecycleChanged
+                .topic_key_ref(),
             trace_record_ref: IdentityTraceRecordRef::new(format!("trace-{token}")),
             outbox_state: state,
             created_at: timestamp(1),
             updated_at: timestamp(1),
         }
+    }
+
+    fn outbox_payload_marker_count(runtime: &IdentityInMemoryRuntime) -> usize {
+        runtime
+            .shared
+            .store
+            .lock()
+            .expect("lock runtime store")
+            .outbox_payload_markers
+            .len()
+    }
+
+    fn assert_outbox_material_snapshot(
+        runtime: &IdentityInMemoryRuntime,
+        outbox_ref: &IdentityOutboxRecordRef,
+        expected_kind: AcceptedOutboundMaterialKind,
+    ) {
+        let store = runtime.shared.store.lock().expect("lock runtime store");
+        let stored = store
+            .outbox_records
+            .get(outbox_ref.as_str())
+            .expect("stored outbox record");
+        let snapshot = store
+            .outbox_payload_markers
+            .get(stored.record.payload_marker_ref.as_str())
+            .expect("stored outbox payload marker");
+        let trace = store
+            .trace_records
+            .get(stored.record.trace_record_ref.as_str())
+            .expect("stored trace record");
+
+        assert_eq!(stored.record.topic_key_ref, expected_kind.topic_key_ref());
+        assert_eq!(snapshot.event_name, expected_kind.event_name());
+        assert_eq!(
+            snapshot.schema_version_ref,
+            expected_kind.schema_version_ref()
+        );
+        assert_eq!(snapshot.subject_ref, stored.record.subject_ref);
+        assert_eq!(snapshot.trace_record_ref, stored.record.trace_record_ref);
+        assert!(!trace.trace.source_cursor_ref.as_str().is_empty());
     }
 
     #[test]
@@ -8974,6 +9137,12 @@ mod tests {
         assert_eq!(first.outcome, IdentityConsumerOutcome::Accepted);
         assert_eq!(first.trace_refs.len(), 2);
         assert_eq!(first.outbox_refs.len(), 1);
+        assert_eq!(outbox_payload_marker_count(&runtime), 1);
+        assert_outbox_material_snapshot(
+            &runtime,
+            &first.outbox_refs[0],
+            AcceptedOutboundMaterialKind::MemoryArchiveHandoffStateChanged,
+        );
 
         let persisted = runtime
             .get_handoff_intent_with_version(TraceHandoffIntentRef::new("handoff-1"))
@@ -9055,6 +9224,7 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(outbox_payload_marker_count(&runtime), 1);
     }
 
     #[test]
@@ -10722,6 +10892,17 @@ mod tests {
         assert_eq!(accepted_response.effect.trace_refs.len(), 1);
         assert_eq!(accepted_response.effect.audit_subject_refs.len(), 1);
         assert_eq!(accepted_response.effect.outbox_refs.len(), 2);
+        assert_eq!(outbox_payload_marker_count(&runtime), 2);
+        assert_outbox_material_snapshot(
+            &runtime,
+            &accepted_response.effect.outbox_refs[0],
+            AcceptedOutboundMaterialKind::GlobalMemberEstablished,
+        );
+        assert_outbox_material_snapshot(
+            &runtime,
+            &accepted_response.effect.outbox_refs[1],
+            AcceptedOutboundMaterialKind::IdentityAnchorChanged,
+        );
 
         let persisted_member = runtime
             .get_member_with_version(requested_member.clone())
@@ -10754,6 +10935,42 @@ mod tests {
         };
         assert_eq!(replay_response.result_ref, accepted_response.result_ref);
         assert_eq!(replay_response.effect, accepted_response.effect);
+        assert_eq!(outbox_payload_marker_count(&runtime), 2);
+    }
+
+    #[test]
+    fn establish_member_rolls_back_when_outbox_save_fails() {
+        let runtime = IdentityInMemoryRuntime::builder()
+            .inject_fault(FaultCase::SaveOutboxRecordFails)
+            .build();
+        let service = command_service(&runtime);
+        let requested_member = member_ref("member-establish-fail-1");
+
+        let error = service
+            .establish_global_member(
+                establish_request("establish-fail-1", Some(requested_member.clone())),
+                establish_context("establish-fail-1"),
+            )
+            .expect_err("outbox save should fail");
+        assert_eq!(error.kind, ApplicationErrorKind::DependencyUnavailable);
+        assert!(
+            runtime
+                .get_member_with_version(requested_member.clone())
+                .expect("load member")
+                .is_none()
+        );
+        assert!(
+            runtime
+                .get_lifecycle_with_version(requested_member.clone())
+                .expect("load lifecycle")
+                .is_none()
+        );
+        assert_eq!(outbox_payload_marker_count(&runtime), 0);
+        assert_eq!(
+            runtime.active_write_transactions().expect("active writes"),
+            0
+        );
+        assert_eq!(runtime.staged_write_count().expect("staged writes"), 0);
     }
 
     #[test]
@@ -10797,6 +11014,17 @@ mod tests {
         assert_eq!(
             accepted_response.result.lifecycle_state_kind,
             PublicLifecycleStateKind::Paused
+        );
+        assert_eq!(accepted_response.effect.outbox_refs.len(), 2);
+        assert_outbox_material_snapshot(
+            &runtime,
+            &accepted_response.effect.outbox_refs[0],
+            AcceptedOutboundMaterialKind::GlobalLifecycleChanged,
+        );
+        assert_outbox_material_snapshot(
+            &runtime,
+            &accepted_response.effect.outbox_refs[1],
+            AcceptedOutboundMaterialKind::GlobalMemberAvailabilityChanged,
         );
 
         let persisted = runtime
@@ -10859,6 +11087,16 @@ mod tests {
             PublicRoleCapabilitySummaryStateKind::Active
         );
         assert_eq!(accepted_response.effect.outbox_refs.len(), 2);
+        assert_outbox_material_snapshot(
+            &runtime,
+            &accepted_response.effect.outbox_refs[0],
+            AcceptedOutboundMaterialKind::RoleCapabilitySummaryChanged,
+        );
+        assert_outbox_material_snapshot(
+            &runtime,
+            &accepted_response.effect.outbox_refs[1],
+            AcceptedOutboundMaterialKind::RoleCapabilitySourceStateChanged,
+        );
 
         let persisted = runtime
             .find_current_summary_by_member(member_ref("member-role-1"))
@@ -10926,6 +11164,12 @@ mod tests {
             appended.result.record_state_kind,
             PublicCareerRecordStateKind::Appended
         );
+        assert_eq!(appended.effect.outbox_refs.len(), 1);
+        assert_outbox_material_snapshot(
+            &runtime,
+            &appended.effect.outbox_refs[0],
+            AcceptedOutboundMaterialKind::CareerRecordAppended,
+        );
 
         let duplicate = service
             .append_career_record(
@@ -10974,6 +11218,12 @@ mod tests {
         assert_eq!(
             corrected.result.record_state_kind,
             PublicCareerRecordStateKind::CorrectionAppended
+        );
+        assert_eq!(corrected.effect.outbox_refs.len(), 1);
+        assert_outbox_material_snapshot(
+            &runtime,
+            &corrected.effect.outbox_refs[0],
+            AcceptedOutboundMaterialKind::CareerCorrectionAppended,
         );
         let original = runtime
             .get_career_record(appended.result.career_record_ref.clone())
@@ -11068,6 +11318,12 @@ mod tests {
         assert_eq!(
             linked_response.result.reference_state_kind,
             PublicMemoryReferenceStateKind::Linked
+        );
+        assert_eq!(linked_response.effect.outbox_refs.len(), 1);
+        assert_outbox_material_snapshot(
+            &runtime,
+            &linked_response.effect.outbox_refs[0],
+            AcceptedOutboundMaterialKind::MemoryReferenceChanged,
         );
 
         let handoff_ref = ArchiveHandoffRef::new(

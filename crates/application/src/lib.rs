@@ -6,6 +6,7 @@ pub mod command;
 pub mod consumer;
 pub mod errors;
 pub mod mapper;
+pub mod outbound_material;
 pub mod ports;
 pub mod query;
 pub mod support;

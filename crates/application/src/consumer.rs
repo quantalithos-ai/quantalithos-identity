@@ -13,11 +13,10 @@ use identity_contracts::refs::{
     AuditTrailRef, CareerAppendReasonKind, CareerAppendReasonRef, CareerRecordChangeIntent,
     CareerRecordRef, ExternalReferenceRef, GlobalMemberRef, IdentityChangeKind,
     IdentityChangeKindRef, IdentityChangeReasonRef, IdentityOperationChannel,
-    IdentityOutboxPayloadMarkerRef, IdentityOutboxRecordRef, IdentityProjectionRef,
-    IdentityReferenceOwnerRef, IdentitySourceRef, IdentityStoredResultRef, IdentityTimestamp,
-    IdentityTraceRecordRef, IdentityTruthCursor, MemoryReferenceReasonKind,
-    MemoryReferenceReasonRef, MemoryReferenceSourceKind, MemoryReferenceSourceState,
-    MemoryReferenceStateKind as PublicMemoryReferenceStateKind, TopicKeyRef,
+    IdentityOutboxRecordRef, IdentityProjectionRef, IdentityReferenceOwnerRef, IdentitySourceRef,
+    IdentityStoredResultRef, IdentityTimestamp, IdentityTraceRecordRef, IdentityTruthCursor,
+    MemoryReferenceReasonKind, MemoryReferenceReasonRef, MemoryReferenceSourceKind,
+    MemoryReferenceSourceState, MemoryReferenceStateKind as PublicMemoryReferenceStateKind,
 };
 use identity_contracts::views::{IdentityReadMaterialKind, IdentityReadMaterialMarker};
 use identity_domain::audit::{AuditTrail, AuditTrailEntry};
@@ -26,12 +25,13 @@ use identity_domain::handoff::{HandoffPolicy, HandoffState};
 use identity_domain::memory_reference::{
     MemoryReference, MemoryReferencePolicy, MemoryReferenceState,
 };
-use identity_domain::outbox::{IdentityOutboxRecord, OutboxState};
+use identity_domain::outbox::IdentityOutboxRecord;
 use identity_domain::projection_state::ProjectionState;
 use identity_domain::role_capability::RoleCapabilitySourceSnapshot;
 use identity_domain::trace::IdentityTraceRecord;
 
 use crate::errors::{ApplicationError, ApplicationErrorKind};
+use crate::outbound_material::AcceptedOutboundMaterialKind;
 use crate::ports::{
     CareerRecordRepository, GlobalMemberRepository, IdentityAcceptedAuditTrailMarkerMapper,
     IdentityAuditTrailRepository, IdentityClockPort, IdentityCursorAssignerPort,
@@ -463,8 +463,7 @@ impl<'a> IdentityConsumerService<'a> {
                     payload.member_ref.clone(),
                     source_subjects.outbox_subject_ref.clone(),
                     change_kind_ref.clone(),
-                    "identity.role-capability.source-state.changed.v1",
-                    "identity.role-capability.source-state.changed.v1",
+                    AcceptedOutboundMaterialKind::RoleCapabilitySourceStateChanged,
                     source_trace.trace_record_ref.clone(),
                     now,
                 )?;
@@ -532,8 +531,7 @@ impl<'a> IdentityConsumerService<'a> {
                             payload.member_ref.clone(),
                             summary_subjects.outbox_subject_ref.clone(),
                             change_kind_ref.clone(),
-                            "identity.role-capability.summary.changed.v1",
-                            "identity.role-capability.summary.changed.v1",
+                            AcceptedOutboundMaterialKind::RoleCapabilitySummaryChanged,
                             summary_trace.trace_record_ref.clone(),
                             now,
                         )?;
@@ -757,8 +755,7 @@ impl<'a> IdentityConsumerService<'a> {
                     payload.member_ref.clone(),
                     subjects.outbox_subject_ref.clone(),
                     change_kind_ref,
-                    "identity.career.record.appended.v1",
-                    "identity.career.record.appended.v1",
+                    AcceptedOutboundMaterialKind::CareerRecordAppended,
                     trace.trace_record_ref.clone(),
                     now,
                 )?;
@@ -1002,8 +999,7 @@ impl<'a> IdentityConsumerService<'a> {
                     payload.member_ref.clone(),
                     subjects.outbox_subject_ref.clone(),
                     change_kind_ref.clone(),
-                    "identity.memory.reference.changed.v1",
-                    "identity.memory.reference.changed.v1",
+                    AcceptedOutboundMaterialKind::MemoryReferenceChanged,
                     trace.trace_record_ref.clone(),
                     now,
                 )?;
@@ -1024,8 +1020,7 @@ impl<'a> IdentityConsumerService<'a> {
                         payload.member_ref.clone(),
                         subjects.outbox_subject_ref.clone(),
                         change_kind_ref,
-                        "identity.memory.archive-handoff-state.changed.v1",
-                        "identity.memory.archive-handoff-state.changed.v1",
+                        AcceptedOutboundMaterialKind::MemoryArchiveHandoffStateChanged,
                         trace.trace_record_ref.clone(),
                         now,
                     )?;
@@ -1253,8 +1248,7 @@ impl<'a> IdentityConsumerService<'a> {
                     payload.member_ref.clone(),
                     subjects.outbox_subject_ref.clone(),
                     change_kind_ref.clone(),
-                    "identity.memory.archive-handoff-state.changed.v1",
-                    "identity.memory.archive-handoff-state.changed.v1",
+                    AcceptedOutboundMaterialKind::MemoryArchiveHandoffStateChanged,
                     trace.trace_record_ref.clone(),
                     now,
                 )?;
@@ -1262,8 +1256,7 @@ impl<'a> IdentityConsumerService<'a> {
                     payload.member_ref.clone(),
                     subjects.outbox_subject_ref.clone(),
                     change_kind_ref,
-                    "identity.memory.reference.changed.v1",
-                    "identity.memory.reference.changed.v1",
+                    AcceptedOutboundMaterialKind::MemoryReferenceChanged,
                     trace.trace_record_ref.clone(),
                     now,
                 )?;
@@ -1514,8 +1507,7 @@ impl<'a> IdentityConsumerService<'a> {
                     intent_v.value.member_ref.clone(),
                     subjects.outbox_subject_ref.clone(),
                     change_kind_ref,
-                    "identity.memory.archive-handoff-state.changed.v1",
-                    "identity.memory.archive-handoff-state.changed.v1",
+                    AcceptedOutboundMaterialKind::MemoryArchiveHandoffStateChanged,
                     trace.trace_record_ref.clone(),
                     now,
                 )?;
@@ -1757,23 +1749,18 @@ impl<'a> IdentityConsumerService<'a> {
         member_ref: GlobalMemberRef,
         subject_ref: identity_contracts::refs::IdentityOutboxSubjectRef,
         change_kind_ref: IdentityChangeKindRef,
-        payload_marker: &str,
-        topic: &str,
+        material_kind: AcceptedOutboundMaterialKind,
         trace_record_ref: IdentityTraceRecordRef,
         now: IdentityTimestamp,
     ) -> Result<IdentityOutboxRecord, ApplicationError> {
-        Ok(IdentityOutboxRecord {
-            outbox_record_ref: self.deps.id_generator.new_identity_outbox_record_ref()?,
+        material_kind.build_outbox_record(
+            self.deps.id_generator,
             member_ref,
             subject_ref,
             change_kind_ref,
-            payload_marker_ref: IdentityOutboxPayloadMarkerRef::new(payload_marker),
-            topic_key_ref: TopicKeyRef::new(topic),
             trace_record_ref,
-            outbox_state: OutboxState::pending(now),
-            created_at: now,
-            updated_at: now,
-        })
+            now,
+        )
     }
 
     fn save_projection_stale_marks(

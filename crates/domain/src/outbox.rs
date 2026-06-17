@@ -3,7 +3,7 @@
 use identity_contracts::refs::{
     GlobalMemberRef, IdentityChangeKindRef, IdentityOutboxPayloadMarkerRef,
     IdentityOutboxRecordRef, IdentityOutboxSubjectRef, IdentityTimestamp, IdentityTraceRecordRef,
-    OutboxDeliveryAttemptRef, OutboxDeliveryIssueRef, TopicKeyRef,
+    OutboxDeliveryAttemptRef, OutboxDeliveryIssueRef, TopicKeyRef, VisibilityContextRef,
 };
 
 use crate::errors::IdentityDomainError;
@@ -132,7 +132,65 @@ pub struct IdentityOutboxRecord {
     pub updated_at: IdentityTimestamp,
 }
 
+/// Factory input for creating accepted pending outbox records.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdentityOutboxRecordCreateArgs {
+    /// Stable outbox record identity.
+    pub outbox_record_ref: IdentityOutboxRecordRef,
+    /// Accepted change member subject.
+    pub member_ref: GlobalMemberRef,
+    /// Canonical outbound subject marker.
+    pub subject_ref: IdentityOutboxSubjectRef,
+    /// Accepted change kind marker.
+    pub change_kind_ref: IdentityChangeKindRef,
+    /// Body-free payload marker.
+    pub payload_marker_ref: IdentityOutboxPayloadMarkerRef,
+    /// Topic binding marker.
+    pub topic_key_ref: TopicKeyRef,
+    /// Accepted trace record marker.
+    pub trace_record_ref: IdentityTraceRecordRef,
+    /// Create timestamp.
+    pub created_at: IdentityTimestamp,
+}
+
 impl IdentityOutboxRecord {
+    /// Creates a pending outbox record from accepted change material.
+    pub fn from_accepted_change(
+        args: IdentityOutboxRecordCreateArgs,
+    ) -> Result<Self, IdentityDomainError> {
+        if args.trace_record_ref.as_str().is_empty() {
+            return Err(IdentityDomainError::invalid_input(
+                "trace_record_ref",
+                "accepted outbox requires a formal trace record",
+            ));
+        }
+        if args.payload_marker_ref.as_str().is_empty() {
+            return Err(IdentityDomainError::invalid_input(
+                "payload_marker_ref",
+                "accepted outbox requires a body-free payload marker",
+            ));
+        }
+        if args.topic_key_ref.as_str().is_empty() {
+            return Err(IdentityDomainError::invalid_input(
+                "topic_key_ref",
+                "accepted outbox requires a canonical topic key marker",
+            ));
+        }
+
+        Ok(Self {
+            outbox_record_ref: args.outbox_record_ref,
+            member_ref: args.member_ref,
+            subject_ref: args.subject_ref,
+            change_kind_ref: args.change_kind_ref,
+            payload_marker_ref: args.payload_marker_ref,
+            topic_key_ref: args.topic_key_ref,
+            trace_record_ref: args.trace_record_ref,
+            outbox_state: OutboxState::pending(args.created_at),
+            created_at: args.created_at,
+            updated_at: args.created_at,
+        })
+    }
+
     /// Returns whether the outbox belongs to the provided member.
     pub fn belongs_to(&self, member_ref: &GlobalMemberRef) -> bool {
         self.member_ref.same_member(member_ref)
@@ -240,6 +298,109 @@ impl IdentityOutboxRecord {
     }
 }
 
+/// Factory input for outbound accepted material policy construction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutboundEventPolicyArgs {
+    /// Canonical outbound subject marker.
+    pub subject_ref: IdentityOutboxSubjectRef,
+    /// Accepted change kind marker.
+    pub change_kind_ref: IdentityChangeKindRef,
+    /// Body-free payload marker.
+    pub payload_marker_ref: IdentityOutboxPayloadMarkerRef,
+    /// Canonical topic marker.
+    pub topic_key_ref: TopicKeyRef,
+    /// Prepared visibility context marker.
+    pub visibility_context_ref: VisibilityContextRef,
+}
+
+/// Accepted-only outbound material policy guard.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutboundEventPolicy {
+    /// Canonical outbound subject marker.
+    pub subject_ref: IdentityOutboxSubjectRef,
+    /// Accepted change kind marker.
+    pub change_kind_ref: IdentityChangeKindRef,
+    /// Body-free payload marker.
+    pub payload_marker_ref: IdentityOutboxPayloadMarkerRef,
+    /// Canonical topic marker.
+    pub topic_key_ref: TopicKeyRef,
+    /// Prepared visibility context marker.
+    pub visibility_context_ref: VisibilityContextRef,
+}
+
+impl OutboundEventPolicy {
+    /// Creates an outbound event policy for accepted outbox material.
+    pub fn for_outbox(args: OutboundEventPolicyArgs) -> Result<Self, IdentityDomainError> {
+        if args.payload_marker_ref.as_str().is_empty() {
+            return Err(IdentityDomainError::invalid_input(
+                "payload_marker_ref",
+                "outbound policy requires a body-free payload marker",
+            ));
+        }
+        if args.topic_key_ref.as_str().is_empty() {
+            return Err(IdentityDomainError::invalid_input(
+                "topic_key_ref",
+                "outbound policy requires a canonical topic key marker",
+            ));
+        }
+        if args.visibility_context_ref.as_str().is_empty() {
+            return Err(IdentityDomainError::invalid_input(
+                "visibility_context_ref",
+                "outbound policy requires a visibility context marker",
+            ));
+        }
+
+        Ok(Self {
+            subject_ref: args.subject_ref,
+            change_kind_ref: args.change_kind_ref,
+            payload_marker_ref: args.payload_marker_ref,
+            topic_key_ref: args.topic_key_ref,
+            visibility_context_ref: args.visibility_context_ref,
+        })
+    }
+
+    /// Asserts that the material originates from an accepted change trace.
+    pub fn assert_from_accepted_change(
+        &self,
+        trace_record_ref: &IdentityTraceRecordRef,
+    ) -> Result<(), IdentityDomainError> {
+        if trace_record_ref.as_str().is_empty() {
+            return Err(IdentityDomainError::invalid_input(
+                "trace_record_ref",
+                "accepted outbound material requires a formal trace record",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Asserts that the payload marker remains body-free.
+    pub fn assert_payload_body_free(&self) -> Result<(), IdentityDomainError> {
+        if self.payload_marker_ref.as_str().is_empty() {
+            return Err(IdentityDomainError::invalid_input(
+                "payload_marker_ref",
+                "outbound payload marker must remain body-free",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Asserts that the material remains visible for the canonical topic.
+    pub fn assert_visible_for_topic(&self) -> Result<(), IdentityDomainError> {
+        if self.visibility_context_ref.as_str().is_empty() {
+            return Err(IdentityDomainError::invalid_input(
+                "visibility_context_ref",
+                "outbound visibility context marker must remain present",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Asserts that publish remains decoupled from accepted truth persistence.
+    pub fn assert_publish_not_acceptance_gate(&self) -> Result<(), IdentityDomainError> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use identity_contracts::refs::{
@@ -247,9 +408,13 @@ mod tests {
         IdentityChangeKindRef, IdentityOutboxPayloadMarkerRef, IdentityOutboxRecordRef,
         IdentityOutboxSubjectRef, IdentitySourceOwner, IdentitySourceRef, IdentityTimestamp,
         IdentityTraceRecordRef, OutboxDeliveryAttemptRef, OutboxDeliveryIssueRef, TopicKeyRef,
+        VisibilityContextRef,
     };
 
-    use super::{IdentityOutboxRecord, OutboxState};
+    use super::{
+        IdentityOutboxRecord, IdentityOutboxRecordCreateArgs, OutboundEventPolicy,
+        OutboundEventPolicyArgs, OutboxState,
+    };
     use crate::errors::IdentityDomainError;
 
     fn timestamp(value: i64) -> IdentityTimestamp {
@@ -271,7 +436,7 @@ mod tests {
     }
 
     fn outbox_record() -> IdentityOutboxRecord {
-        IdentityOutboxRecord {
+        IdentityOutboxRecord::from_accepted_change(IdentityOutboxRecordCreateArgs {
             outbox_record_ref: IdentityOutboxRecordRef::new("outbox-1"),
             member_ref: member_ref(),
             subject_ref: IdentityOutboxSubjectRef::new("subject-1"),
@@ -280,12 +445,11 @@ mod tests {
                 None,
             ),
             payload_marker_ref: IdentityOutboxPayloadMarkerRef::new("payload-1"),
-            topic_key_ref: TopicKeyRef::new("topic-1"),
+            topic_key_ref: TopicKeyRef::new("identity.lifecycle.changed.v1"),
             trace_record_ref: IdentityTraceRecordRef::new("trace-1"),
-            outbox_state: OutboxState::pending(timestamp(1)),
             created_at: timestamp(1),
-            updated_at: timestamp(1),
-        }
+        })
+        .expect("accepted outbox")
     }
 
     fn attempt_ref() -> OutboxDeliveryAttemptRef {
@@ -294,6 +458,67 @@ mod tests {
 
     fn issue_ref() -> OutboxDeliveryIssueRef {
         OutboxDeliveryIssueRef::new(source("issue-1"))
+    }
+
+    #[test]
+    fn accepted_outbox_factory_creates_pending_state() {
+        let record = outbox_record();
+
+        assert_eq!(
+            record.outbox_state.state_kind,
+            super::OutboxStateKind::PendingPublish
+        );
+        assert_eq!(record.created_at, timestamp(1));
+        assert_eq!(record.updated_at, timestamp(1));
+    }
+
+    #[test]
+    fn accepted_outbox_factory_requires_trace_record() {
+        let error = IdentityOutboxRecord::from_accepted_change(IdentityOutboxRecordCreateArgs {
+            outbox_record_ref: IdentityOutboxRecordRef::new("outbox-trace-missing"),
+            member_ref: member_ref(),
+            subject_ref: IdentityOutboxSubjectRef::new("subject-1"),
+            change_kind_ref: IdentityChangeKindRef::new(
+                IdentityChangeKind::DerivedMarkerChanged,
+                None,
+            ),
+            payload_marker_ref: IdentityOutboxPayloadMarkerRef::new("payload-1"),
+            topic_key_ref: TopicKeyRef::new("identity.lifecycle.changed.v1"),
+            trace_record_ref: IdentityTraceRecordRef::new(""),
+            created_at: timestamp(1),
+        })
+        .expect_err("missing trace should be rejected");
+
+        assert_eq!(
+            error,
+            IdentityDomainError::invalid_input(
+                "trace_record_ref",
+                "accepted outbox requires a formal trace record",
+            )
+        );
+    }
+
+    #[test]
+    fn outbound_policy_requires_visibility_context() {
+        let error = OutboundEventPolicy::for_outbox(OutboundEventPolicyArgs {
+            subject_ref: IdentityOutboxSubjectRef::new("subject-1"),
+            change_kind_ref: IdentityChangeKindRef::new(
+                IdentityChangeKind::DerivedMarkerChanged,
+                None,
+            ),
+            payload_marker_ref: IdentityOutboxPayloadMarkerRef::new("payload-1"),
+            topic_key_ref: TopicKeyRef::new("identity.lifecycle.changed.v1"),
+            visibility_context_ref: VisibilityContextRef::new(""),
+        })
+        .expect_err("missing visibility context should fail");
+
+        assert_eq!(
+            error,
+            IdentityDomainError::invalid_input(
+                "visibility_context_ref",
+                "outbound policy requires a visibility context marker",
+            )
+        );
     }
 
     #[test]

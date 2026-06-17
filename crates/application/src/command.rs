@@ -20,11 +20,11 @@ use identity_contracts::refs::{
     GlobalMemberRef, GovernanceBasisRef, HandoffStateKind as PublicHandoffStateKind,
     IdentityAnchorReasonKind, IdentityAnchorReasonRef, IdentityAnchorStateKind,
     IdentityAuditSubjectRef, IdentityChangeKind, IdentityChangeKindRef, IdentityChangeReasonRef,
-    IdentityDegradedMarkerRef, IdentityOperationChannel, IdentityOutboxPayloadMarkerRef,
-    IdentityProjectionRef, IdentitySourceOwner, IdentitySourceRef, IdentityStoredResultRef,
-    IdentityTimestamp, IdentityTraceRecordRef, IdentityTruthCursor, MaintenanceScopeRef,
-    MemoryReferenceSourceState, MemoryReferenceStateKind as PublicMemoryReferenceStateKind,
-    RoleCapabilitySourceStateKind, RoleCapabilitySummaryStateKind, TopicKeyRef,
+    IdentityDegradedMarkerRef, IdentityOperationChannel, IdentityProjectionRef,
+    IdentitySourceOwner, IdentitySourceRef, IdentityStoredResultRef, IdentityTimestamp,
+    IdentityTraceRecordRef, IdentityTruthCursor, MaintenanceScopeRef, MemoryReferenceSourceState,
+    MemoryReferenceStateKind as PublicMemoryReferenceStateKind, RoleCapabilitySourceStateKind,
+    RoleCapabilitySummaryStateKind,
 };
 use identity_contracts::views::{IdentityReadMaterialKind, IdentityReadMaterialMarker};
 use identity_domain::audit::{AuditTrail, AuditTrailEntry};
@@ -41,13 +41,14 @@ use identity_domain::member_identity::{GlobalMember, IdentityAnchorPolicy, Ident
 use identity_domain::memory_reference::{
     MemoryReference, MemoryReferencePolicy, MemoryReferenceState, MemoryReferenceStateKind,
 };
-use identity_domain::outbox::{IdentityOutboxRecord, OutboxState};
+use identity_domain::outbox::IdentityOutboxRecord;
 use identity_domain::role_capability::{
     RoleCapabilitySourcePolicy, RoleCapabilitySourceSnapshot, RoleCapabilitySummary,
 };
 use identity_domain::trace::IdentityTraceRecord;
 
 use crate::errors::{ApplicationError, ApplicationErrorKind};
+use crate::outbound_material::AcceptedOutboundMaterialKind;
 use crate::ports::{
     CareerRecordRepository, GlobalLifecycleRepository, GlobalMemberRepository,
     IdentityAcceptedAuditTrailMarkerMapper, IdentityAuditTrailRepository, IdentityClockPort,
@@ -497,24 +498,18 @@ impl<'a> IdentityCommandService<'a> {
         member_ref: GlobalMemberRef,
         subject_ref: identity_contracts::refs::IdentityOutboxSubjectRef,
         change_kind_ref: IdentityChangeKindRef,
-        payload_marker: &str,
-        topic: &str,
+        material_kind: AcceptedOutboundMaterialKind,
         trace_record_ref: IdentityTraceRecordRef,
         now: IdentityTimestamp,
     ) -> Result<IdentityOutboxRecord, ApplicationError> {
-        let outbox_record_ref = self.deps.id_generator.new_identity_outbox_record_ref()?;
-        Ok(IdentityOutboxRecord {
-            outbox_record_ref,
+        material_kind.build_outbox_record(
+            self.deps.id_generator,
             member_ref,
             subject_ref,
             change_kind_ref,
-            payload_marker_ref: IdentityOutboxPayloadMarkerRef::new(payload_marker),
-            topic_key_ref: TopicKeyRef::new(topic),
             trace_record_ref,
-            outbox_state: OutboxState::pending(now),
-            created_at: now,
-            updated_at: now,
-        })
+            now,
+        )
     }
 
     fn save_projection_stale_marks(
@@ -1033,8 +1028,7 @@ impl<'a> IdentityCommandService<'a> {
                     member_ref.clone(),
                     subjects.outbox_subject_ref.clone(),
                     change_kind_ref.clone(),
-                    "identity.global-member.established.v1",
-                    "identity.global-member.established.v1",
+                    AcceptedOutboundMaterialKind::GlobalMemberEstablished,
                     trace.trace_record_ref.clone(),
                     now,
                 )?;
@@ -1042,23 +1036,28 @@ impl<'a> IdentityCommandService<'a> {
                     member_ref.clone(),
                     subjects.outbox_subject_ref.clone(),
                     change_kind_ref.clone(),
-                    "identity.anchor.changed.v1",
-                    "identity.anchor.changed.v1",
+                    AcceptedOutboundMaterialKind::IdentityAnchorChanged,
                     trace.trace_record_ref.clone(),
                     now,
                 )?;
                 let established_outbox_ref = established_outbox.outbox_record_ref.clone();
                 let anchor_outbox_ref = anchor_outbox.outbox_record_ref.clone();
-                self.deps.outbox_repository.save_outbox_record(
+                if let Err(error) = self.deps.outbox_repository.save_outbox_record(
                     established_outbox,
                     None,
                     uow.as_ref(),
-                )?;
-                self.deps.outbox_repository.save_outbox_record(
+                ) {
+                    self.rollback_quietly(uow);
+                    return Err(error);
+                }
+                if let Err(error) = self.deps.outbox_repository.save_outbox_record(
                     anchor_outbox,
                     None,
                     uow.as_ref(),
-                )?;
+                ) {
+                    self.rollback_quietly(uow);
+                    return Err(error);
+                }
 
                 let stale_projection_refs =
                     self.save_projection_stale_marks(&subjects, now, uow.as_ref())?;
@@ -1552,17 +1551,19 @@ impl<'a> IdentityCommandService<'a> {
                     request.body.member_ref.clone(),
                     subjects.outbox_subject_ref.clone(),
                     change_kind_ref.clone(),
-                    "identity.lifecycle.changed.v1",
-                    "identity.lifecycle.changed.v1",
+                    AcceptedOutboundMaterialKind::GlobalLifecycleChanged,
                     trace.trace_record_ref.clone(),
                     now,
                 )?;
                 let lifecycle_outbox_ref = lifecycle_outbox.outbox_record_ref.clone();
-                self.deps.outbox_repository.save_outbox_record(
+                if let Err(error) = self.deps.outbox_repository.save_outbox_record(
                     lifecycle_outbox,
                     None,
                     uow.as_ref(),
-                )?;
+                ) {
+                    self.rollback_quietly(uow);
+                    return Err(error);
+                }
 
                 let mut outbox_refs = vec![lifecycle_outbox_ref];
                 if anchor_state_kind.is_some() {
@@ -1573,17 +1574,19 @@ impl<'a> IdentityCommandService<'a> {
                             IdentityChangeKind::MemberAnchorChanged,
                             Some(request.body.reason_ref.source_ref.clone()),
                         ),
-                        "identity.anchor.changed.v1",
-                        "identity.anchor.changed.v1",
+                        AcceptedOutboundMaterialKind::IdentityAnchorChanged,
                         trace.trace_record_ref.clone(),
                         now,
                     )?;
                     let anchor_ref = anchor_outbox.outbox_record_ref.clone();
-                    self.deps.outbox_repository.save_outbox_record(
+                    if let Err(error) = self.deps.outbox_repository.save_outbox_record(
                         anchor_outbox,
                         None,
                         uow.as_ref(),
-                    )?;
+                    ) {
+                        self.rollback_quietly(uow);
+                        return Err(error);
+                    }
                     outbox_refs.push(anchor_ref);
                 }
                 if lifecycle_v.value.is_available() != new_lifecycle.is_available() {
@@ -1591,17 +1594,19 @@ impl<'a> IdentityCommandService<'a> {
                         request.body.member_ref.clone(),
                         subjects.outbox_subject_ref.clone(),
                         change_kind_ref.clone(),
-                        "identity.global-member.availability.changed.v1",
-                        "identity.global-member.availability.changed.v1",
+                        AcceptedOutboundMaterialKind::GlobalMemberAvailabilityChanged,
                         trace.trace_record_ref.clone(),
                         now,
                     )?;
                     let availability_ref = availability_outbox.outbox_record_ref.clone();
-                    self.deps.outbox_repository.save_outbox_record(
+                    if let Err(error) = self.deps.outbox_repository.save_outbox_record(
                         availability_outbox,
                         None,
                         uow.as_ref(),
-                    )?;
+                    ) {
+                        self.rollback_quietly(uow);
+                        return Err(error);
+                    }
                     outbox_refs.push(availability_ref);
                 }
 
@@ -2222,17 +2227,19 @@ impl<'a> IdentityCommandService<'a> {
                     request.body.member_ref.clone(),
                     subjects.outbox_subject_ref.clone(),
                     change_kind_ref.clone(),
-                    "identity.role-capability.summary.changed.v1",
-                    "identity.role-capability.summary.changed.v1",
+                    AcceptedOutboundMaterialKind::RoleCapabilitySummaryChanged,
                     trace.trace_record_ref.clone(),
                     now,
                 )?;
                 let summary_outbox_ref = summary_outbox.outbox_record_ref.clone();
-                self.deps.outbox_repository.save_outbox_record(
+                if let Err(error) = self.deps.outbox_repository.save_outbox_record(
                     summary_outbox,
                     None,
                     uow.as_ref(),
-                )?;
+                ) {
+                    self.rollback_quietly(uow);
+                    return Err(error);
+                }
                 let source_subjects = self
                     .deps
                     .truth_change_subject_mapper
@@ -2241,17 +2248,19 @@ impl<'a> IdentityCommandService<'a> {
                     request.body.member_ref.clone(),
                     source_subjects.outbox_subject_ref.clone(),
                     change_kind_ref.clone(),
-                    "identity.role-capability.source-state.changed.v1",
-                    "identity.role-capability.source-state.changed.v1",
+                    AcceptedOutboundMaterialKind::RoleCapabilitySourceStateChanged,
                     trace.trace_record_ref.clone(),
                     now,
                 )?;
                 let source_outbox_ref = source_outbox.outbox_record_ref.clone();
-                self.deps.outbox_repository.save_outbox_record(
+                if let Err(error) = self.deps.outbox_repository.save_outbox_record(
                     source_outbox,
                     None,
                     uow.as_ref(),
-                )?;
+                ) {
+                    self.rollback_quietly(uow);
+                    return Err(error);
+                }
 
                 let stale_projection_refs =
                     self.save_projection_stale_marks(&subjects, now, uow.as_ref())?;
@@ -2552,7 +2561,7 @@ impl<'a> IdentityCommandService<'a> {
                                 now,
                             )?,
                             None,
-                            Some("identity.career.record.appended.v1"),
+                            Some(AcceptedOutboundMaterialKind::CareerRecordAppended),
                         )
                     }
                     identity_contracts::refs::CareerRecordChangeIntent::AppendCorrection => {
@@ -2623,7 +2632,7 @@ impl<'a> IdentityCommandService<'a> {
                         (
                             correction_record,
                             request.body.original_record_ref.clone(),
-                            Some("identity.career.correction.appended.v1"),
+                            Some(AcceptedOutboundMaterialKind::CareerCorrectionAppended),
                         )
                     }
                     identity_contracts::refs::CareerRecordChangeIntent::MarkSourcePendingReview => {
@@ -2721,20 +2730,24 @@ impl<'a> IdentityCommandService<'a> {
                 )?;
 
                 let mut outbox_refs = Vec::new();
-                if let Some(topic) = create_outbox {
+                if let Some(material_kind) = create_outbox {
                     let outbox = self.outbox_record(
                         request.body.member_ref.clone(),
                         subjects.outbox_subject_ref.clone(),
                         change_kind_ref.clone(),
-                        topic,
-                        topic,
+                        material_kind,
                         trace.trace_record_ref.clone(),
                         now,
                     )?;
                     let outbox_ref = outbox.outbox_record_ref.clone();
-                    self.deps
-                        .outbox_repository
-                        .save_outbox_record(outbox, None, uow.as_ref())?;
+                    if let Err(error) =
+                        self.deps
+                            .outbox_repository
+                            .save_outbox_record(outbox, None, uow.as_ref())
+                    {
+                        self.rollback_quietly(uow);
+                        return Err(error);
+                    }
                     outbox_refs.push(outbox_ref);
                 }
 
@@ -3327,15 +3340,19 @@ impl<'a> IdentityCommandService<'a> {
                     request.body.member_ref.clone(),
                     subjects.outbox_subject_ref.clone(),
                     change_kind_ref.clone(),
-                    "identity.memory.reference.changed.v1",
-                    "identity.memory.reference.changed.v1",
+                    AcceptedOutboundMaterialKind::MemoryReferenceChanged,
                     trace.trace_record_ref.clone(),
                     now,
                 )?;
                 let outbox_ref = outbox.outbox_record_ref.clone();
-                self.deps
-                    .outbox_repository
-                    .save_outbox_record(outbox, None, uow.as_ref())?;
+                if let Err(error) =
+                    self.deps
+                        .outbox_repository
+                        .save_outbox_record(outbox, None, uow.as_ref())
+                {
+                    self.rollback_quietly(uow);
+                    return Err(error);
+                }
                 let stale_projection_refs =
                     self.save_projection_stale_marks(&subjects, now, uow.as_ref())?;
                 let stored_result_ref = self.deps.id_generator.new_identity_stored_result_ref()?;
