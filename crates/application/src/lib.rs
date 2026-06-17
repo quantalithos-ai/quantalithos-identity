@@ -5,6 +5,7 @@
 pub mod command;
 pub mod consumer;
 pub mod errors;
+pub mod jobs;
 pub mod mapper;
 pub mod outbound_material;
 pub mod ports;
@@ -16,6 +17,7 @@ pub use crate::command::{
 };
 pub use crate::consumer::{IdentityConsumerService, IdentityConsumerServiceDeps};
 pub use crate::errors::{ApplicationError, ApplicationErrorKind};
+pub use crate::jobs::{IdentityJobExecution, IdentityJobService, IdentityJobServiceDeps};
 pub use crate::mapper::{
     DefaultIdentityAcceptedAuditTrailMarkerMapper, DefaultIdentityDispatchTargetCatalog,
     DefaultIdentityMaintenanceIssueMapper, DefaultIdentityMarkerSubjectMapper,

@@ -6874,6 +6874,9 @@ mod tests {
     use core_contracts::actor::{ActorKind, ActorRef};
     use identity_application::command::{IdentityCommandService, IdentityCommandServiceDeps};
     use identity_application::consumer::{IdentityConsumerService, IdentityConsumerServiceDeps};
+    use identity_application::jobs::{
+        IdentityJobExecution, IdentityJobService, IdentityJobServiceDeps,
+    };
     use identity_application::outbound_material::AcceptedOutboundMaterialKind;
     use identity_contracts::commands::{
         AppendCareerRecordRequest, EstablishGlobalMemberRequest, IdentityCommandOutcome,
@@ -6887,6 +6890,7 @@ mod tests {
         RoleCapabilitySourceChangedPayload, TraceHandoffResultKind, TraceHandoffResultPayload,
         WorkParticipationAcceptedPayload,
     };
+    use identity_contracts::jobs::IdentityJobRequest;
     use identity_contracts::metadata::{
         IdentityCommandMetadata, IdentityDegradedKind, IdentityQueryDisposition,
         IdentityQueryMetadata, IdentityRequestDigestMarker,
@@ -6947,6 +6951,13 @@ mod tests {
 
     use super::*;
     use identity_application::query::{IdentityQueryService, IdentityQueryServiceDeps};
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct TestJobOutput {
+        disposition: &'static str,
+        changed_count: u32,
+        failed_count: u32,
+    }
 
     fn timestamp(value: i64) -> IdentityTimestamp {
         IdentityTimestamp::from_clock(value).expect("valid timestamp")
@@ -7174,6 +7185,17 @@ mod tests {
             outbox_repository: runtime,
             projection_repository: runtime,
             handoff_intent_repository: runtime,
+        })
+    }
+
+    fn job_service<'a>(runtime: &'a IdentityInMemoryRuntime) -> IdentityJobService<'a> {
+        IdentityJobService::new(IdentityJobServiceDeps {
+            unit_of_work_manager: runtime,
+            clock: runtime,
+            id_generator: runtime,
+            idempotency_repository: runtime,
+            stored_result_repository: runtime,
+            job_report_repository: runtime,
         })
     }
 
@@ -7479,6 +7501,29 @@ mod tests {
             IdentityJobRunRef::new(job_run_ref),
             timestamp(1),
         )
+    }
+
+    fn job_request(
+        job_name: &str,
+        idempotency_key: &str,
+        job_run_ref: &str,
+        token: &str,
+    ) -> IdentityJobRequest<String> {
+        IdentityJobRequest {
+            job_name: IdentityJobName::new(job_name),
+            job_run_ref: IdentityJobRunRef::new(job_run_ref),
+            run_metadata_ref: identity_contracts::refs::IdentityJobRunMetadataRef::new(format!(
+                "job-metadata-{token}"
+            )),
+            scope_marker_ref: IdentityJobScopeMarkerRef::new(format!("job-scope-{token}")),
+            idempotency_key: idempotency_key.to_owned().into(),
+            input_cursor_ref: Some(identity_contracts::refs::IdentityJobCursorRef::new(
+                format!("job-input-cursor-{token}"),
+            )),
+            schema_version_ref: IdentityProtocolSchemaVersionRef::new("identity.job.v1"),
+            system_actor_ref: ActorRef::system("job-system"),
+            input: format!("job-input-{token}"),
+        }
     }
 
     fn stored_result_ref(token: &str) -> IdentityStoredResultRef {
@@ -7960,6 +8005,7 @@ mod tests {
             stored_result_ref,
             timestamp(2),
         )
+        .expect("partial report")
     }
 
     fn outbox_record(token: &str, state: OutboxState) -> IdentityOutboxRecord {
@@ -9278,6 +9324,252 @@ mod tests {
             .expect("lookup")
             .expect("report");
         assert_eq!(persisted.value, report);
+    }
+
+    #[test]
+    fn job_dispatch_duplicate_replay_does_not_run_handler() {
+        let context = job_context(
+            "RunIdentityReconciliation",
+            "idem-job-dup",
+            "job",
+            "job-run-dup",
+        );
+        let stored = StoredIdentityOperationResult::job_report(
+            stored_result_ref("job-dup"),
+            context.context_ref.clone(),
+            identity_application::support::IdentityStoredSurfaceMarkerRef::new("surface-job-dup"),
+            timestamp(2),
+        );
+        let report = job_report("dup", Some(stored_result_ref("job-dup")));
+        let record = IdentityIdempotencyRecord {
+            record_ref: IdentityIdempotencyRecordRef::new("idem-record-job-dup"),
+            operation_name: context.operation_name.clone(),
+            channel: IdentityOperationChannel::Job,
+            idempotency_key: IdentityIdempotencyKey::new("idem-job-dup"),
+            request_digest: context.request_digest.clone(),
+            state: identity_application::support::IdentityIdempotencyStateKind::Completed,
+            stored_result_ref: Some(stored_result_ref("job-dup")),
+            reserved_at: timestamp(1),
+            completed_at: Some(timestamp(2)),
+        };
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_idempotency_record(record, IdentityVersion::new(2))
+            .seed_stored_result(stored)
+            .seed_job_report(report.clone(), IdentityVersion::new(1))
+            .build();
+        let service = job_service(&runtime);
+
+        let response = service
+            .dispatch_job_scaffold(
+                context,
+                job_request(
+                    "RunIdentityReconciliation",
+                    "idem-job-dup",
+                    "job-run-dup",
+                    "dup",
+                ),
+                |loaded_report| {
+                    Ok(TestJobOutput {
+                        disposition: "duplicate_replayed",
+                        changed_count: loaded_report.rebuilt_projection_refs.len() as u32,
+                        failed_count: loaded_report.issue_refs.len() as u32,
+                    })
+                },
+                |_, _, _, _, _| unreachable!("duplicate replay must not dispatch a job body"),
+            )
+            .expect("duplicate replay");
+
+        assert_eq!(response.report_ref, report.report_ref);
+        assert_eq!(response.stored_result_ref, stored_result_ref("job-dup"));
+        assert_eq!(
+            response.output,
+            TestJobOutput {
+                disposition: "duplicate_replayed",
+                changed_count: 0,
+                failed_count: 1,
+            }
+        );
+        assert_eq!(response.report, report.to_surface());
+    }
+
+    #[test]
+    fn job_dispatch_replay_missing_report_is_consistency_defect() {
+        let context = job_context(
+            "RunIdentityReconciliation",
+            "idem-job-missing-report",
+            "job",
+            "job-run-missing-report",
+        );
+        let stored = StoredIdentityOperationResult::job_report(
+            stored_result_ref("job-missing-report"),
+            context.context_ref.clone(),
+            identity_application::support::IdentityStoredSurfaceMarkerRef::new(
+                "surface-job-missing-report",
+            ),
+            timestamp(2),
+        );
+        let record = IdentityIdempotencyRecord {
+            record_ref: IdentityIdempotencyRecordRef::new("idem-record-job-missing-report"),
+            operation_name: context.operation_name.clone(),
+            channel: IdentityOperationChannel::Job,
+            idempotency_key: IdentityIdempotencyKey::new("idem-job-missing-report"),
+            request_digest: context.request_digest.clone(),
+            state: identity_application::support::IdentityIdempotencyStateKind::Completed,
+            stored_result_ref: Some(stored_result_ref("job-missing-report")),
+            reserved_at: timestamp(1),
+            completed_at: Some(timestamp(2)),
+        };
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_idempotency_record(record, IdentityVersion::new(2))
+            .seed_stored_result(stored)
+            .build();
+        let service = job_service(&runtime);
+
+        let err = service
+            .dispatch_job_scaffold(
+                context,
+                job_request(
+                    "RunIdentityReconciliation",
+                    "idem-job-missing-report",
+                    "job-run-missing-report",
+                    "job-missing-report",
+                ),
+                |_| -> Result<TestJobOutput, ApplicationError> {
+                    unreachable!("replay output must not run without a stored report")
+                },
+                |_, _, _, _, _| unreachable!("duplicate replay must not dispatch a job body"),
+            )
+            .expect_err("missing report should fail");
+
+        assert_eq!(
+            err.kind,
+            ApplicationErrorKind::DuplicateReplayConsistencyDefect
+        );
+    }
+
+    #[test]
+    fn job_dispatch_replay_wrong_stored_kind_is_consistency_defect() {
+        let context = job_context(
+            "RunIdentityReconciliation",
+            "idem-job-wrong-kind",
+            "job",
+            "job-run-wrong-kind",
+        );
+        let record = IdentityIdempotencyRecord {
+            record_ref: IdentityIdempotencyRecordRef::new("idem-record-job-wrong-kind"),
+            operation_name: context.operation_name.clone(),
+            channel: IdentityOperationChannel::Job,
+            idempotency_key: IdentityIdempotencyKey::new("idem-job-wrong-kind"),
+            request_digest: context.request_digest.clone(),
+            state: identity_application::support::IdentityIdempotencyStateKind::Completed,
+            stored_result_ref: Some(stored_result_ref("job-wrong-kind")),
+            reserved_at: timestamp(1),
+            completed_at: Some(timestamp(2)),
+        };
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_idempotency_record(record, IdentityVersion::new(2))
+            .seed_stored_result(command_stored_result(
+                "job-wrong-kind",
+                &context.context_ref,
+            ))
+            .seed_job_report(
+                job_report("job-wrong-kind", Some(stored_result_ref("job-wrong-kind"))),
+                IdentityVersion::new(1),
+            )
+            .build();
+        let service = job_service(&runtime);
+
+        let err = service
+            .dispatch_job_scaffold(
+                context,
+                job_request(
+                    "RunIdentityReconciliation",
+                    "idem-job-wrong-kind",
+                    "job-run-wrong-kind",
+                    "job-wrong-kind",
+                ),
+                |_| -> Result<TestJobOutput, ApplicationError> {
+                    unreachable!("replay output must not run on wrong stored kind")
+                },
+                |_, _, _, _, _| unreachable!("duplicate replay must not dispatch a job body"),
+            )
+            .expect_err("wrong kind should fail");
+
+        assert_eq!(
+            err.kind,
+            ApplicationErrorKind::DuplicateReplayConsistencyDefect
+        );
+    }
+
+    #[test]
+    fn job_dispatch_saves_report_before_idempotency_completion() {
+        let runtime = IdentityInMemoryRuntime::builder()
+            .inject_fault(FaultCase::CompleteIdempotencyFails)
+            .build();
+        let service = job_service(&runtime);
+        let context = job_context(
+            "RunIdentityReconciliation",
+            "idem-job-save-order",
+            "job",
+            "job-run-save-order",
+        );
+
+        let err = service
+            .dispatch_job_scaffold(
+                context.clone(),
+                job_request(
+                    "RunIdentityReconciliation",
+                    "idem-job-save-order",
+                    "job-run-save-order",
+                    "job-save-order",
+                ),
+                |_| unreachable!("first run should not replay"),
+                |_, _, now, report, _| {
+                    let mut report = report.succeed(
+                        Some(identity_contracts::refs::IdentityJobCursorRef::new(
+                            "job-output-cursor-save-order",
+                        )),
+                        None,
+                        now,
+                    );
+                    report
+                        .rebuilt_projection_refs
+                        .push(IdentityProjectionRef::new("projection-save-order"));
+                    Ok(IdentityJobExecution::new(
+                        TestJobOutput {
+                            disposition: "completed",
+                            changed_count: 1,
+                            failed_count: 0,
+                        },
+                        report,
+                    ))
+                },
+            )
+            .expect_err("completion fault");
+
+        assert_eq!(err.kind, ApplicationErrorKind::DependencyUnavailable);
+        assert!(
+            runtime
+                .find_job_report_by_run(IdentityJobRunRef::new("job-run-save-order"))
+                .expect("lookup")
+                .is_none()
+        );
+        assert!(
+            runtime
+                .find_by_operation_context(context.context_ref.clone())
+                .expect("stored result lookup")
+                .is_none()
+        );
+        assert!(
+            runtime
+                .get_by_key(
+                    IdentityOperationName::new("RunIdentityReconciliation"),
+                    IdentityOperationChannel::Job,
+                    IdentityIdempotencyKey::new("idem-job-save-order"),
+                )
+                .expect("idempotency lookup")
+                .is_none()
+        );
     }
 
     #[test]

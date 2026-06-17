@@ -1,5 +1,6 @@
 //! Application-local helper objects shared by identity services and ports.
 
+use crate::errors::ApplicationError;
 use core_contracts::actor::ActorRef;
 use core_contracts::metadata::IdempotencyKey;
 use identity_contracts::commands::{
@@ -8,7 +9,7 @@ use identity_contracts::commands::{
     TraceHandoffCommandResult,
 };
 use identity_contracts::events::IdentityConsumerReceipt;
-use identity_contracts::jobs::IdentityJobResultKind;
+use identity_contracts::jobs::{IdentityJobReportSurface, IdentityJobResultKind};
 use identity_contracts::metadata::{IdentityDegradedKind, IdentityProtocolRejection};
 use identity_contracts::protocol::{
     IdentityCommandName, IdentityDigestAlgorithmMarkerRef, IdentityJobName,
@@ -1349,13 +1350,14 @@ impl IdentityJobRunReport {
         output_cursor_ref: Option<IdentityJobCursorRef>,
         stored_result_ref: Option<IdentityStoredResultRef>,
         finished_at: IdentityTimestamp,
-    ) -> Self {
+    ) -> Result<Self, ApplicationError> {
+        Self::ensure_issue_refs(&issue_refs, IdentityJobResultKind::Partial)?;
         self.result_kind = IdentityJobResultKind::Partial;
         self.issue_refs = issue_refs;
         self.output_cursor_ref = output_cursor_ref;
         self.stored_result_ref = stored_result_ref;
         self.finished_at = Some(finished_at);
-        self
+        Ok(self)
     }
 
     /// Marks the report as failed.
@@ -1363,11 +1365,12 @@ impl IdentityJobRunReport {
         mut self,
         issue_refs: Vec<MaintenanceIssueRef>,
         finished_at: IdentityTimestamp,
-    ) -> Self {
+    ) -> Result<Self, ApplicationError> {
+        Self::ensure_issue_refs(&issue_refs, IdentityJobResultKind::Failed)?;
         self.result_kind = IdentityJobResultKind::Failed;
         self.issue_refs = issue_refs;
         self.finished_at = Some(finished_at);
-        self
+        Ok(self)
     }
 
     /// Marks the report as retryably failed.
@@ -1375,11 +1378,12 @@ impl IdentityJobRunReport {
         mut self,
         issue_refs: Vec<MaintenanceIssueRef>,
         finished_at: IdentityTimestamp,
-    ) -> Self {
+    ) -> Result<Self, ApplicationError> {
+        Self::ensure_issue_refs(&issue_refs, IdentityJobResultKind::RetryableFailed)?;
         self.result_kind = IdentityJobResultKind::RetryableFailed;
         self.issue_refs = issue_refs;
         self.finished_at = Some(finished_at);
-        self
+        Ok(self)
     }
 
     /// Marks the report as noop.
@@ -1394,6 +1398,65 @@ impl IdentityJobRunReport {
         self.stored_result_ref = stored_result_ref;
         self.finished_at = Some(finished_at);
         self
+    }
+
+    /// Copies the application-local report into the public body-free report shell.
+    pub fn to_surface(&self) -> IdentityJobReportSurface {
+        IdentityJobReportSurface {
+            job_run_ref: self.job_run_ref.clone(),
+            result_kind: self.result_kind,
+            affected_member_refs: self.affected_member_refs.clone(),
+            affected_projection_refs: self.affected_projection_refs.clone(),
+            rebuilt_projection_refs: self.rebuilt_projection_refs.clone(),
+            failed_projection_refs: self.failed_projection_refs.clone(),
+            refreshed_reference_refs: self.refreshed_reference_refs.clone(),
+            failed_reference_refs: self.failed_reference_refs.clone(),
+            inspected_target_refs: self.inspected_target_refs.clone(),
+            report_refs: self.report_refs.clone(),
+            outbox_record_refs: self.outbox_record_refs.clone(),
+            published_outbox_refs: self.published_outbox_refs.clone(),
+            failed_outbox_refs: self.failed_outbox_refs.clone(),
+            handoff_intent_refs: self.handoff_intent_refs.clone(),
+            delivered_handoff_refs: self.delivered_handoff_refs.clone(),
+            failed_handoff_refs: self.failed_handoff_refs.clone(),
+            handoff_receipt_refs: self.handoff_receipt_refs.clone(),
+            issue_refs: self.issue_refs.clone(),
+            input_cursor_ref: self.input_cursor_ref.clone(),
+            output_cursor_ref: self.output_cursor_ref.clone(),
+            started_at: self.started_at,
+            finished_at: self.finished_at,
+        }
+    }
+
+    /// Binds the final stored replay ref allocated by the application service.
+    pub fn with_stored_result_ref(mut self, stored_result_ref: IdentityStoredResultRef) -> Self {
+        self.stored_result_ref = Some(stored_result_ref);
+        self
+    }
+
+    /// Verifies the formal issue-ref invariant for partial and failed reports.
+    pub fn validate_result_issue_invariant(&self) -> Result<(), ApplicationError> {
+        match self.result_kind {
+            IdentityJobResultKind::Partial
+            | IdentityJobResultKind::Failed
+            | IdentityJobResultKind::RetryableFailed => {
+                Self::ensure_issue_refs(&self.issue_refs, self.result_kind)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn ensure_issue_refs(
+        issue_refs: &[MaintenanceIssueRef],
+        result_kind: IdentityJobResultKind,
+    ) -> Result<(), ApplicationError> {
+        if issue_refs.is_empty() {
+            return Err(ApplicationError::consistency_defect(format!(
+                "job report result kind {:?} requires at least one maintenance issue ref",
+                result_kind
+            )));
+        }
+        Ok(())
     }
 }
 
