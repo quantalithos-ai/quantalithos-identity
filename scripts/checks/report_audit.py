@@ -23,6 +23,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--artifact-root", required=True)
     parser.add_argument("--report-root", required=True)
+    parser.add_argument("--acceptance-root")
+    parser.add_argument("--review-root")
     return parser.parse_args()
 
 
@@ -74,15 +76,27 @@ def evidence_status(artifact_root: Path, report_root: Path) -> tuple[list[str], 
         passed.append(
             f"`{item['evidence_id']}` links suite refs, TC refs, AC refs, VETO refs, artifact paths, and report paths."
         )
+        detail_path = report_root / "evidence" / f"{item['evidence_id']}.md"
+        if not detail_path.exists():
+            failed.append(f"missing evidence detail page for `{item['evidence_id']}`")
+        else:
+            passed.append(f"`{item['evidence_id']}` detail page exists at `{detail_path.as_posix()}`.")
     return passed, failed
 
 
-def no_static_status(report_root: Path) -> tuple[list[str], list[str]]:
+def no_static_status(
+    report_root: Path,
+    acceptance_root: Path | None,
+    review_root: Path | None,
+) -> tuple[list[str], list[str]]:
     passed: list[str] = []
     failed: list[str] = []
-    markdown_files = sorted(
-        path for path in report_root.rglob("*.md") if path.name != "report-audit.md"
-    )
+    markdown_files = [path for path in report_root.rglob("*.md") if path.name != "report-audit.md"]
+    if acceptance_root and acceptance_root.exists():
+        markdown_files.extend(acceptance_root.rglob("*.md"))
+    if review_root and review_root.exists():
+        markdown_files.extend(review_root.rglob("*.md"))
+    markdown_files = sorted(markdown_files)
     if not markdown_files:
         failed.append("no markdown reports were generated")
         return passed, failed
@@ -93,6 +107,69 @@ def no_static_status(report_root: Path) -> tuple[list[str], list[str]]:
             failed.append(f"`{markdown_path.as_posix()}` contains forbidden `latest`")
         else:
             passed.append(f"`{markdown_path.as_posix()}` avoids forbidden `latest` references.")
+    return passed, failed
+
+
+def acceptance_material_status(
+    *,
+    run_id: str,
+    report_root: Path,
+    acceptance_root: Path | None,
+    review_root: Path | None,
+) -> tuple[list[str], list[str]]:
+    passed: list[str] = []
+    failed: list[str] = []
+    if acceptance_root is None or review_root is None:
+        return passed, failed
+
+    required_acceptance = [
+        acceptance_root / "handoff.md",
+        acceptance_root / "veto-checklist.md",
+        acceptance_root / "risk-acceptance.md",
+        acceptance_root / "open-issues.md",
+    ]
+    required_review = [
+        review_root / "agent-review.md",
+        review_root / "reviewer-notes.md",
+    ]
+    for path in [*required_acceptance, *required_review]:
+        if not path.exists():
+            failed.append(f"missing acceptance/review material `{path.as_posix()}`")
+        else:
+            passed.append(f"`{path.as_posix()}` is present.")
+
+    handoff_path = acceptance_root / "handoff.md"
+    if handoff_path.exists():
+        handoff_content = handoff_path.read_text(encoding="utf-8")
+        required_refs = [
+            run_id,
+            (report_root / "gate-summary.md").as_posix(),
+            (report_root / "evidence-index.md").as_posix(),
+            (report_root / "report-audit.md").as_posix(),
+        ]
+        missing_refs = [ref for ref in required_refs if ref not in handoff_content]
+        if missing_refs:
+            failed.append(
+                f"handoff.md is missing required run-scoped references: {', '.join(missing_refs)}"
+            )
+        else:
+            passed.append("handoff.md cites the run id and formal gate/evidence/report paths.")
+
+    veto_path = acceptance_root / "veto-checklist.md"
+    if veto_path.exists():
+        veto_content = veto_path.read_text(encoding="utf-8")
+        missing_veto_ids = [
+            veto_id for veto_id in [f"VETO-ID-{value:03d}" for value in range(1, 7)]
+            if veto_id not in veto_content
+        ]
+        if missing_veto_ids:
+            failed.append(
+                "veto-checklist.md is missing formal VETO coverage: "
+                + ", ".join(missing_veto_ids)
+            )
+        else:
+            passed.append("veto-checklist.md covers all formal VETO IDs.")
+
     return passed, failed
 
 
@@ -146,12 +223,26 @@ def main() -> None:
     args = parse_args()
     artifact_root = Path(args.artifact_root)
     report_root = Path(args.report_root)
+    acceptance_root = Path(args.acceptance_root) if args.acceptance_root else None
+    review_root = Path(args.review_root) if args.review_root else None
 
     sections = [
         ("Artifact and report pairing", *suite_report_status(artifact_root, report_root)),
         ("Evidence index traceability", *evidence_status(artifact_root, report_root)),
-        ("No static evidence markers", *no_static_status(report_root)),
+        (
+            "No static evidence markers",
+            *no_static_status(report_root, acceptance_root, review_root),
+        ),
         ("Gate summary integrity", *gate_summary_status(report_root)),
+        (
+            "Acceptance and review material",
+            *acceptance_material_status(
+                run_id=args.run_id,
+                report_root=report_root,
+                acceptance_root=acceptance_root,
+                review_root=review_root,
+            ),
+        ),
     ]
     write_report(report_root=report_root, run_id=args.run_id, sections=sections)
 

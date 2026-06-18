@@ -22,6 +22,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--artifact-root", required=True)
     parser.add_argument("--report-root", required=True)
+    parser.add_argument("--acceptance-root")
+    parser.add_argument("--review-root")
     return parser.parse_args()
 
 
@@ -42,14 +44,15 @@ def main() -> None:
     args = parse_args()
     artifact_root = Path(args.artifact_root)
     report_root = Path(args.report_root)
+    acceptance_root = Path(args.acceptance_root) if args.acceptance_root else None
+    review_root = Path(args.review_root) if args.review_root else None
 
-    scan_paths = sorted(
-        [
-            *artifact_root.rglob("*.json"),
-            *artifact_root.rglob("*.log"),
-            *report_root.rglob("*.md"),
-        ]
-    )
+    scan_paths = [*artifact_root.rglob("*.json"), *artifact_root.rglob("*.log"), *report_root.rglob("*.md")]
+    if acceptance_root and acceptance_root.exists():
+        scan_paths.extend(acceptance_root.rglob("*.md"))
+    if review_root and review_root.exists():
+        scan_paths.extend(review_root.rglob("*.md"))
+    scan_paths = sorted(scan_paths)
     passed, failed = scan_files(scan_paths)
 
     lines = [

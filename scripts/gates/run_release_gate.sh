@@ -7,6 +7,16 @@ reports_dir="${repo_root}/scripts/reports"
 checks_dir="${repo_root}/scripts/checks"
 design_repo="${repo_root}/../quantalithos-design"
 core_repo="${repo_root}/../quantalithos-core"
+design_ref_inputs=(
+  "projects/L1-identity/05-测试方案.md"
+  "projects/L1-identity/06-验收标准.md"
+  "projects/L1-identity/07-实施计划.md"
+  "projects/L1-identity/design-calibration/implementation_execution_ledger.md"
+  "projects/L1-identity/design-calibration/implementation-boundaries/commit-08-c.md"
+  "projects/L1-identity/design-calibration/05_test_plan_step_13_evidence.md"
+  "projects/L1-identity/design-calibration/06_acceptance_step_10_evidence_audit.md"
+  "projects/L1-identity/design-calibration/06_acceptance_step_11_blockers.md"
+)
 
 cd "${repo_root}"
 
@@ -18,6 +28,8 @@ config_profile=""
 design_source_ref=""
 implementation_source_ref=""
 core_contracts_source_ref=""
+acceptance_root=""
+review_root=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -39,6 +51,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --config-profile)
       config_profile="$2"
+      shift 2
+      ;;
+    --acceptance-root)
+      acceptance_root="$2"
+      shift 2
+      ;;
+    --review-root)
+      review_root="$2"
       shift 2
       ;;
     --design-source-ref)
@@ -82,9 +102,38 @@ fi
 if [[ -z "${config_profile}" ]]; then
   config_profile="release-candidate"
 fi
+if [[ -z "${acceptance_root}" ]]; then
+  acceptance_root="reports/acceptance"
+fi
+if [[ -z "${review_root}" ]]; then
+  review_root="reports/review"
+fi
 
 if [[ -z "${design_source_ref}" ]]; then
-  design_source_ref="git:$(git -C "${design_repo}" rev-parse HEAD)"
+  design_repo_dirty=0
+  if ! git -C "${design_repo}" diff --quiet -- "${design_ref_inputs[@]}"; then
+    design_repo_dirty=1
+  fi
+  if ! git -C "${design_repo}" diff --cached --quiet -- "${design_ref_inputs[@]}"; then
+    design_repo_dirty=1
+  fi
+  if [[ "${design_repo_dirty}" -eq 0 ]]; then
+    design_source_ref="git:$(git -C "${design_repo}" rev-parse HEAD)"
+  else
+    design_source_ref="$(
+      python3 - "${design_repo}" "${design_ref_inputs[@]}" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+repo_root = pathlib.Path(sys.argv[1])
+digest = hashlib.sha256()
+for relative_path in sys.argv[2:]:
+    digest.update((repo_root / relative_path).read_bytes())
+print(f"doc-digest:sha256:{digest.hexdigest()}")
+PY
+    )"
+  fi
 fi
 if [[ -z "${implementation_source_ref}" ]]; then
   implementation_source_ref="git:$(git -C "${repo_root}" rev-parse HEAD)"
@@ -134,9 +183,46 @@ bash "${checks_dir}/check_artifact_report_pairing.sh" \
   --artifact-root "${artifact_root}" \
   --report-root "${report_root}"
 
+bash "${reports_dir}/generate_acceptance_materials.sh" \
+  --run-id "${run_id}" \
+  --artifact-root "${artifact_root}" \
+  --report-root "${report_root}" \
+  --acceptance-root "${acceptance_root}" \
+  --review-root "${review_root}"
+
+bash "${checks_dir}/check_redaction.sh" \
+  --run-id "${run_id}" \
+  --artifact-root "${artifact_root}" \
+  --report-root "${report_root}" \
+  --acceptance-root "${acceptance_root}" \
+  --review-root "${review_root}"
+
 bash "${checks_dir}/check_no_static_evidence.sh" \
   --run-id "${run_id}" \
   --artifact-root "${artifact_root}" \
-  --report-root "${report_root}"
+  --report-root "${report_root}" \
+  --acceptance-root "${acceptance_root}" \
+  --review-root "${review_root}"
+
+bash "${reports_dir}/generate_acceptance_materials.sh" \
+  --run-id "${run_id}" \
+  --artifact-root "${artifact_root}" \
+  --report-root "${report_root}" \
+  --acceptance-root "${acceptance_root}" \
+  --review-root "${review_root}"
+
+bash "${checks_dir}/check_redaction.sh" \
+  --run-id "${run_id}" \
+  --artifact-root "${artifact_root}" \
+  --report-root "${report_root}" \
+  --acceptance-root "${acceptance_root}" \
+  --review-root "${review_root}"
+
+bash "${checks_dir}/check_no_static_evidence.sh" \
+  --run-id "${run_id}" \
+  --artifact-root "${artifact_root}" \
+  --report-root "${report_root}" \
+  --acceptance-root "${acceptance_root}" \
+  --review-root "${review_root}"
 
 echo "run_release_gate completed for ${suite} with config profile ${config_profile}"

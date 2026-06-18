@@ -36,6 +36,36 @@ def main() -> None:
     ]
 
     for item in evidence_items:
+        detail_path = report_root / "evidence" / f"{item['evidence_id']}.md"
+        detail_path.parent.mkdir(parents=True, exist_ok=True)
+        detail_lines = [
+            f"# {item['evidence_id']}",
+            "",
+            f"- run_id: `{args.run_id}`",
+            f"- status: `{item['status']}`",
+            f"- redaction_status: `{item['redaction_status']}`",
+            f"- review_status: `{item['review_status']}`",
+            f"- suite_refs: `{','.join(item['suite_refs'])}`",
+            f"- tc_refs: `{','.join(item['tc_refs'])}`",
+            f"- ac_refs: `{','.join(item['ac_refs'])}`",
+            f"- veto_refs: `{','.join(item['veto_refs']) if item['veto_refs'] else 'none'}`",
+            f"- safe_summary: {item['safe_summary']}",
+            "",
+            "## Artifact Paths",
+            "",
+            *(f"- `{path}`" for path in item["artifact_paths"]),
+            "",
+            "## Artifact Digests",
+            "",
+            *(f"- `{digest}`" for digest in item["artifact_digests"]),
+            "",
+            "## Report Paths",
+            "",
+            *(f"- `{path}`" for path in item["report_paths"]),
+            "",
+        ]
+        detail_path.write_text("\n".join(detail_lines), encoding="utf-8")
+
         lines.extend(
             [
                 f"## {item['evidence_id']}",
@@ -54,6 +84,7 @@ def main() -> None:
                 *(f"  - `{digest}`" for digest in item["artifact_digests"]),
                 "- report paths:",
                 *(f"  - `{path}`" for path in item["report_paths"]),
+                f"- detail page: `{detail_path}`",
                 "",
             ]
         )
