@@ -49,6 +49,9 @@ def evidence_status(artifact_root: Path, report_root: Path) -> tuple[list[str], 
     failed: list[str] = []
     evidence_items = load_evidence_items(artifact_root / "evidence-index.json")
     evidence_index_markdown = report_root / "evidence-index.md"
+    pending_report_paths = {
+        (report_root / "report-audit.md").as_posix(),
+    }
     if not evidence_index_markdown.exists():
         failed.append("missing generated evidence-index.md")
         return passed, failed
@@ -59,7 +62,9 @@ def evidence_status(artifact_root: Path, report_root: Path) -> tuple[list[str], 
             failed.append(f"evidence index markdown does not contain `{item['evidence_id']}`")
             continue
         missing_report_paths = [
-            report_path for report_path in item["report_paths"] if not Path(report_path).exists()
+            report_path
+            for report_path in item["report_paths"]
+            if not Path(report_path).exists() and report_path not in pending_report_paths
         ]
         if missing_report_paths:
             failed.append(

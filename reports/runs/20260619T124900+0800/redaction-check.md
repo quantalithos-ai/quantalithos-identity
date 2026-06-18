@@ -1,0 +1,76 @@
+# redaction-check
+
+- run_id: `20260619T124900+0800`
+- overall_status: `clean`
+- scanned_file_count: `64`
+
+## Clean Files
+
+- `artifacts/test/20260619T124900+0800/evidence-index.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/meta/config-digest.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/meta/context.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/meta/source-commits.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/config-redline/cases/config-001-formal-profile-matrix.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/config-redline/report.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/config-redline/stderr.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/config-redline/stdout.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/contract-domain-fast/cases/contract-001-public-shell-roundtrip.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/contract-domain-fast/cases/state-001-domain-transition-guards.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/contract-domain-fast/report.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/contract-domain-fast/stderr.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/contract-domain-fast/stdout.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/dependency-boundary/cases/arch-001-entry-facade-dependency-boundary.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/dependency-boundary/report.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/dependency-boundary/stderr.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/dependency-boundary/stdout.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/entry-worker-job/cases/consumer-001-inbound-and-callback-replay.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/entry-worker-job/cases/job-001-job-entry-and-report-replay.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/entry-worker-job/report.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/entry-worker-job/stderr.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/entry-worker-job/stdout.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/infra-runtime-fake/cases/idemp-001-stored-replay-and-fake-parity.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/infra-runtime-fake/report.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/infra-runtime-fake/stderr.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/infra-runtime-fake/stdout.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/operations-replay-core/cases/job-002-maintenance-and-propagation-no-truth-repair.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/operations-replay-core/cases/outbox-001-accepted-only-payload-marker.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/operations-replay-core/report.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/operations-replay-core/stderr.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/operations-replay-core/stdout.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/redaction-boundary/cases/redaction-001-forbidden-material-scan.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/redaction-boundary/report.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/redaction-boundary/stderr.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/redaction-boundary/stdout.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/release-main-smoke/cases/core-001-release-scenario-closure.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/release-main-smoke/report.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/release-main-smoke/stderr.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/release-main-smoke/stdout.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/report-generation-audit/cases/report-001-pairing-and-no-static-evidence.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/report-generation-audit/report.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/report-generation-audit/stderr.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/report-generation-audit/stdout.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/service-flow-fast/cases/cmd-001-command-accepted-and-replay.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/service-flow-fast/cases/query-001-visibility-first-no-write.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/service-flow-fast/report.json` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/service-flow-fast/stderr.log` stayed clean across the formal deny-list scan.
+- `artifacts/test/20260619T124900+0800/suites/service-flow-fast/stdout.log` stayed clean across the formal deny-list scan.
+- `reports/runs/20260619T124900+0800/dependency-boundary.md` stayed clean across the formal deny-list scan.
+- `reports/runs/20260619T124900+0800/evidence-index.md` stayed clean across the formal deny-list scan.
+- `reports/runs/20260619T124900+0800/gate-summary.md` stayed clean across the formal deny-list scan.
+- `reports/runs/20260619T124900+0800/redaction-check.md` stayed clean across the formal deny-list scan.
+- `reports/runs/20260619T124900+0800/report-audit.md` stayed clean across the formal deny-list scan.
+- `reports/runs/20260619T124900+0800/suites/config-redline.md` stayed clean across the formal deny-list scan.
+- `reports/runs/20260619T124900+0800/suites/contract-domain-fast.md` stayed clean across the formal deny-list scan.
+- `reports/runs/20260619T124900+0800/suites/dependency-boundary.md` stayed clean across the formal deny-list scan.
+- `reports/runs/20260619T124900+0800/suites/entry-worker-job.md` stayed clean across the formal deny-list scan.
+- `reports/runs/20260619T124900+0800/suites/infra-runtime-fake.md` stayed clean across the formal deny-list scan.
+- `reports/runs/20260619T124900+0800/suites/operations-replay-core.md` stayed clean across the formal deny-list scan.
+- `reports/runs/20260619T124900+0800/suites/redaction-boundary.md` stayed clean across the formal deny-list scan.
+- `reports/runs/20260619T124900+0800/suites/release-main-smoke.md` stayed clean across the formal deny-list scan.
+- `reports/runs/20260619T124900+0800/suites/report-generation-audit.md` stayed clean across the formal deny-list scan.
+- `reports/runs/20260619T124900+0800/suites/service-flow-fast.md` stayed clean across the formal deny-list scan.
+- `reports/runs/20260619T124900+0800/summary.md` stayed clean across the formal deny-list scan.
+
+## Findings
+
+- no forbidden patterns were found in the run-scoped artifacts or generated reports
