@@ -5,12 +5,19 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../.." && pwd)"
 reports_dir="${repo_root}/scripts/reports"
 checks_dir="${repo_root}/scripts/checks"
+design_repo="${repo_root}/../quantalithos-design"
+core_repo="${repo_root}/../quantalithos-core"
+
+cd "${repo_root}"
 
 run_id=""
 suite=""
 artifact_root=""
 report_root=""
 config_profile=""
+design_source_ref=""
+implementation_source_ref=""
+core_contracts_source_ref=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -34,6 +41,18 @@ while [[ $# -gt 0 ]]; do
       config_profile="$2"
       shift 2
       ;;
+    --design-source-ref)
+      design_source_ref="$2"
+      shift 2
+      ;;
+    --implementation-source-ref)
+      implementation_source_ref="$2"
+      shift 2
+      ;;
+    --core-contracts-source-ref)
+      core_contracts_source_ref="$2"
+      shift 2
+      ;;
     *)
       echo "unknown argument: $1" >&2
       exit 2
@@ -47,11 +66,10 @@ if [[ -z "${run_id}" ]]; then
 fi
 
 if [[ -z "${suite}" ]]; then
-  echo "commit-08-b keeps release-main-smoke in commit-08-c; pass --suite report-generation-audit for the current audit subset" >&2
-  exit 2
+  suite="release-main-smoke"
 fi
-if [[ "${suite}" != "report-generation-audit" ]]; then
-  echo "unsupported release suite at commit-08-b: ${suite}" >&2
+if [[ "${suite}" != "release-main-smoke" ]]; then
+  echo "commit-08-c release orchestration only supports --suite release-main-smoke" >&2
   exit 2
 fi
 
@@ -65,9 +83,25 @@ if [[ -z "${config_profile}" ]]; then
   config_profile="release-candidate"
 fi
 
-if [[ ! -f "${repo_root}/${artifact_root}/meta/context.json" ]]; then
-  echo "missing raw artifacts under ${artifact_root}; materialize them before running the release audit subset" >&2
-  exit 2
+if [[ -z "${design_source_ref}" ]]; then
+  design_source_ref="git:$(git -C "${design_repo}" rev-parse HEAD)"
+fi
+if [[ -z "${implementation_source_ref}" ]]; then
+  implementation_source_ref="git:$(git -C "${repo_root}" rev-parse HEAD)"
+fi
+if [[ -z "${core_contracts_source_ref}" ]]; then
+  core_contracts_source_ref="git:$(git -C "${core_repo}" rev-parse HEAD)"
+fi
+
+if [[ ! -f "${artifact_root}/meta/context.json" ]]; then
+  bash "${reports_dir}/write_commit_08_c_artifacts.sh" \
+    --run-id "${run_id}" \
+    --artifact-root "${artifact_root}" \
+    --report-root "${report_root}" \
+    --config-profile "${config_profile}" \
+    --design-source-ref "${design_source_ref}" \
+    --implementation-source-ref "${implementation_source_ref}" \
+    --core-contracts-source-ref "${core_contracts_source_ref}"
 fi
 
 bash "${reports_dir}/generate_reports.sh" \
