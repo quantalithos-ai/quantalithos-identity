@@ -554,19 +554,7 @@ impl<'a> IdentityConsumerService<'a> {
                     payload.external_reference_ref.clone(),
                     payload.reference_owner_ref.clone(),
                 ) {
-                    self.save_reference_bundle_sidecars(
-                        reference_ref,
-                        owner_ref,
-                        |state| crate::ports::ExternalReferenceTypedSidecarRefs {
-                            role_capability_safe_summary_ref: state.safe_summary_ref.clone(),
-                            career_safe_summary_ref: None,
-                            memory_safe_summary_ref: None,
-                            governance_basis_summary_ref: None,
-                            evidence_summary_ref: None,
-                            source_version_ref: state.source_version_ref.clone(),
-                        },
-                        uow,
-                    )?;
+                    self.save_reference_bundle_sidecars(reference_ref, owner_ref, uow)?;
                 }
 
                 let _ = stale_projection_refs;
@@ -947,19 +935,7 @@ impl<'a> IdentityConsumerService<'a> {
                     payload.external_reference_ref.clone(),
                     payload.reference_owner_ref.clone(),
                 ) {
-                    self.save_reference_bundle_sidecars(
-                        reference_ref,
-                        owner_ref,
-                        |state| crate::ports::ExternalReferenceTypedSidecarRefs {
-                            role_capability_safe_summary_ref: None,
-                            career_safe_summary_ref: None,
-                            memory_safe_summary_ref: state.safe_summary_ref.clone(),
-                            governance_basis_summary_ref: None,
-                            evidence_summary_ref: None,
-                            source_version_ref: state.source_version_ref.clone(),
-                        },
-                        uow,
-                    )?;
+                    self.save_reference_bundle_sidecars(reference_ref, owner_ref, uow)?;
                 }
 
                 let accepted_cursor_ref =
@@ -2092,18 +2068,12 @@ impl<'a> IdentityConsumerService<'a> {
         }
     }
 
-    fn save_reference_bundle_sidecars<F>(
+    fn save_reference_bundle_sidecars(
         &self,
         reference_ref: ExternalReferenceRef,
         owner_ref: IdentityReferenceOwnerRef,
-        build_sidecars: F,
         uow: &dyn IdentityUnitOfWork,
-    ) -> Result<(), ApplicationError>
-    where
-        F: FnOnce(
-            &identity_domain::reference_state::ReferenceResolutionState,
-        ) -> crate::ports::ExternalReferenceTypedSidecarRefs,
-    {
+    ) -> Result<(), ApplicationError> {
         let current = self
             .deps
             .reference_state_repository
@@ -2113,18 +2083,23 @@ impl<'a> IdentityConsumerService<'a> {
             .external_reference_resolver
             .resolve_external_reference(reference_ref.clone(), owner_ref)?;
         let saved = self.deps.reference_state_repository.save_reference_state(
-            resolved.clone(),
+            resolved.state,
             current.as_ref().map(|value| value.version),
             uow,
         )?;
-        self.deps
-            .reference_state_repository
-            .save_typed_sidecar_refs(
-                reference_ref,
-                build_sidecars(&resolved),
-                saved.version,
-                uow,
-            )?;
+        if let Some(sidecar_refs) = resolved.typed_sidecar_refs {
+            self.deps
+                .reference_state_repository
+                .save_typed_sidecar_refs(
+                    reference_ref,
+                    sidecar_refs,
+                    current
+                        .as_ref()
+                        .map(|value| value.version)
+                        .unwrap_or(saved.version),
+                    uow,
+                )?;
+        }
         Ok(())
     }
 

@@ -10,19 +10,21 @@ use identity_application::mapper::{
 };
 use identity_application::outbound_material::AcceptedOutboundMaterialKind;
 use identity_application::ports::{
-    CareerRecordRepository, ExternalReferenceTypedSidecarRefs, GlobalLifecycleRepository,
-    GlobalMemberRepository, HandoffDeliveryOutcome, HandoffReceiptResolution,
-    HandoffTargetResolution, IdentityAcceptedAuditTrailMarkerMapper,
+    CareerRecordRepository, ExternalReferenceResolutionOutcome, ExternalReferenceTypedSidecarRefs,
+    GlobalLifecycleRepository, GlobalMemberRepository, HandoffDeliveryOutcome,
+    HandoffReceiptResolution, HandoffTargetResolution, IdentityAcceptedAuditTrailMarkerMapper,
     IdentityAdapterAvailabilityPort, IdentityAuditTrailRepository, IdentityClockPort,
     IdentityCommandEffectSummaryRepository, IdentityCursorAssignerPort,
     IdentityExternalReferenceResolverPort, IdentityExternalSourceResolverPort,
     IdentityHandoffDeliveryPort, IdentityHandoffTargetPort, IdentityIdGeneratorPort,
-    IdentityIdempotencyRepository, IdentityJobReportRepository, IdentityMarkerSubjectMapper,
-    IdentityOperationContextFactoryPort, IdentityOutboxRepository, IdentityProjectionRepository,
-    IdentityReadVisibilityRepository, IdentityReconciliationReportRepository,
-    IdentityReferenceStateRepository, IdentityStoredResultRepository,
-    IdentityTraceRecordRepository, IdentityTruthChangeSubjectMapper, IdentityUnitOfWork,
-    IdentityUnitOfWorkManagerPort, MemoryReferenceRepository, RoleCapabilityRepository,
+    IdentityIdempotencyRepository, IdentityJobReportRepository,
+    IdentityMaintenanceInspectionContext, IdentityMaintenanceRepository,
+    IdentityMarkerSubjectMapper, IdentityOperationContextFactoryPort, IdentityOutboxRepository,
+    IdentityProjectionRepository, IdentityReadVisibilityRepository,
+    IdentityReconciliationReportRepository, IdentityReferenceStateRepository,
+    IdentityStoredResultRepository, IdentityTraceRecordRepository,
+    IdentityTruthChangeSubjectMapper, IdentityUnitOfWork, IdentityUnitOfWorkManagerPort,
+    MemberSummaryProjectionRebuildPlan, MemoryReferenceRepository, RoleCapabilityRepository,
     TraceHandoffIntentRepository,
 };
 use identity_application::support::{
@@ -42,7 +44,7 @@ use identity_contracts::jobs::IdentityJobResultKind;
 use identity_contracts::protocol::{
     IdentityJobName, IdentityOutboundEventName, IdentityProtocolSchemaVersionRef,
 };
-use identity_contracts::receipts::{MaintenanceIssueRef, TraceHandoffIntentRef};
+use identity_contracts::receipts::TraceHandoffIntentRef;
 use identity_contracts::refs::{
     ArchiveHandoffRef, ArchiveRef, AuditCursorRef, AuditScopeRef, AuditTrailRef, CareerRecordId,
     CareerRecordRef, CareerSourceMarkerRef, ConsumerRef, ExternalReferenceKind,
@@ -56,10 +58,10 @@ use identity_contracts::refs::{
     IdentityTraceRecordRef, IdentityTraceSubjectRef, IdentityTruthCursor, LifecycleRiskRef,
     MaintenanceScopeRef, MemberSummaryViewRef, MemoryRef, MemoryReferenceId, MemoryReferenceRef,
     MemoryReferenceSourceState, ProjectParticipationRef, ProjectionStateRef,
-    ReconciliationReportRef, ReferenceResolutionStateId, ReferenceResolutionStateRef,
-    RoleCapabilitySourceRef, RoleCapabilitySourceSnapshotRef, RoleCapabilitySummaryRef,
-    TopicKeyRef, TraceHandoffSafeMaterialRef, VisibilityContextRef, VisibilityResultRef,
-    VisibilityScopeRef, WorkParticipationSourceState, WorkParticipationSourceSummary,
+    ReconciliationReportRef, ReferenceResolutionStateRef, RoleCapabilitySourceRef,
+    RoleCapabilitySourceSnapshotRef, RoleCapabilitySummaryRef, TopicKeyRef,
+    TraceHandoffSafeMaterialRef, VisibilityContextRef, VisibilityResultRef, VisibilityScopeRef,
+    WorkParticipationSourceState, WorkParticipationSourceSummary,
 };
 use identity_contracts::views::{IdentityVisibilityAccessSummary, MemberSummaryView};
 use identity_domain::audit::{AuditTrail, AuditTrailEntry};
@@ -307,6 +309,16 @@ impl IdentityInMemoryRuntimeBuilder {
         self
     }
 
+    pub fn seed_member_summary_rebuild_plan(
+        mut self,
+        plan: MemberSummaryProjectionRebuildPlan,
+    ) -> Self {
+        self.store
+            .member_summary_rebuild_plans
+            .insert(projection_key(&plan.projection_ref), plan);
+        self
+    }
+
     pub fn seed_reference_state(
         mut self,
         state: ReferenceResolutionState,
@@ -317,10 +329,28 @@ impl IdentityInMemoryRuntimeBuilder {
         self.store.reference_states.insert(
             key.clone(),
             StoredReferenceState {
-                state,
-                sidecars,
+                state: state.clone(),
+                sidecars: sidecars.clone(),
                 version,
             },
+        );
+        self.store.reference_resolution_outcomes.insert(
+            key,
+            ExternalReferenceResolutionOutcome {
+                state,
+                typed_sidecar_refs: Some(sidecars),
+            },
+        );
+        self
+    }
+
+    pub fn seed_external_reference_resolution_outcome(
+        mut self,
+        outcome: ExternalReferenceResolutionOutcome,
+    ) -> Self {
+        self.store.reference_resolution_outcomes.insert(
+            external_reference_key(&outcome.state.external_reference_ref),
+            outcome,
         );
         self
     }
@@ -559,6 +589,62 @@ impl IdentityInMemoryRuntimeBuilder {
         self
     }
 
+    pub fn seed_maintenance_targets(
+        mut self,
+        maintenance_scope_ref: MaintenanceScopeRef,
+        target_refs: Vec<IdentityMaintenanceTargetRef>,
+    ) -> Self {
+        self.store
+            .maintenance_targets_by_scope
+            .insert(maintenance_scope_key(&maintenance_scope_ref), target_refs);
+        self
+    }
+
+    pub fn seed_projection_targets_for_rebuild(
+        mut self,
+        maintenance_scope_ref: MaintenanceScopeRef,
+        projection_refs: Vec<IdentityProjectionRef>,
+    ) -> Self {
+        self.store.projection_targets_by_scope.insert(
+            maintenance_scope_key(&maintenance_scope_ref),
+            projection_refs,
+        );
+        self
+    }
+
+    pub fn seed_reference_targets_for_refresh(
+        mut self,
+        maintenance_scope_ref: MaintenanceScopeRef,
+        reference_refs: Vec<ExternalReferenceRef>,
+    ) -> Self {
+        self.store.reference_targets_by_scope.insert(
+            maintenance_scope_key(&maintenance_scope_ref),
+            reference_refs,
+        );
+        self
+    }
+
+    pub fn seed_report_targets(
+        mut self,
+        maintenance_scope_ref: MaintenanceScopeRef,
+        target_refs: Vec<IdentityMaintenanceTargetRef>,
+    ) -> Self {
+        self.store
+            .report_targets_by_scope
+            .insert(maintenance_scope_key(&maintenance_scope_ref), target_refs);
+        self
+    }
+
+    pub fn seed_maintenance_target_inspection_context(
+        mut self,
+        context: IdentityMaintenanceInspectionContext,
+    ) -> Self {
+        self.store
+            .maintenance_inspection_contexts
+            .insert(maintenance_target_key(&context.target_ref), context);
+        self
+    }
+
     pub fn seed_projection_state_read_access(
         mut self,
         projection_ref: IdentityProjectionRef,
@@ -661,6 +747,10 @@ impl IdentityInMemoryRuntime {
         self
     }
 
+    pub fn maintenance_repository(&self) -> &Self {
+        self
+    }
+
     pub fn reference_state_repository(&self) -> &Self {
         self
     }
@@ -715,7 +805,7 @@ impl IdentityInMemoryRuntime {
         &self,
         transaction_ref: &IdentityTransactionRef,
         reference_ref: &ExternalReferenceRef,
-    ) -> Result<Option<(ReferenceResolutionStateRef, IdentityVersion)>, ApplicationError> {
+    ) -> Result<Option<ReferenceBundleVersionState>, ApplicationError> {
         let committed = {
             let store =
                 self.shared.store.lock().map_err(|_| {
@@ -724,7 +814,11 @@ impl IdentityInMemoryRuntime {
             store
                 .reference_states
                 .get(&external_reference_key(reference_ref))
-                .map(|stored| (stored.state.resolution_state_ref.clone(), stored.version))
+                .map(|stored| ReferenceBundleVersionState {
+                    value_ref: stored.state.resolution_state_ref.clone(),
+                    committed_version: Some(stored.version),
+                    current_version: stored.version,
+                })
         };
         let staged = self.shared.staged_by_tx.lock().map_err(|_| {
             ApplicationError::consistency_defect("staged transaction map lock poisoned")
@@ -737,22 +831,26 @@ impl IdentityInMemoryRuntime {
                         state,
                         expected_version,
                     } if state.external_reference_ref == *reference_ref => {
-                        current = Some((
-                            state.resolution_state_ref.clone(),
-                            expected_version
+                        let committed_version =
+                            current.as_ref().and_then(|value| value.committed_version);
+                        current = Some(ReferenceBundleVersionState {
+                            value_ref: state.resolution_state_ref.clone(),
+                            committed_version,
+                            current_version: expected_version
                                 .map(|value| IdentityVersion::new(value.get() + 1))
                                 .unwrap_or_else(|| IdentityVersion::new(1)),
-                        ));
+                        });
                     }
                     StagedOp::SaveTypedSidecars {
                         reference_ref: staged_reference_ref,
                         expected_version,
                         ..
                     } if staged_reference_ref == reference_ref => {
-                        let state_ref = current.as_ref().map(|(value_ref, _)| value_ref.clone());
-                        if let Some(state_ref) = state_ref {
-                            current =
-                                Some((state_ref, IdentityVersion::new(expected_version.get() + 1)));
+                        if let Some(current_state) = current.as_mut() {
+                            if current_state.current_version == *expected_version {
+                                current_state.current_version =
+                                    IdentityVersion::new(expected_version.get() + 1);
+                            }
                         }
                     }
                     _ => {}
@@ -1041,6 +1139,13 @@ struct SharedRuntime {
     staged_by_tx: Mutex<HashMap<String, Vec<StagedOp>>>,
 }
 
+#[derive(Clone, Debug)]
+struct ReferenceBundleVersionState {
+    value_ref: ReferenceResolutionStateRef,
+    committed_version: Option<IdentityVersion>,
+    current_version: IdentityVersion,
+}
+
 #[derive(Clone, Debug, Default)]
 struct RuntimeStore {
     members: HashMap<String, StoredMember>,
@@ -1068,8 +1173,15 @@ struct RuntimeStore {
     member_summary_views: HashMap<String, StoredMemberSummaryView>,
     member_scope_index: HashMap<String, String>,
     projection_states: HashMap<String, StoredProjectionState>,
+    member_summary_rebuild_plans: HashMap<String, MemberSummaryProjectionRebuildPlan>,
     reference_states: HashMap<String, StoredReferenceState>,
+    reference_resolution_outcomes: HashMap<String, ExternalReferenceResolutionOutcome>,
     reconciliation_reports: HashMap<String, StoredReconciliationReport>,
+    maintenance_targets_by_scope: HashMap<String, Vec<IdentityMaintenanceTargetRef>>,
+    projection_targets_by_scope: HashMap<String, Vec<IdentityProjectionRef>>,
+    reference_targets_by_scope: HashMap<String, Vec<ExternalReferenceRef>>,
+    report_targets_by_scope: HashMap<String, Vec<IdentityMaintenanceTargetRef>>,
+    maintenance_inspection_contexts: HashMap<String, IdentityMaintenanceInspectionContext>,
     handoff_intents: HashMap<String, StoredHandoffIntent>,
     outbox_records: HashMap<String, StoredOutboxRecord>,
     outbox_payload_markers: HashMap<String, StoredOutboxPayloadMarker>,
@@ -3308,6 +3420,21 @@ impl IdentityProjectionRepository for IdentityInMemoryRuntime {
             .and_then(|stored| stored.state.source_cursor_ref.clone()))
     }
 
+    fn get_member_summary_rebuild_plan(
+        &self,
+        projection_ref: IdentityProjectionRef,
+    ) -> Result<Option<MemberSummaryProjectionRebuildPlan>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .member_summary_rebuild_plans
+            .get(&projection_key(&projection_ref))
+            .cloned())
+    }
+
     fn expand_affected_projection_refs(
         &self,
         _subject_refs: identity_application::support::IdentityAcceptedSubjectRefs,
@@ -3376,65 +3503,27 @@ impl IdentityExternalReferenceResolverPort for IdentityInMemoryRuntime {
         &self,
         reference_ref: ExternalReferenceRef,
         owner_ref: IdentityReferenceOwnerRef,
-    ) -> Result<ReferenceResolutionState, ApplicationError> {
+    ) -> Result<ExternalReferenceResolutionOutcome, ApplicationError> {
         let store = self
             .shared
             .store
             .lock()
             .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
-        if let Some(stored) = store
-            .reference_states
+        if let Some(outcome) = store
+            .reference_resolution_outcomes
             .get(&external_reference_key(&reference_ref))
         {
-            if stored.state.reference_owner_ref != owner_ref {
+            if outcome.state.reference_owner_ref != owner_ref {
                 return Err(ApplicationError::not_found(
-                    "reference bundle owner mismatch",
+                    "external reference resolution outcome owner mismatch",
                 ));
             }
-            return Ok(stored.state.clone());
+            return Ok(outcome.clone());
         }
-        drop(store);
-
-        let token = reference_ref.source_ref.external_ref.as_str().to_owned();
-        let resolution_state_ref = runtime_reference_state_ref(&reference_ref)?;
-        let checked_at = runtime_timestamp(1)?;
-        if token.contains("unavailable") {
-            let issue_source_ref = reference_ref.source_ref.clone();
-            return Ok(ReferenceResolutionState::unavailable(
-                resolution_state_ref,
-                reference_ref,
-                owner_ref,
-                MaintenanceIssueRef::new(
-                    identity_contracts::receipts::MaintenanceIssueKind::Unavailable,
-                    issue_source_ref,
-                ),
-                checked_at,
-            ));
-        }
-        if token.contains("unrecognized") {
-            let issue_source_ref = reference_ref.source_ref.clone();
-            return Ok(ReferenceResolutionState::unrecognized(
-                resolution_state_ref,
-                reference_ref,
-                owner_ref,
-                MaintenanceIssueRef::new(
-                    identity_contracts::receipts::MaintenanceIssueKind::Unrecognized,
-                    issue_source_ref,
-                ),
-                checked_at,
-            ));
-        }
-
-        let source_version_ref = runtime_external_source_version_ref(&reference_ref)?;
-        let safe_summary_ref = runtime_external_reference_safe_summary_ref(&reference_ref)?;
-        Ok(ReferenceResolutionState::resolved(
-            resolution_state_ref,
-            reference_ref,
-            owner_ref,
-            source_version_ref,
-            safe_summary_ref,
-            checked_at,
-        ))
+        Err(ApplicationError::not_found(format!(
+            "external reference resolution outcome {} is not seeded",
+            reference_ref.source_ref.external_ref.as_str()
+        )))
     }
 
     fn map_role_capability_owner(
@@ -3525,7 +3614,7 @@ impl IdentityReferenceStateRepository for IdentityInMemoryRuntime {
         &self,
         owner_ref: IdentityReferenceOwnerRef,
         page: IdentityRepositoryPage,
-    ) -> Result<Page<IdentityVersionedRef<ReferenceResolutionStateRef>>, ApplicationError> {
+    ) -> Result<Page<ExternalReferenceRef>, ApplicationError> {
         let store = self
             .shared
             .store
@@ -3542,7 +3631,7 @@ impl IdentityReferenceStateRepository for IdentityInMemoryRuntime {
         &self,
         reference_kind: ExternalReferenceKind,
         page: IdentityRepositoryPage,
-    ) -> Result<Page<IdentityVersionedRef<ReferenceResolutionStateRef>>, ApplicationError> {
+    ) -> Result<Page<ExternalReferenceRef>, ApplicationError> {
         let store = self
             .shared
             .store
@@ -3559,7 +3648,7 @@ impl IdentityReferenceStateRepository for IdentityInMemoryRuntime {
         &self,
         _maintenance_scope_ref: identity_contracts::refs::MaintenanceScopeRef,
         page: IdentityRepositoryPage,
-    ) -> Result<Page<IdentityVersionedRef<ReferenceResolutionStateRef>>, ApplicationError> {
+    ) -> Result<Page<ExternalReferenceRef>, ApplicationError> {
         let store = self
             .shared
             .store
@@ -3623,14 +3712,23 @@ impl IdentityReferenceStateRepository for IdentityInMemoryRuntime {
         expected_version: IdentityVersion,
         uow: &dyn IdentityUnitOfWork,
     ) -> Result<IdentityVersionedRef<ReferenceResolutionStateRef>, ApplicationError> {
-        let (value_ref, current_version) = self
+        let current = self
             .staged_reference_bundle_state(&uow.transaction_ref(), &reference_ref)?
             .ok_or_else(|| ApplicationError::not_found("reference bundle not found"))?;
-        if current_version != expected_version {
+        let current_matches_loaded = current.current_version == expected_version;
+        let staged_state_already_used_loaded_version = current.committed_version
+            == Some(expected_version)
+            && current.current_version == IdentityVersion::new(expected_version.get() + 1);
+        if !current_matches_loaded && !staged_state_already_used_loaded_version {
             return Err(ApplicationError::optimistic_version_conflict(
                 "reference bundle version mismatch",
             ));
         }
+        let predicted_version = if current_matches_loaded {
+            IdentityVersion::new(expected_version.get() + 1)
+        } else {
+            current.current_version
+        };
 
         self.stage(
             &uow.transaction_ref(),
@@ -3642,9 +3740,113 @@ impl IdentityReferenceStateRepository for IdentityInMemoryRuntime {
         )?;
 
         Ok(IdentityVersionedRef {
-            value_ref,
-            version: IdentityVersion::new(expected_version.get() + 1),
+            value_ref: current.value_ref,
+            version: predicted_version,
         })
+    }
+}
+
+impl IdentityMaintenanceRepository for IdentityInMemoryRuntime {
+    fn expand_maintenance_targets(
+        &self,
+        maintenance_scope_ref: MaintenanceScopeRef,
+    ) -> Result<Page<IdentityMaintenanceTargetRef>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let (items, next_cursor) = paged(
+            store
+                .maintenance_targets_by_scope
+                .get(&maintenance_scope_key(&maintenance_scope_ref))
+                .cloned()
+                .unwrap_or_default(),
+            IdentityRepositoryPage::new(None, u32::MAX),
+            "maintenance-target",
+        );
+        Ok(Page { items, next_cursor })
+    }
+
+    fn list_projection_targets_for_rebuild(
+        &self,
+        maintenance_scope_ref: MaintenanceScopeRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityProjectionRef>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let (items, next_cursor) = paged(
+            store
+                .projection_targets_by_scope
+                .get(&maintenance_scope_key(&maintenance_scope_ref))
+                .cloned()
+                .unwrap_or_default(),
+            page,
+            "maintenance-projection",
+        );
+        Ok(Page { items, next_cursor })
+    }
+
+    fn list_reference_targets_for_refresh(
+        &self,
+        maintenance_scope_ref: MaintenanceScopeRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<ExternalReferenceRef>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let (items, next_cursor) = paged(
+            store
+                .reference_targets_by_scope
+                .get(&maintenance_scope_key(&maintenance_scope_ref))
+                .cloned()
+                .unwrap_or_default(),
+            page,
+            "maintenance-reference",
+        );
+        Ok(Page { items, next_cursor })
+    }
+
+    fn list_report_targets(
+        &self,
+        maintenance_scope_ref: MaintenanceScopeRef,
+        page: IdentityRepositoryPage,
+    ) -> Result<Page<IdentityMaintenanceTargetRef>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let (items, next_cursor) = paged(
+            store
+                .report_targets_by_scope
+                .get(&maintenance_scope_key(&maintenance_scope_ref))
+                .cloned()
+                .unwrap_or_default(),
+            page,
+            "maintenance-report",
+        );
+        Ok(Page { items, next_cursor })
+    }
+
+    fn load_maintenance_target_inspection_context(
+        &self,
+        target_ref: IdentityMaintenanceTargetRef,
+    ) -> Result<Option<IdentityMaintenanceInspectionContext>, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .maintenance_inspection_contexts
+            .get(&maintenance_target_key(&target_ref))
+            .cloned())
     }
 }
 
@@ -5025,7 +5227,7 @@ fn apply_op(
             reference_ref,
             sidecars,
             expected_version,
-        } => apply_save_typed_sidecars(store, reference_ref, sidecars, expected_version),
+        } => apply_save_typed_sidecars(store, baseline, reference_ref, sidecars, expected_version),
         StagedOp::SaveHandoffIntent {
             intent,
             expected_version,
@@ -5635,14 +5837,21 @@ fn apply_save_reference_state(
     let key = external_reference_key(&state.external_reference_ref);
     match (store.reference_states.get(&key), expected_version) {
         (None, None) => {
+            let next_state = state;
             store.reference_states.insert(
                 key,
                 StoredReferenceState {
-                    state,
+                    state: next_state.clone(),
                     sidecars: empty_sidecars(),
                     version: IdentityVersion::new(1),
                 },
             );
+            if let Some(outcome) = store
+                .reference_resolution_outcomes
+                .get_mut(&external_reference_key(&next_state.external_reference_ref))
+            {
+                outcome.state = next_state;
+            }
             Ok(())
         }
         (Some(existing), Some(expected)) if existing.version == expected => {
@@ -5658,11 +5867,17 @@ fn apply_save_reference_state(
             store.reference_states.insert(
                 key,
                 StoredReferenceState {
-                    state: next_state,
+                    state: next_state.clone(),
                     sidecars: existing.sidecars.clone(),
                     version: IdentityVersion::new(expected.get() + 1),
                 },
             );
+            if let Some(outcome) = store
+                .reference_resolution_outcomes
+                .get_mut(&external_reference_key(&next_state.external_reference_ref))
+            {
+                outcome.state = next_state;
+            }
             Ok(())
         }
         (None, Some(_)) => Err(ApplicationError::not_found(
@@ -5676,6 +5891,7 @@ fn apply_save_reference_state(
 
 fn apply_save_typed_sidecars(
     store: &mut RuntimeStore,
+    baseline: &RuntimeStore,
     reference_ref: ExternalReferenceRef,
     sidecars: ExternalReferenceTypedSidecarRefs,
     expected_version: IdentityVersion,
@@ -5685,7 +5901,13 @@ fn apply_save_typed_sidecars(
         .reference_states
         .get(&key)
         .ok_or_else(|| ApplicationError::not_found("reference state not found for sidecar save"))?;
-    if existing.version != expected_version {
+    let keep_current_version = baseline
+        .reference_states
+        .get(&key)
+        .map(|stored| stored.version == expected_version)
+        .unwrap_or(false)
+        && existing.version == IdentityVersion::new(expected_version.get() + 1);
+    if existing.version != expected_version && !keep_current_version {
         return Err(ApplicationError::optimistic_version_conflict(
             "reference bundle version mismatch",
         ));
@@ -5695,10 +5917,20 @@ fn apply_save_typed_sidecars(
         key,
         StoredReferenceState {
             state,
-            sidecars,
-            version: IdentityVersion::new(expected_version.get() + 1),
+            sidecars: sidecars.clone(),
+            version: if keep_current_version {
+                existing.version
+            } else {
+                IdentityVersion::new(expected_version.get() + 1)
+            },
         },
     );
+    if let Some(outcome) = store
+        .reference_resolution_outcomes
+        .get_mut(&external_reference_key(&reference_ref))
+    {
+        outcome.typed_sidecar_refs = Some(sidecars);
+    }
     Ok(())
 }
 
@@ -6378,7 +6610,7 @@ fn project_reference_page<F>(
     entries: Vec<&StoredReferenceState>,
     page: IdentityRepositoryPage,
     predicate: F,
-) -> Page<IdentityVersionedRef<ReferenceResolutionStateRef>>
+) -> Page<ExternalReferenceRef>
 where
     F: Fn(&StoredReferenceState) -> bool,
 {
@@ -6391,10 +6623,7 @@ where
         .iter()
         .skip(start)
         .take(page.limit as usize)
-        .map(|entry| IdentityVersionedRef {
-            value_ref: entry.state.resolution_state_ref.clone(),
-            version: entry.version,
-        })
+        .map(|entry| entry.state.external_reference_ref.clone())
         .collect();
     let next_cursor = if start + items.len() < filtered.len() {
         Some(IdentityRepositoryCursor::new(format!(
@@ -6535,6 +6764,14 @@ fn audit_access_key(
 
 fn maintenance_scope_key(maintenance_scope_ref: &MaintenanceScopeRef) -> String {
     identity_source_key(&maintenance_scope_ref.scope_ref)
+}
+
+fn maintenance_target_key(target_ref: &IdentityMaintenanceTargetRef) -> String {
+    format!(
+        "{:?}::{}",
+        target_ref.target_kind,
+        identity_source_key(&target_ref.target_ref)
+    )
 }
 
 fn projection_state_access_key(
@@ -6798,12 +7035,6 @@ fn empty_sidecars() -> ExternalReferenceTypedSidecarRefs {
     }
 }
 
-fn runtime_timestamp(ticks: u64) -> Result<IdentityTimestamp, ApplicationError> {
-    let ticks = i64::try_from(ticks)
-        .map_err(|_| ApplicationError::invalid_request("timestamp ticks overflow"))?;
-    IdentityTimestamp::from_clock(ticks).map_err(contract_error_to_application_error)
-}
-
 fn runtime_identity_source_ref(
     owner: IdentitySourceOwner,
     token: impl Into<String>,
@@ -6821,55 +7052,6 @@ fn runtime_reference_owner_ref(
         owner_kind,
         runtime_identity_source_ref(IdentitySourceOwner::Identity, token)?,
     ))
-}
-
-fn runtime_reference_state_ref(
-    reference_ref: &ExternalReferenceRef,
-) -> Result<ReferenceResolutionStateRef, ApplicationError> {
-    Ok(ReferenceResolutionStateRef::from_id(
-        ReferenceResolutionStateId::new(format!(
-            "reference-state:{}:{}",
-            match reference_ref.reference_kind {
-                ExternalReferenceKind::MethodSource => "method-source",
-                ExternalReferenceKind::WorkParticipation => "work-participation",
-                ExternalReferenceKind::Memory => "memory",
-                ExternalReferenceKind::Archive => "archive",
-                ExternalReferenceKind::GovernanceBasis => "governance-basis",
-                ExternalReferenceKind::RuntimeSignal => "runtime-signal",
-            },
-            reference_ref.source_ref.external_ref.as_str(),
-        ))
-        .map_err(contract_error_to_application_error)?,
-    ))
-}
-
-fn runtime_external_source_version_ref(
-    reference_ref: &ExternalReferenceRef,
-) -> Result<ExternalSourceVersionRef, ApplicationError> {
-    Ok(ExternalSourceVersionRef::new(runtime_identity_source_ref(
-        reference_ref.source_ref.owner(),
-        format!(
-            "source-version:{}",
-            reference_ref.source_ref.external_ref.as_str()
-        ),
-    )?))
-}
-
-fn runtime_external_reference_safe_summary_ref(
-    reference_ref: &ExternalReferenceRef,
-) -> Result<identity_contracts::refs::ExternalReferenceSafeSummaryRef, ApplicationError> {
-    Ok(
-        identity_contracts::refs::ExternalReferenceSafeSummaryRef::new(
-            reference_ref.clone(),
-            runtime_identity_source_ref(
-                reference_ref.source_ref.owner(),
-                format!(
-                    "safe-summary:{}",
-                    reference_ref.source_ref.external_ref.as_str()
-                ),
-            )?,
-        ),
-    )
 }
 
 fn contract_error_to_application_error(
@@ -6896,7 +7078,12 @@ mod tests {
     use identity_application::jobs::{
         IdentityJobExecution, IdentityJobService, IdentityJobServiceDeps,
     };
+    use identity_application::mapper::DefaultIdentityMaintenanceIssueMapper;
     use identity_application::outbound_material::AcceptedOutboundMaterialKind;
+    use identity_application::ports::{
+        ExternalReferenceResolutionOutcome, ExternalReferenceTypedSidecarRefs,
+        MemberSummaryProjectionRebuildPlan, MemberSummaryProjectionRebuildViewInput,
+    };
     use identity_contracts::commands::{
         AppendCareerRecordRequest, EstablishGlobalMemberRequest, IdentityCommandOutcome,
         IdentityCommandRequest, MaintainMemoryReferenceRequest,
@@ -6909,7 +7096,12 @@ mod tests {
         RoleCapabilitySourceChangedPayload, TraceHandoffResultKind, TraceHandoffResultPayload,
         WorkParticipationAcceptedPayload,
     };
-    use identity_contracts::jobs::IdentityJobRequest;
+    use identity_contracts::jobs::{
+        IdentityExternalReferenceRefreshScopeDto, IdentityJobRequest, IdentityJobRunDisposition,
+        IdentityProjectionRebuildScopeDto, IdentityReconciliationTargetScopeDto,
+        RebuildIdentityProjectionJobInput, RefreshExternalReferenceStateJobInput,
+        RunIdentityReconciliationJobInput,
+    };
     use identity_contracts::metadata::{
         IdentityCommandMetadata, IdentityDegradedKind, IdentityQueryDisposition,
         IdentityQueryMetadata, IdentityRequestDigestMarker,
@@ -6927,7 +7119,7 @@ mod tests {
         ListMemoryReferencesRequest, ListPendingIdentityOutboxRequest, ReadAuditTrailRequest,
         ReadIdentityTraceRequest, ReadMemberSummaryRequest, ReadReconciliationReportRequest,
     };
-    use identity_contracts::receipts::MaintenanceIssueRef;
+    use identity_contracts::receipts::{MaintenanceIssueKind, MaintenanceIssueRef};
     use identity_contracts::refs::{
         ArchiveHandoffRef, ArchiveRef, CapabilityEvidenceKind, CapabilityEvidenceRef,
         CapabilitySourceRef, CareerAppendMaterialKind, CareerAppendMaterialMarker,
@@ -6939,17 +7131,18 @@ mod tests {
         HandoffTargetRef, IdentityApiRequestMarkerRef, IdentityCanonicalRequestMarkerRef,
         IdentityChangeKind, IdentityConsumerBindingRef, IdentityConsumerReceiptRef,
         IdentityDegradedMarkerRef, IdentityEventEnvelopeMarkerRef, IdentityJobReportRef,
-        IdentityJobRunRef, IdentityJobScopeMarkerRef, IdentityMaintenanceTargetRef,
-        IdentityOperationChannel, IdentityOutboxPayloadMarkerRef, IdentityReadSubjectRef,
-        IdentityReadSurfaceKind, IdentityRedactionMarkerRef, IdentityRequestDigestValue,
-        IdentitySourceEventRef, IdentityStoredResultRef, IdentityTimestamp, LifecycleReasonKind,
-        LifecycleReasonRef, MemoryRef, MemoryReferenceChangeIntent,
-        MemoryReferenceChangeMaterialKind, MemoryReferenceChangeMaterialMarker,
-        MemoryReferenceReasonKind, MemoryReferenceReasonRef, MemoryReferenceRef,
-        MemoryReferenceSourceKind, MemoryReferenceSourceRef,
+        IdentityJobRunRef, IdentityJobScopeMarkerRef, IdentityMaintenanceTargetKind,
+        IdentityMaintenanceTargetRef, IdentityOperationChannel, IdentityOutboxPayloadMarkerRef,
+        IdentityProjectionKind, IdentityReadSubjectRef, IdentityReadSurfaceKind,
+        IdentityRedactionMarkerRef, IdentityRequestDigestValue, IdentitySourceEventRef,
+        IdentityStoredResultRef, IdentityTimestamp, LifecycleReasonKind, LifecycleReasonRef,
+        MemoryRef, MemoryReferenceChangeIntent, MemoryReferenceChangeMaterialKind,
+        MemoryReferenceChangeMaterialMarker, MemoryReferenceReasonKind, MemoryReferenceReasonRef,
+        MemoryReferenceRef, MemoryReferenceSourceKind, MemoryReferenceSourceRef,
         MemoryReferenceStateKind as PublicMemoryReferenceStateKind,
         OutboxStateKind as PublicOutboxStateKind, ProjectParticipationRef,
         ProjectionFreshnessMarkerRef, ProjectionStateKind as PublicProjectionStateKind,
+        ReconciliationFindingMaterialKind, ReconciliationFindingRef, ReconciliationReportId,
         ReconciliationReportRef,
         ReferenceResolutionStateKind as PublicReferenceResolutionStateKind,
         RoleCapabilityChangeMaterialKind, RoleCapabilityChangeMaterialMarker,
@@ -6998,7 +7191,11 @@ mod tests {
     }
 
     fn projection_ref(token: &str) -> IdentityProjectionRef {
-        IdentityProjectionRef::new(token)
+        IdentityProjectionRef::new(
+            IdentityProjectionKind::MemberSummary,
+            identity_source_ref(IdentitySourceOwner::Identity, token),
+        )
+        .expect("projection ref")
     }
 
     fn projection_cursor(token: &str) -> IdentityProjectionCursorRef {
@@ -7010,6 +7207,33 @@ mod tests {
             IdentitySourceOwner::Identity,
             token,
         ))
+    }
+
+    fn maintenance_issue_ref(token: &str, issue_kind: MaintenanceIssueKind) -> MaintenanceIssueRef {
+        MaintenanceIssueRef::new(
+            issue_kind,
+            identity_source_ref(IdentitySourceOwner::Identity, token),
+        )
+    }
+
+    fn maintenance_target_ref(
+        token: &str,
+        target_kind: IdentityMaintenanceTargetKind,
+    ) -> IdentityMaintenanceTargetRef {
+        IdentityMaintenanceTargetRef::new(
+            target_kind,
+            identity_source_ref(IdentitySourceOwner::Identity, token),
+        )
+    }
+
+    fn reconciliation_finding_ref(token: &str) -> ReconciliationFindingRef {
+        ReconciliationFindingRef::new(identity_source_ref(IdentitySourceOwner::Identity, token))
+    }
+
+    fn reconciliation_report_ref(token: &str) -> ReconciliationReportRef {
+        ReconciliationReportRef::from_id(
+            ReconciliationReportId::new(token.to_owned()).expect("report id"),
+        )
     }
 
     fn summary_view(scope: &str) -> MemberSummaryView {
@@ -7029,6 +7253,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             visibility_result(&format!("visibility-{scope}")),
+            IdentityReadSurfaceKind::Found,
             Some(IdentityTruthCursor::new("truth-cursor-1")),
             Some(ProjectionFreshnessMarkerRef {
                 projection_ref: projection_ref("projection-1"),
@@ -7037,6 +7262,44 @@ mod tests {
             IdentityReadMaterialMarker::new(IdentityReadMaterialKind::SafeSummaryRefs, None),
         )
         .expect("summary view")
+    }
+
+    fn member_summary_rebuild_plan(scope: &str) -> MemberSummaryProjectionRebuildPlan {
+        let member = member_ref("member-1");
+        let source = identity_source_ref(IdentitySourceOwner::Identity, "summary-source-1");
+        MemberSummaryProjectionRebuildPlan {
+            projection_ref: projection_ref("projection-1"),
+            member_ref: member.clone(),
+            view_inputs: vec![MemberSummaryProjectionRebuildViewInput {
+                view_ref: MemberSummaryViewRef::new(format!("view-{scope}")),
+                member_ref: member.clone(),
+                visibility_scope_ref: scope_ref(scope),
+                anchor_slice_ref: MemberSummarySliceRef::new(
+                    MemberSummarySliceKind::Anchor,
+                    member.clone(),
+                    source.clone(),
+                ),
+                lifecycle_slice_ref: MemberSummarySliceRef::new(
+                    MemberSummarySliceKind::Lifecycle,
+                    member.clone(),
+                    source.clone(),
+                ),
+                role_capability_slice_refs: Vec::new(),
+                career_slice_refs: Vec::new(),
+                memory_slice_refs: Vec::new(),
+                visibility_result_ref: visibility_result(&format!("visibility-{scope}")),
+                read_surface_kind: IdentityReadSurfaceKind::Found,
+                source_cursor_ref: Some(IdentityTruthCursor::new("truth-cursor-1")),
+                projection_freshness_ref: Some(ProjectionFreshnessMarkerRef {
+                    projection_ref: projection_ref("projection-1"),
+                    state_kind: "stale".into(),
+                }),
+                read_material_marker: IdentityReadMaterialMarker::new(
+                    IdentityReadMaterialKind::SafeSummaryRefs,
+                    None,
+                ),
+            }],
+        }
     }
 
     fn projection_state(cursor: &str) -> ProjectionState {
@@ -7090,6 +7353,45 @@ mod tests {
             ),
             timestamp(1),
         )
+    }
+
+    fn refreshed_reference_outcome() -> ExternalReferenceResolutionOutcome {
+        let reference_ref = external_reference();
+        ExternalReferenceResolutionOutcome {
+            state: ReferenceResolutionState::resolved(
+                ReferenceResolutionStateRef::from_id(
+                    identity_contracts::refs::ReferenceResolutionStateId::new(
+                        "reference-state-1".to_owned(),
+                    )
+                    .expect("reference state id"),
+                ),
+                reference_ref.clone(),
+                reference_owner(),
+                ExternalSourceVersionRef::new(identity_source_ref(
+                    IdentitySourceOwner::MethodLibrary,
+                    "source-version-2",
+                )),
+                ExternalReferenceSafeSummaryRef::new(
+                    reference_ref.clone(),
+                    identity_source_ref(IdentitySourceOwner::MethodLibrary, "safe-summary-2"),
+                ),
+                timestamp(2),
+            ),
+            typed_sidecar_refs: Some(ExternalReferenceTypedSidecarRefs {
+                role_capability_safe_summary_ref: Some(ExternalReferenceSafeSummaryRef::new(
+                    reference_ref,
+                    identity_source_ref(IdentitySourceOwner::MethodLibrary, "role-summary-2"),
+                )),
+                career_safe_summary_ref: None,
+                memory_safe_summary_ref: None,
+                governance_basis_summary_ref: None,
+                evidence_summary_ref: None,
+                source_version_ref: Some(ExternalSourceVersionRef::new(identity_source_ref(
+                    IdentitySourceOwner::MethodLibrary,
+                    "sidecar-version-2",
+                ))),
+            }),
+        }
     }
 
     fn handoff_intent() -> TraceHandoffIntent {
@@ -7207,7 +7509,10 @@ mod tests {
         })
     }
 
-    fn job_service<'a>(runtime: &'a IdentityInMemoryRuntime) -> IdentityJobService<'a> {
+    fn job_service<'a>(
+        runtime: &'a IdentityInMemoryRuntime,
+        maintenance_issue_mapper: &'a DefaultIdentityMaintenanceIssueMapper,
+    ) -> IdentityJobService<'a> {
         IdentityJobService::new(IdentityJobServiceDeps {
             unit_of_work_manager: runtime,
             clock: runtime,
@@ -7215,6 +7520,12 @@ mod tests {
             idempotency_repository: runtime,
             stored_result_repository: runtime,
             job_report_repository: runtime,
+            projection_repository: runtime,
+            maintenance_repository: runtime,
+            reference_state_repository: runtime,
+            external_reference_resolver: runtime,
+            reconciliation_report_repository: runtime,
+            maintenance_issue_mapper,
         })
     }
 
@@ -7542,6 +7853,37 @@ mod tests {
             schema_version_ref: IdentityProtocolSchemaVersionRef::new("identity.job.v1"),
             system_actor_ref: ActorRef::system("job-system"),
             input: format!("job-input-{token}"),
+        }
+    }
+
+    fn typed_job_request<T>(
+        job_name: &str,
+        idempotency_key: &str,
+        job_run_ref: &str,
+        token: &str,
+        input: T,
+    ) -> IdentityJobRequest<T> {
+        IdentityJobRequest {
+            job_name: IdentityJobName::new(job_name),
+            job_run_ref: IdentityJobRunRef::new(job_run_ref),
+            run_metadata_ref: identity_contracts::refs::IdentityJobRunMetadataRef::new(format!(
+                "job-metadata-{token}"
+            )),
+            scope_marker_ref: IdentityJobScopeMarkerRef::new(format!("job-scope-{token}")),
+            idempotency_key: idempotency_key.to_owned().into(),
+            input_cursor_ref: Some(identity_contracts::refs::IdentityJobCursorRef::new(
+                format!("job-input-cursor-{token}"),
+            )),
+            schema_version_ref: IdentityProtocolSchemaVersionRef::new("identity.job.v1"),
+            system_actor_ref: ActorRef::system("job-system"),
+            input,
+        }
+    }
+
+    fn job_page(limit: u32) -> IdentityPublicPageRequest {
+        IdentityPublicPageRequest {
+            cursor: None,
+            limit,
         }
     }
 
@@ -8017,7 +8359,10 @@ mod tests {
             timestamp(1),
         )
         .partial(
-            vec![MaintenanceIssueRef::new(format!("issue-{token}"))],
+            vec![maintenance_issue_ref(
+                &format!("issue-{token}"),
+                MaintenanceIssueKind::Partial,
+            )],
             Some(identity_contracts::refs::IdentityJobCursorRef::new(
                 format!("job-output-cursor-{token}"),
             )),
@@ -8145,7 +8490,7 @@ mod tests {
             ),
             external_reference(),
             reference_owner(),
-            MaintenanceIssueRef::new("reference-unavailable"),
+            maintenance_issue_ref("reference-unavailable", MaintenanceIssueKind::Unavailable),
             timestamp(2),
         );
 
@@ -8164,8 +8509,6 @@ mod tests {
             persisted.value.state_kind,
             ReferenceResolutionStateKind::Unavailable
         );
-        assert!(persisted.value.safe_summary_ref.is_some());
-        assert!(persisted.value.source_version_ref.is_some());
         assert!(
             runtime
                 .get_typed_sidecar_refs(external_reference())
@@ -8235,68 +8578,31 @@ mod tests {
     }
 
     #[test]
-    fn external_reference_resolver_returns_seeded_or_deterministic_state() {
+    fn external_reference_resolver_returns_seeded_outcome_and_rejects_missing_seed() {
         let seeded = reference_state_resolved();
+        let seeded_outcome = ExternalReferenceResolutionOutcome {
+            state: seeded.clone(),
+            typed_sidecar_refs: Some(empty_sidecars()),
+        };
         let runtime = IdentityInMemoryRuntime::builder()
-            .seed_reference_state(seeded.clone(), empty_sidecars(), IdentityVersion::new(3))
+            .seed_external_reference_resolution_outcome(seeded_outcome.clone())
             .build();
 
         let loaded = runtime
             .resolve_external_reference(seeded.external_reference_ref.clone(), reference_owner())
             .expect("seeded bundle");
-        assert_eq!(loaded, seeded);
+        assert_eq!(loaded, seeded_outcome);
 
-        let unavailable = runtime
+        let err = runtime
             .resolve_external_reference(
                 ExternalReferenceRef::new(
                     ExternalReferenceKind::MethodSource,
-                    identity_source_ref(
-                        IdentitySourceOwner::MethodLibrary,
-                        "reference-unavailable-1",
-                    ),
+                    identity_source_ref(IdentitySourceOwner::MethodLibrary, "reference-missing-1"),
                 ),
                 reference_owner(),
             )
-            .expect("unavailable bundle");
-        assert_eq!(
-            unavailable.state_kind,
-            ReferenceResolutionStateKind::Unavailable
-        );
-        assert!(unavailable.issue_ref.is_some());
-        assert!(unavailable.source_version_ref.is_none());
-        assert!(unavailable.safe_summary_ref.is_none());
-
-        let unrecognized = runtime
-            .resolve_external_reference(
-                ExternalReferenceRef::new(
-                    ExternalReferenceKind::MethodSource,
-                    identity_source_ref(
-                        IdentitySourceOwner::MethodLibrary,
-                        "reference-unrecognized-1",
-                    ),
-                ),
-                reference_owner(),
-            )
-            .expect("unrecognized bundle");
-        assert_eq!(
-            unrecognized.state_kind,
-            ReferenceResolutionStateKind::Unrecognized
-        );
-        assert!(unrecognized.issue_ref.is_some());
-
-        let resolved = runtime
-            .resolve_external_reference(
-                ExternalReferenceRef::new(
-                    ExternalReferenceKind::MethodSource,
-                    identity_source_ref(IdentitySourceOwner::MethodLibrary, "reference-resolved-1"),
-                ),
-                reference_owner(),
-            )
-            .expect("resolved bundle");
-        assert_eq!(resolved.state_kind, ReferenceResolutionStateKind::Resolved);
-        assert_eq!(resolved.reference_owner_ref, reference_owner());
-        assert!(resolved.source_version_ref.is_some());
-        assert!(resolved.safe_summary_ref.is_some());
+            .expect_err("missing seed");
+        assert_eq!(err.kind, ApplicationErrorKind::NotFound);
     }
 
     #[test]
@@ -8347,7 +8653,10 @@ mod tests {
 
         let mut degraded = projection_state("cursor-1");
         degraded
-            .mark_degraded(MaintenanceIssueRef::new("projection-issue"), timestamp(2))
+            .mark_degraded(
+                maintenance_issue_ref("projection-issue", MaintenanceIssueKind::Failed),
+                timestamp(2),
+            )
             .expect("mark degraded");
 
         let uow = runtime.begin().expect("uow");
@@ -9376,7 +9685,8 @@ mod tests {
             .seed_stored_result(stored)
             .seed_job_report(report.clone(), IdentityVersion::new(1))
             .build();
-        let service = job_service(&runtime);
+        let mapper = DefaultIdentityMaintenanceIssueMapper;
+        let service = job_service(&runtime, &mapper);
 
         let response = service
             .dispatch_job_scaffold(
@@ -9442,7 +9752,8 @@ mod tests {
             .seed_idempotency_record(record, IdentityVersion::new(2))
             .seed_stored_result(stored)
             .build();
-        let service = job_service(&runtime);
+        let mapper = DefaultIdentityMaintenanceIssueMapper;
+        let service = job_service(&runtime, &mapper);
 
         let err = service
             .dispatch_job_scaffold(
@@ -9496,7 +9807,8 @@ mod tests {
                 IdentityVersion::new(1),
             )
             .build();
-        let service = job_service(&runtime);
+        let mapper = DefaultIdentityMaintenanceIssueMapper;
+        let service = job_service(&runtime, &mapper);
 
         let err = service
             .dispatch_job_scaffold(
@@ -9525,7 +9837,8 @@ mod tests {
         let runtime = IdentityInMemoryRuntime::builder()
             .inject_fault(FaultCase::CompleteIdempotencyFails)
             .build();
-        let service = job_service(&runtime);
+        let mapper = DefaultIdentityMaintenanceIssueMapper;
+        let service = job_service(&runtime, &mapper);
         let context = job_context(
             "RunIdentityReconciliation",
             "idem-job-save-order",
@@ -9553,7 +9866,7 @@ mod tests {
                     );
                     report
                         .rebuilt_projection_refs
-                        .push(IdentityProjectionRef::new("projection-save-order"));
+                        .push(projection_ref("projection-save-order"));
                     Ok(IdentityJobExecution::new(
                         TestJobOutput {
                             disposition: "completed",
@@ -9588,6 +9901,400 @@ mod tests {
                 )
                 .expect("idempotency lookup")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn rebuild_projection_job_saves_view_and_marks_projection_rebuilt() {
+        let member = GlobalMember::establish(
+            member_ref("member-1"),
+            identity_source_ref(IdentitySourceOwner::Identity, "member-source-job-rebuild-1"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let plan = member_summary_rebuild_plan("scope-job-rebuild-1");
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member.clone(), IdentityVersion::new(1))
+            .seed_projection_state(projection_state("cursor-1"), IdentityVersion::new(1))
+            .seed_member_summary_rebuild_plan(plan.clone())
+            .build();
+        let mapper = DefaultIdentityMaintenanceIssueMapper;
+        let service = job_service(&runtime, &mapper);
+
+        let response = service
+            .rebuild_identity_projection(
+                typed_job_request(
+                    "RebuildIdentityProjection",
+                    "idem-job-rebuild-1",
+                    "job-run-rebuild-1",
+                    "job-rebuild-1",
+                    RebuildIdentityProjectionJobInput {
+                        rebuild_scope: IdentityProjectionRebuildScopeDto::ExplicitProjectionRefs(
+                            vec![projection_ref("projection-1")],
+                        ),
+                        maintenance_scope_ref: maintenance_scope("scope-1"),
+                        page: job_page(10),
+                    },
+                ),
+                job_context(
+                    "RebuildIdentityProjection",
+                    "idem-job-rebuild-1",
+                    "job-rebuild-1",
+                    "job-run-rebuild-1",
+                ),
+            )
+            .expect("rebuild job");
+
+        assert_eq!(
+            response.output.disposition,
+            IdentityJobRunDisposition::Completed
+        );
+        assert_eq!(
+            response.output.rebuilt_projection_refs,
+            vec![projection_ref("projection-1")]
+        );
+        assert!(response.output.failed_projection_refs.is_empty());
+        assert!(response.output.issue_refs.is_empty());
+        let view_ref = runtime
+            .find_member_summary_view_ref(
+                member.member_ref.clone(),
+                scope_ref("scope-job-rebuild-1"),
+            )
+            .expect("lookup")
+            .expect("view ref");
+        assert_eq!(view_ref, plan.view_inputs[0].view_ref);
+        let view = runtime
+            .get_member_summary_view(view_ref)
+            .expect("load view")
+            .expect("stored view");
+        assert_eq!(view.read_surface_kind, IdentityReadSurfaceKind::Found);
+        let rebuilt_state = runtime
+            .get_projection_state_with_version(projection_ref("projection-1"))
+            .expect("load state")
+            .expect("projection state");
+        assert_eq!(
+            rebuilt_state.value.state_kind,
+            identity_domain::projection_state::ProjectionStateKind::Rebuilt
+        );
+        let persisted_member = runtime
+            .get_member_with_version(member.member_ref.clone())
+            .expect("load member")
+            .expect("member");
+        assert_eq!(persisted_member.value, member);
+    }
+
+    #[test]
+    fn refresh_reference_job_by_owner_uses_loaded_bundle_version_for_state_and_sidecars() {
+        let member = GlobalMember::establish(
+            member_ref("member-1"),
+            identity_source_ref(IdentitySourceOwner::Identity, "member-source-job-refresh-1"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member.clone(), IdentityVersion::new(1))
+            .seed_reference_state(
+                reference_state_resolved(),
+                empty_sidecars(),
+                IdentityVersion::new(1),
+            )
+            .seed_external_reference_resolution_outcome(refreshed_reference_outcome())
+            .build();
+        let mapper = DefaultIdentityMaintenanceIssueMapper;
+        let service = job_service(&runtime, &mapper);
+
+        let response = service
+            .refresh_external_reference_state(
+                typed_job_request(
+                    "RefreshExternalReferenceState",
+                    "idem-job-refresh-1",
+                    "job-run-refresh-1",
+                    "job-refresh-1",
+                    RefreshExternalReferenceStateJobInput {
+                        refresh_scope: IdentityExternalReferenceRefreshScopeDto::ByOwner(
+                            reference_owner(),
+                        ),
+                        maintenance_scope_ref: maintenance_scope("scope-1"),
+                        page: job_page(10),
+                    },
+                ),
+                job_context(
+                    "RefreshExternalReferenceState",
+                    "idem-job-refresh-1",
+                    "job-refresh-1",
+                    "job-run-refresh-1",
+                ),
+            )
+            .expect("refresh job");
+
+        assert_eq!(
+            response.output.disposition,
+            IdentityJobRunDisposition::Completed
+        );
+        assert_eq!(
+            response.output.refreshed_reference_refs,
+            vec![external_reference()]
+        );
+        assert!(response.output.failed_reference_refs.is_empty());
+        let persisted = runtime
+            .get_reference_state_with_version(external_reference())
+            .expect("load bundle")
+            .expect("bundle");
+        assert_eq!(persisted.version, IdentityVersion::new(2));
+        assert_eq!(
+            persisted.value.safe_summary_ref,
+            Some(ExternalReferenceSafeSummaryRef::new(
+                external_reference(),
+                identity_source_ref(IdentitySourceOwner::MethodLibrary, "safe-summary-2"),
+            ))
+        );
+        assert_eq!(
+            runtime
+                .get_typed_sidecar_refs(external_reference())
+                .expect("load sidecars")
+                .source_version_ref,
+            Some(ExternalSourceVersionRef::new(identity_source_ref(
+                IdentitySourceOwner::MethodLibrary,
+                "sidecar-version-2",
+            )))
+        );
+        let persisted_member = runtime
+            .get_member_with_version(member.member_ref.clone())
+            .expect("load member")
+            .expect("member");
+        assert_eq!(persisted_member.value, member);
+    }
+
+    #[test]
+    fn rebuild_projection_job_duplicate_replay_returns_typed_output_without_body_rerun() {
+        let context = job_context(
+            "RebuildIdentityProjection",
+            "idem-job-rebuild-dup",
+            "job-rebuild-dup",
+            "job-run-rebuild-dup",
+        );
+        let stored_result = StoredIdentityOperationResult::job_report(
+            stored_result_ref("job-rebuild-dup"),
+            context.context_ref.clone(),
+            identity_application::support::IdentityStoredSurfaceMarkerRef::new(
+                "surface-job-rebuild-dup",
+            ),
+            timestamp(2),
+        );
+        let mut report = IdentityJobRunReport::start(
+            IdentityJobReportRef::new("job-report-rebuild-dup"),
+            IdentityJobRunRef::new("job-run-rebuild-dup"),
+            IdentityJobName::new("RebuildIdentityProjection"),
+            IdentityJobScopeMarkerRef::new("job-scope-job-rebuild-dup"),
+            Some(identity_contracts::refs::IdentityJobCursorRef::new(
+                "job-input-cursor-rebuild-dup",
+            )),
+            timestamp(1),
+        )
+        .succeed(
+            None,
+            Some(stored_result_ref("job-rebuild-dup")),
+            timestamp(2),
+        );
+        report
+            .affected_projection_refs
+            .push(projection_ref("projection-1"));
+        report
+            .rebuilt_projection_refs
+            .push(projection_ref("projection-1"));
+        let record = IdentityIdempotencyRecord {
+            record_ref: IdentityIdempotencyRecordRef::new("idem-record-job-rebuild-dup"),
+            operation_name: context.operation_name.clone(),
+            channel: IdentityOperationChannel::Job,
+            idempotency_key: IdentityIdempotencyKey::new("idem-job-rebuild-dup"),
+            request_digest: context.request_digest.clone(),
+            state: identity_application::support::IdentityIdempotencyStateKind::Completed,
+            stored_result_ref: Some(stored_result_ref("job-rebuild-dup")),
+            reserved_at: timestamp(1),
+            completed_at: Some(timestamp(2)),
+        };
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_idempotency_record(record, IdentityVersion::new(2))
+            .seed_stored_result(stored_result)
+            .seed_job_report(report.clone(), IdentityVersion::new(1))
+            .build();
+        let mapper = DefaultIdentityMaintenanceIssueMapper;
+        let service = job_service(&runtime, &mapper);
+
+        let response = service
+            .rebuild_identity_projection(
+                typed_job_request(
+                    "RebuildIdentityProjection",
+                    "idem-job-rebuild-dup",
+                    "job-run-rebuild-dup",
+                    "job-rebuild-dup",
+                    RebuildIdentityProjectionJobInput {
+                        rebuild_scope: IdentityProjectionRebuildScopeDto::ExplicitProjectionRefs(
+                            vec![projection_ref("projection-1")],
+                        ),
+                        maintenance_scope_ref: maintenance_scope("scope-1"),
+                        page: job_page(10),
+                    },
+                ),
+                context,
+            )
+            .expect("duplicate replay");
+
+        assert_eq!(
+            response.output.disposition,
+            IdentityJobRunDisposition::DuplicateReplayed
+        );
+        assert_eq!(
+            response.output.rebuilt_projection_refs,
+            vec![projection_ref("projection-1")]
+        );
+        assert_eq!(response.report, report.to_surface());
+    }
+
+    #[test]
+    fn reconciliation_job_missing_inspection_context_returns_partial_report_only() {
+        let member = GlobalMember::establish(
+            member_ref("member-1"),
+            identity_source_ref(
+                IdentitySourceOwner::Identity,
+                "member-source-job-reconcile-1",
+            ),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let target_ref = maintenance_target_ref(
+            "target-reconcile-1",
+            IdentityMaintenanceTargetKind::Projection,
+        );
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member.clone(), IdentityVersion::new(1))
+            .build();
+        let mapper = DefaultIdentityMaintenanceIssueMapper;
+        let service = job_service(&runtime, &mapper);
+
+        let response = service
+            .run_identity_reconciliation(
+                typed_job_request(
+                    "RunIdentityReconciliation",
+                    "idem-job-reconcile-1",
+                    "job-run-reconcile-1",
+                    "job-reconcile-1",
+                    RunIdentityReconciliationJobInput {
+                        maintenance_scope_ref: maintenance_scope("scope-1"),
+                        target_scope: IdentityReconciliationTargetScopeDto::ExplicitTargets(vec![
+                            target_ref.clone(),
+                        ]),
+                        finding_intent_ref:
+                            identity_contracts::refs::ReconciliationFindingIntentRef::new(
+                                identity_source_ref(
+                                    IdentitySourceOwner::Identity,
+                                    "finding-intent-1",
+                                ),
+                            ),
+                        finding_material: identity_contracts::refs::ReconciliationFindingMaterial {
+                            material_kind: ReconciliationFindingMaterialKind::SafeRefsOnly,
+                            source_ref: Some(identity_source_ref(
+                                IdentitySourceOwner::Identity,
+                                "finding-material-1",
+                            )),
+                        },
+                        page: job_page(10),
+                    },
+                ),
+                job_context(
+                    "RunIdentityReconciliation",
+                    "idem-job-reconcile-1",
+                    "job-reconcile-1",
+                    "job-run-reconcile-1",
+                ),
+            )
+            .expect("reconciliation job");
+
+        assert_eq!(
+            response.output.disposition,
+            IdentityJobRunDisposition::Partial
+        );
+        assert_eq!(
+            response.output.inspected_target_refs,
+            vec![target_ref.clone()]
+        );
+        assert_eq!(response.output.issue_refs.len(), 1);
+        let saved_report = runtime
+            .get_report_with_version(response.output.report_refs[0].clone())
+            .expect("load report")
+            .expect("report");
+        assert_eq!(
+            saved_report.value.report_state,
+            identity_domain::reconciliation::ReconciliationReportStateKind::Partial
+        );
+        assert_eq!(saved_report.value.target_refs, vec![target_ref]);
+        let persisted_member = runtime
+            .get_member_with_version(member.member_ref.clone())
+            .expect("load member")
+            .expect("member");
+        assert_eq!(persisted_member.value, member);
+    }
+
+    #[test]
+    fn reconciliation_job_rejects_forbidden_finding_material() {
+        let runtime = IdentityInMemoryRuntime::builder().build();
+        let mapper = DefaultIdentityMaintenanceIssueMapper;
+        let service = job_service(&runtime, &mapper);
+
+        let err = service
+            .run_identity_reconciliation(
+                typed_job_request(
+                    "RunIdentityReconciliation",
+                    "idem-job-reconcile-forbidden",
+                    "job-run-reconcile-forbidden",
+                    "job-reconcile-forbidden",
+                    RunIdentityReconciliationJobInput {
+                        maintenance_scope_ref: maintenance_scope("scope-1"),
+                        target_scope: IdentityReconciliationTargetScopeDto::ExplicitTargets(vec![
+                            maintenance_target_ref(
+                                "target-reconcile-forbidden",
+                                IdentityMaintenanceTargetKind::Projection,
+                            ),
+                        ]),
+                        finding_intent_ref:
+                            identity_contracts::refs::ReconciliationFindingIntentRef::new(
+                                identity_source_ref(
+                                    IdentitySourceOwner::Identity,
+                                    "finding-intent-forbidden",
+                                ),
+                            ),
+                        finding_material: identity_contracts::refs::ReconciliationFindingMaterial {
+                            material_kind: ReconciliationFindingMaterialKind::ForbiddenExternalBody,
+                            source_ref: Some(identity_source_ref(
+                                IdentitySourceOwner::Identity,
+                                "finding-material-forbidden",
+                            )),
+                        },
+                        page: job_page(10),
+                    },
+                ),
+                job_context(
+                    "RunIdentityReconciliation",
+                    "idem-job-reconcile-forbidden",
+                    "job-reconcile-forbidden",
+                    "job-run-reconcile-forbidden",
+                ),
+            )
+            .expect_err("forbidden finding material");
+
+        assert_eq!(err.kind, ApplicationErrorKind::DomainRejected);
+        assert!(
+            runtime
+                .list_reports_by_scope(
+                    maintenance_scope("scope-1"),
+                    IdentityRepositoryPage::new(None, 10)
+                )
+                .expect("list reports")
+                .items
+                .is_empty()
         );
     }
 
@@ -10090,26 +10797,30 @@ mod tests {
         scope_ref: identity_contracts::refs::MaintenanceScopeRef,
         report_state: identity_domain::reconciliation::ReconciliationReportStateKind,
     ) -> ReconciliationReport {
-        let target_refs = vec![IdentityMaintenanceTargetRef::new(format!("target-{token}"))];
+        let target_refs = vec![maintenance_target_ref(
+            &format!("target-{token}"),
+            IdentityMaintenanceTargetKind::Projection,
+        )];
         let finding_refs = matches!(
             report_state,
             identity_domain::reconciliation::ReconciliationReportStateKind::FindingDetected
         )
-        .then(|| {
-            vec![identity_contracts::refs::ReconciliationFindingRef::new(
-                format!("finding-{token}"),
-            )]
-        })
+        .then(|| vec![reconciliation_finding_ref(&format!("finding-{token}"))])
         .unwrap_or_default();
         let issue_refs = matches!(
             report_state,
             identity_domain::reconciliation::ReconciliationReportStateKind::Partial
                 | identity_domain::reconciliation::ReconciliationReportStateKind::Failed
         )
-        .then(|| vec![MaintenanceIssueRef::new(format!("issue-{token}"))])
+        .then(|| {
+            vec![maintenance_issue_ref(
+                &format!("issue-{token}"),
+                MaintenanceIssueKind::Failed,
+            )]
+        })
         .unwrap_or_default();
         ReconciliationReport {
-            report_ref: ReconciliationReportRef::new(format!("report-{token}")),
+            report_ref: reconciliation_report_ref(&format!("report-{token}")),
             maintenance_scope_ref: scope_ref,
             target_refs,
             finding_refs,
@@ -10206,6 +10917,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             visibility_result("visibility-a"),
+            IdentityReadSurfaceKind::Found,
             Some(IdentityTruthCursor::new("truth-cursor-1")),
             Some(ProjectionFreshnessMarkerRef {
                 projection_ref: projection_ref("projection-1"),
@@ -10514,6 +11226,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             visibility_result("summary-visibility-1"),
+            IdentityReadSurfaceKind::Found,
             Some(IdentityTruthCursor::new("truth-cursor-1")),
             None,
             IdentityReadMaterialMarker::new(IdentityReadMaterialKind::SafeSummaryRefs, None),

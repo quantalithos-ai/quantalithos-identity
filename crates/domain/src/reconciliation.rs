@@ -254,10 +254,6 @@ impl ReconciliationReport {
         generated_by_ref: Option<ActorRef>,
         generated_at: IdentityTimestamp,
     ) -> Result<Self, IdentityDomainError> {
-        if target_refs.is_empty() {
-            return Err(IdentityDomainError::missing_required_field("target_refs"));
-        }
-
         Ok(Self {
             report_ref,
             maintenance_scope_ref,

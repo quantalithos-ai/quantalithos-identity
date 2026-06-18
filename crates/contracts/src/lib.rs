@@ -250,6 +250,7 @@ mod tests {
                 MemberSummarySliceKind::MemoryReference,
             )],
             VisibilityResultRef::new("visibility-result-1"),
+            IdentityReadSurfaceKind::Found,
             Some(IdentityTruthCursor::new("truth-cursor-1")),
             Some(ProjectionFreshnessMarkerRef {
                 projection_ref: IdentityProjectionRef::new("projection-1"),

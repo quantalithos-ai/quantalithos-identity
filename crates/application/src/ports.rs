@@ -13,18 +13,22 @@ use identity_contracts::refs::{
     IdentityChangeKindRef, IdentityConsumerBindingRef, IdentityJobRunRef,
     IdentityMaintenanceTargetRef, IdentityOutboxPayloadMarkerRef, IdentityOutboxRecordRef,
     IdentityOutboxSubjectRef, IdentityProjectionCursorRef, IdentityProjectionRef,
-    IdentityReferenceOwnerRef, IdentitySourceEventRef, IdentitySourceRef, IdentityStoredResultRef,
-    IdentityTraceRecordRef, IdentityTraceSubjectRef, IdentityTruthCursor,
+    IdentityReadSurfaceKind, IdentityReferenceOwnerRef, IdentitySourceEventRef, IdentitySourceRef,
+    IdentityStoredResultRef, IdentityTraceRecordRef, IdentityTraceSubjectRef, IdentityTruthCursor,
     IdentityVisibilityDecisionRef, LifecycleRiskRef, MaintenanceScopeRef, MemberSummaryViewRef,
     MemoryRef, MemoryReferenceId, MemoryReferenceRef, MemoryReferenceSourceRef,
-    OutboxDeliveryAttemptRef, OutboxDeliveryIssueRef, ProjectionStateRef, ReconciliationFindingRef,
-    ReconciliationReportId, ReconciliationReportRef, ReferenceResolutionStateRef,
-    RoleCapabilitySafeSummaryRef, RoleCapabilitySourceRef, RoleCapabilitySourceSnapshotId,
-    RoleCapabilitySourceSnapshotRef, RoleCapabilitySourceVersionRef, RoleCapabilitySummaryId,
-    RoleCapabilitySummaryRef, TopicKeyRef, TraceHandoffSafeMaterialRef, VisibilityContextRef,
-    VisibilityResultRef, VisibilityScopeRef, WorkParticipationSourceSummary, WorkSourceRef,
+    OutboxDeliveryAttemptRef, OutboxDeliveryIssueRef, ProjectionFreshnessMarkerRef,
+    ProjectionStateRef, ReconciliationFindingRef, ReconciliationReportId, ReconciliationReportRef,
+    ReferenceResolutionStateRef, RoleCapabilitySafeSummaryRef, RoleCapabilitySourceRef,
+    RoleCapabilitySourceSnapshotId, RoleCapabilitySourceSnapshotRef,
+    RoleCapabilitySourceVersionRef, RoleCapabilitySummaryId, RoleCapabilitySummaryRef, TopicKeyRef,
+    TraceHandoffSafeMaterialRef, VisibilityContextRef, VisibilityResultRef, VisibilityScopeRef,
+    WorkParticipationSourceSummary, WorkSourceRef,
 };
-use identity_contracts::views::{IdentityVisibilityAccessSummary, MemberSummaryView};
+use identity_contracts::views::{
+    IdentityReadMaterialMarker, IdentityVisibilityAccessSummary, MemberSummarySliceRef,
+    MemberSummaryView,
+};
 use identity_domain::audit::{AuditTrail, AuditTrailEntry};
 use identity_domain::career::CareerRecord;
 use identity_domain::handoff::TraceHandoffIntent;
@@ -32,9 +36,9 @@ use identity_domain::lifecycle::GlobalLifecycleState;
 use identity_domain::member_identity::{GlobalMember, IdentityAnchorState};
 use identity_domain::memory_reference::MemoryReference;
 use identity_domain::outbox::IdentityOutboxRecord;
-use identity_domain::projection_state::ProjectionState;
+use identity_domain::projection_state::{ProjectionState, ProjectionStateKind};
 use identity_domain::reconciliation::{ReconciliationReport, ReconciliationReportStateKind};
-use identity_domain::reference_state::ReferenceResolutionState;
+use identity_domain::reference_state::{ReferenceResolutionState, ReferenceResolutionStateKind};
 use identity_domain::role_capability::{
     RoleCapabilitySourceSnapshot, RoleCapabilitySourceStateKind, RoleCapabilitySummary,
 };
@@ -578,6 +582,12 @@ pub trait IdentityMaintenanceIssueMapper {
         projection_ref: IdentityProjectionRef,
     ) -> MaintenanceIssueRef;
 
+    /// Converts a missing or mismatched projection rebuild input into a safe maintenance issue ref.
+    fn projection_missing_rebuild_input_issue(
+        &self,
+        projection_ref: IdentityProjectionRef,
+    ) -> MaintenanceIssueRef;
+
     /// Converts a missing external reference state into a safe maintenance issue ref.
     fn reference_missing_state_issue(
         &self,
@@ -588,6 +598,12 @@ pub trait IdentityMaintenanceIssueMapper {
     fn reference_refresh_failed_issue(
         &self,
         reference_ref: ExternalReferenceRef,
+    ) -> MaintenanceIssueRef;
+
+    /// Converts a missing maintenance target inspection context into a safe maintenance issue ref.
+    fn maintenance_target_missing_issue(
+        &self,
+        target_ref: IdentityMaintenanceTargetRef,
     ) -> MaintenanceIssueRef;
 
     /// Converts an outbox retryable issue into a safe maintenance issue ref.
@@ -625,6 +641,48 @@ pub trait IdentityMaintenanceIssueMapper {
 
     /// Converts an unsupported-target handoff issue into a safe maintenance issue ref.
     fn handoff_unsupported_target_issue(&self, issue_ref: HandoffIssueRef) -> MaintenanceIssueRef;
+}
+
+/// Complete body-free input for one member summary view rebuild.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemberSummaryProjectionRebuildViewInput {
+    /// Stable summary view ref selected by the formal projection builder.
+    pub view_ref: MemberSummaryViewRef,
+    /// Member represented by this summary.
+    pub member_ref: GlobalMemberRef,
+    /// Visibility scope for which this summary view is materialized.
+    pub visibility_scope_ref: VisibilityScopeRef,
+    /// Anchor safe summary slice.
+    pub anchor_slice_ref: MemberSummarySliceRef,
+    /// Lifecycle safe summary slice.
+    pub lifecycle_slice_ref: MemberSummarySliceRef,
+    /// Optional role/capability safe summary slices.
+    pub role_capability_slice_refs: Vec<MemberSummarySliceRef>,
+    /// Career safe summary slices.
+    pub career_slice_refs: Vec<MemberSummarySliceRef>,
+    /// Memory reference safe summary slices.
+    pub memory_slice_refs: Vec<MemberSummarySliceRef>,
+    /// Visibility result for this view surface.
+    pub visibility_result_ref: VisibilityResultRef,
+    /// Public read surface kind copied into the rebuilt view.
+    pub read_surface_kind: IdentityReadSurfaceKind,
+    /// Optional committed truth cursor covered by this view.
+    pub source_cursor_ref: Option<IdentityTruthCursor>,
+    /// Optional freshness marker copied into stale-visible query surfaces.
+    pub projection_freshness_ref: Option<ProjectionFreshnessMarkerRef>,
+    /// Body-free read material marker.
+    pub read_material_marker: IdentityReadMaterialMarker,
+}
+
+/// Formal rebuild plan for the member summary projection writer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemberSummaryProjectionRebuildPlan {
+    /// Projection target being rebuilt.
+    pub projection_ref: IdentityProjectionRef,
+    /// Member whose summary view is rebuilt.
+    pub member_ref: GlobalMemberRef,
+    /// Complete body-free view inputs selected by the projection builder/catalog.
+    pub view_inputs: Vec<MemberSummaryProjectionRebuildViewInput>,
 }
 
 /// Returns application service targets for API, worker, and job entry guards.
@@ -1097,6 +1155,12 @@ pub trait IdentityProjectionRepository {
         projection_ref: IdentityProjectionRef,
     ) -> Result<Option<IdentityProjectionCursorRef>, ApplicationError>;
 
+    /// Loads the formal member-summary rebuild plan for one projection target.
+    fn get_member_summary_rebuild_plan(
+        &self,
+        projection_ref: IdentityProjectionRef,
+    ) -> Result<Option<MemberSummaryProjectionRebuildPlan>, ApplicationError>;
+
     /// Expands affected projection refs from formal accepted subject refs.
     fn expand_affected_projection_refs(
         &self,
@@ -1258,6 +1322,15 @@ pub struct ExternalReferenceTypedSidecarRefs {
     pub source_version_ref: Option<ExternalSourceVersionRef>,
 }
 
+/// Safe resolver output for one external reference bundle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalReferenceResolutionOutcome {
+    /// Updated or resolved bundle state.
+    pub state: ReferenceResolutionState,
+    /// Optional typed sidecars for the same bundle.
+    pub typed_sidecar_refs: Option<ExternalReferenceTypedSidecarRefs>,
+}
+
 /// Repository for external reference bundles and typed sidecar refs.
 pub trait IdentityReferenceStateRepository {
     /// Loads a reference state and version.
@@ -1277,21 +1350,21 @@ pub trait IdentityReferenceStateRepository {
         &self,
         owner_ref: IdentityReferenceOwnerRef,
         page: IdentityRepositoryPage,
-    ) -> Result<Page<IdentityVersionedRef<ReferenceResolutionStateRef>>, ApplicationError>;
+    ) -> Result<Page<ExternalReferenceRef>, ApplicationError>;
 
     /// Lists reference states by external reference kind.
     fn list_reference_states_by_kind(
         &self,
         reference_kind: identity_contracts::refs::ExternalReferenceKind,
         page: IdentityRepositoryPage,
-    ) -> Result<Page<IdentityVersionedRef<ReferenceResolutionStateRef>>, ApplicationError>;
+    ) -> Result<Page<ExternalReferenceRef>, ApplicationError>;
 
     /// Lists stale reference states for a maintenance scope.
     fn list_stale_reference_states(
         &self,
         maintenance_scope_ref: MaintenanceScopeRef,
         page: IdentityRepositoryPage,
-    ) -> Result<Page<IdentityVersionedRef<ReferenceResolutionStateRef>>, ApplicationError>;
+    ) -> Result<Page<ExternalReferenceRef>, ApplicationError>;
 
     /// Loads typed sidecar refs for a bundle.
     fn get_typed_sidecar_refs(
@@ -1345,6 +1418,49 @@ pub trait IdentityMaintenanceRepository {
         maintenance_scope_ref: MaintenanceScopeRef,
         page: IdentityRepositoryPage,
     ) -> Result<Page<IdentityMaintenanceTargetRef>, ApplicationError>;
+
+    /// Loads the formal typed inspection context for one maintenance target.
+    fn load_maintenance_target_inspection_context(
+        &self,
+        target_ref: IdentityMaintenanceTargetRef,
+    ) -> Result<Option<IdentityMaintenanceInspectionContext>, ApplicationError>;
+}
+
+/// Typed maintenance target loaded for report-only reconciliation inspection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdentityMaintenanceLoadedTarget {
+    /// Loaded projection maintenance state.
+    Projection {
+        projection_ref: IdentityProjectionRef,
+        projection_state_ref: ProjectionStateRef,
+        state_kind: ProjectionStateKind,
+        source_cursor_ref: Option<IdentityProjectionCursorRef>,
+        issue_ref: Option<MaintenanceIssueRef>,
+    },
+    /// Loaded external reference resolution state.
+    ReferenceResolution {
+        external_reference_ref: ExternalReferenceRef,
+        resolution_state_ref: ReferenceResolutionStateRef,
+        state_kind: ReferenceResolutionStateKind,
+        source_version_ref: Option<ExternalSourceVersionRef>,
+        issue_ref: Option<MaintenanceIssueRef>,
+    },
+    /// Loaded reconciliation report state.
+    ReconciliationReport {
+        report_ref: ReconciliationReportRef,
+        report_state: ReconciliationReportStateKind,
+        finding_refs: Vec<ReconciliationFindingRef>,
+        issue_refs: Vec<MaintenanceIssueRef>,
+    },
+}
+
+/// Body-free inspection context for one maintenance target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdentityMaintenanceInspectionContext {
+    /// Original target marker returned by formal maintenance expansion.
+    pub target_ref: IdentityMaintenanceTargetRef,
+    /// Typed loaded maintenance state for the target.
+    pub loaded_target: IdentityMaintenanceLoadedTarget,
 }
 
 /// Repository for report-only reconciliation reports.
@@ -1749,7 +1865,7 @@ pub trait IdentityExternalReferenceResolverPort {
         &self,
         reference_ref: ExternalReferenceRef,
         owner_ref: IdentityReferenceOwnerRef,
-    ) -> Result<ReferenceResolutionState, ApplicationError>;
+    ) -> Result<ExternalReferenceResolutionOutcome, ApplicationError>;
 
     /// Maps a role capability summary to a formal local owner ref.
     fn map_role_capability_owner(
