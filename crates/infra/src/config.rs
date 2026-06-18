@@ -1510,6 +1510,60 @@ mod tests {
     }
 
     #[test]
+    fn formal_profile_matrix_loads_under_formal_constraints() {
+        let local_dev = IdentityRuntimeConfigSources {
+            code_defaults: valid_defaults(),
+            config_file_json: Some(r#"{ "profile": { "name": "local-dev" } }"#.to_owned()),
+            environment_json: None,
+        }
+        .load()
+        .expect("local-dev should validate");
+        assert_eq!(local_dev.profile.name.as_str(), "local-dev");
+
+        let integration_like = IdentityRuntimeConfigSources {
+            code_defaults: valid_defaults(),
+            config_file_json: Some(
+                r#"{
+                  "profile": { "name": "integration-like", "allow_test_override": false },
+                  "role_catalog": { "source_mode": "disabled" },
+                  "bus": { "publisher_mode": "disabled", "topic_map_ref": null },
+                  "external_refs": { "work_source": { "mode": "disabled" } },
+                  "fixture": { "clock_mode": "system", "id_sequence_mode": "runtime" }
+                }"#
+                .to_owned(),
+            ),
+            environment_json: None,
+        }
+        .load()
+        .expect("integration-like should validate");
+        assert_eq!(integration_like.profile.name.as_str(), "integration-like");
+
+        let operations_replay = IdentityRuntimeConfigSources {
+            code_defaults: valid_defaults(),
+            config_file_json: Some(
+                r#"{
+                  "profile": { "name": "operations-replay", "allow_test_override": false },
+                  "role_catalog": { "source_mode": "disabled" },
+                  "bus": { "publisher_mode": "disabled", "topic_map_ref": null },
+                  "operations": {
+                    "replay": {
+                      "report_root_ref": "reports/runs/operations-replay",
+                      "input_root_ref": "artifacts/test/operations-replay"
+                    }
+                  },
+                  "external_refs": { "work_source": { "mode": "disabled" } },
+                  "fixture": { "clock_mode": "system", "id_sequence_mode": "runtime" }
+                }"#
+                .to_owned(),
+            ),
+            environment_json: None,
+        }
+        .load()
+        .expect("operations-replay should validate");
+        assert_eq!(operations_replay.profile.name.as_str(), "operations-replay");
+    }
+
+    #[test]
     fn strict_json_rejects_comments_and_trailing_commas() {
         let error = IdentityRuntimeStartupConfig::from_strict_json(
             r#"{ "profile": { "name": "ci-test", }, // comment
@@ -1578,6 +1632,21 @@ mod tests {
 
         assert!(error.contains(&super::IdentityConfigIssueRef::new(
             "config:defaults:redline.projection_no_write_guard:must-be-true"
+        )));
+    }
+
+    #[test]
+    fn enabled_publisher_without_topic_map_fails_validation() {
+        let error = IdentityRuntimeConfigSources {
+            code_defaults: valid_defaults(),
+            config_file_json: Some(r#"{ "bus": { "topic_map_ref": "" } }"#.to_owned()),
+            environment_json: None,
+        }
+        .load()
+        .expect_err("enabled publisher without topic map must fail");
+
+        assert!(error.contains(&super::IdentityConfigIssueRef::new(
+            "config:defaults:bus.topic_map_ref:required-when-enabled"
         )));
     }
 }
