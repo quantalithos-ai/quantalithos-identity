@@ -1,30 +1,39 @@
 //! Shared operations-job scaffold and stored-report replay helpers.
 
 use identity_contracts::jobs::{
-    IdentityExternalReferenceRefreshScopeDto, IdentityJobItemCounts, IdentityJobReportSurface,
-    IdentityJobRequest, IdentityJobResponse, IdentityJobRunDisposition,
-    IdentityProjectionRebuildScopeDto, IdentityReconciliationTargetScopeDto,
-    RebuildIdentityProjectionJobInput, RebuildIdentityProjectionJobOutput,
-    RefreshExternalReferenceStateJobInput, RefreshExternalReferenceStateJobOutput,
-    RunIdentityReconciliationJobInput, RunIdentityReconciliationJobOutput,
+    DeliverTraceHandoffJobInput, DeliverTraceHandoffJobOutput,
+    IdentityExternalReferenceRefreshScopeDto, IdentityHandoffDeliveryScopeDto,
+    IdentityJobItemCounts, IdentityJobReportSurface, IdentityJobRequest, IdentityJobResponse,
+    IdentityJobRunDisposition, IdentityProjectionRebuildScopeDto, IdentityPropagationRetryScopeDto,
+    IdentityReconciliationTargetScopeDto, PublishIdentityOutboxJobInput,
+    PublishIdentityOutboxJobOutput, RebuildIdentityProjectionJobInput,
+    RebuildIdentityProjectionJobOutput, RefreshExternalReferenceStateJobInput,
+    RefreshExternalReferenceStateJobOutput, RetryIdentityPropagationFailuresJobInput,
+    RetryIdentityPropagationFailuresJobOutput, RunIdentityReconciliationJobInput,
+    RunIdentityReconciliationJobOutput,
 };
 use identity_contracts::queries::IdentityPublicPageRequest;
 use identity_contracts::receipts::{MaintenanceIssueKind, MaintenanceIssueRef};
 use identity_contracts::refs::{
     GlobalMemberRef, IdentityOperationChannel, IdentityProjectionKind, IdentityStoredResultRef,
     IdentityTimestamp, ReconciliationFindingMaterialKind, ReconciliationReportRef,
+    VisibilityContextRef,
 };
+use identity_domain::handoff::{HandoffPolicy, HandoffPolicyArgs, HandoffState};
+use identity_domain::outbox::{OutboundEventPolicy, OutboundEventPolicyArgs, OutboxState};
 use identity_domain::projection_state::ProjectionStateKind;
 use identity_domain::reconciliation::{ReconciliationPolicy, ReconciliationReportStateKind};
 use identity_domain::reference_state::ReferenceResolutionStateKind;
 
 use crate::errors::{ApplicationError, ApplicationErrorKind};
 use crate::ports::{
-    IdentityClockPort, IdentityIdGeneratorPort, IdentityIdempotencyRepository,
-    IdentityJobReportRepository, IdentityMaintenanceIssueMapper, IdentityMaintenanceLoadedTarget,
-    IdentityMaintenanceRepository, IdentityProjectionRepository,
+    IdentityClockPort, IdentityHandoffDeliveryPort, IdentityHandoffTargetPort,
+    IdentityIdGeneratorPort, IdentityIdempotencyRepository, IdentityJobReportRepository,
+    IdentityMaintenanceIssueMapper, IdentityMaintenanceLoadedTarget, IdentityMaintenanceRepository,
+    IdentityOutboxPublisherPort, IdentityOutboxRepository, IdentityProjectionRepository,
     IdentityReconciliationReportRepository, IdentityReferenceStateRepository,
-    IdentityStoredResultRepository, IdentityUnitOfWork, IdentityUnitOfWorkManagerPort,
+    IdentityStoredResultRepository, IdentityTopicBindingPort, IdentityUnitOfWork,
+    IdentityUnitOfWorkManagerPort, TraceHandoffIntentRepository,
 };
 use crate::support::{
     IdempotencyReserveOutcome, IdentityIdempotencyRecord, IdentityJobRunReport,
@@ -57,6 +66,18 @@ pub struct IdentityJobServiceDeps<'a> {
     pub external_reference_resolver: &'a dyn crate::ports::IdentityExternalReferenceResolverPort,
     /// Reconciliation report repository used by report-only maintenance.
     pub reconciliation_report_repository: &'a dyn IdentityReconciliationReportRepository,
+    /// Outbox repository used by publish and retry jobs.
+    pub outbox_repository: &'a dyn IdentityOutboxRepository,
+    /// Topic binding resolver used by outbox publish jobs.
+    pub topic_binding_port: &'a dyn IdentityTopicBindingPort,
+    /// Outbox publisher used by publish and retry jobs.
+    pub outbox_publisher_port: &'a dyn IdentityOutboxPublisherPort,
+    /// Handoff intent repository used by delivery and retry jobs.
+    pub handoff_intent_repository: &'a dyn TraceHandoffIntentRepository,
+    /// Handoff target resolver used by delivery and retry jobs.
+    pub handoff_target_port: &'a dyn IdentityHandoffTargetPort,
+    /// Handoff delivery adapter used by delivery and retry jobs.
+    pub handoff_delivery_port: &'a dyn IdentityHandoffDeliveryPort,
     /// Safe maintenance issue mapper.
     pub maintenance_issue_mapper: &'a dyn IdentityMaintenanceIssueMapper,
 }
@@ -556,6 +577,409 @@ impl<'a> IdentityJobService<'a> {
         )
     }
 
+    /// Publishes pending outbox records without rebuilding accepted truth.
+    pub fn publish_identity_outbox(
+        &self,
+        request: IdentityJobRequest<PublishIdentityOutboxJobInput>,
+        context: IdentityOperationContext,
+    ) -> Result<IdentityJobResponse<PublishIdentityOutboxJobOutput>, ApplicationError> {
+        self.dispatch_job_scaffold(
+            context,
+            request,
+            |report| {
+                Ok(publish_output(
+                    IdentityJobRunDisposition::DuplicateReplayed,
+                    report,
+                ))
+            },
+            |request, _, now, mut report, uow| {
+                let selected = self.deps.outbox_repository.list_pending_outbox_records(
+                    request.input.topic_key_ref.clone(),
+                    repository_page(&request.input.page),
+                )?;
+
+                for outbox_ref in &selected.items {
+                    let loaded = self
+                        .deps
+                        .outbox_repository
+                        .get_outbox_record_with_version(outbox_ref.value_ref.clone())?
+                        .ok_or_else(|| {
+                            ApplicationError::consistency_defect(
+                                "pending outbox selected by list is missing from repository",
+                            )
+                        })?;
+                    self.process_outbox_publish(loaded, now, uow, &mut report, false)?;
+                }
+
+                finish_publish_execution(now, selected.next_cursor, report)
+            },
+        )
+    }
+
+    /// Delivers pending or target-scoped handoff intents via the formal handoff ports.
+    pub fn deliver_trace_handoff(
+        &self,
+        request: IdentityJobRequest<DeliverTraceHandoffJobInput>,
+        context: IdentityOperationContext,
+    ) -> Result<IdentityJobResponse<DeliverTraceHandoffJobOutput>, ApplicationError> {
+        self.dispatch_job_scaffold(
+            context,
+            request,
+            |report| {
+                Ok(deliver_output(
+                    IdentityJobRunDisposition::DuplicateReplayed,
+                    report,
+                ))
+            },
+            |request, _, now, mut report, uow| {
+                let page = repository_page(&request.input.page);
+                let selected = match &request.input.delivery_scope {
+                    IdentityHandoffDeliveryScopeDto::ExplicitIntentRefs(intent_refs) => {
+                        if intent_refs.is_empty() {
+                            return Err(ApplicationError::invalid_request(
+                                "handoff delivery scope must include at least one intent ref",
+                            ));
+                        }
+                        Page {
+                            items: intent_refs
+                                .iter()
+                                .cloned()
+                                .map(|intent_ref| crate::support::IdentityVersionedRef {
+                                    value_ref: intent_ref,
+                                    version: crate::support::IdentityVersion::new(0),
+                                })
+                                .collect(),
+                            next_cursor: None,
+                        }
+                    }
+                    IdentityHandoffDeliveryScopeDto::ByTarget(target_ref) => self
+                        .deps
+                        .handoff_intent_repository
+                        .list_handoff_intents_by_target(target_ref.clone(), page)?,
+                };
+
+                for intent_ref in &selected.items {
+                    let loaded = self
+                        .deps
+                        .handoff_intent_repository
+                        .get_handoff_intent_with_version(intent_ref.value_ref.clone())?
+                        .ok_or_else(|| {
+                            ApplicationError::consistency_defect(
+                                "handoff intent selected for delivery is missing from repository",
+                            )
+                        })?;
+                    self.process_handoff_delivery(loaded, now, uow, &mut report, false)?;
+                }
+
+                finish_delivery_execution(now, selected.next_cursor, report)
+            },
+        )
+    }
+
+    /// Retries one propagation family using the same mapping rules as fresh publish or deliver.
+    pub fn retry_identity_propagation_failures(
+        &self,
+        request: IdentityJobRequest<RetryIdentityPropagationFailuresJobInput>,
+        context: IdentityOperationContext,
+    ) -> Result<IdentityJobResponse<RetryIdentityPropagationFailuresJobOutput>, ApplicationError>
+    {
+        self.dispatch_job_scaffold(
+            context,
+            request,
+            |report| Ok(retry_output(IdentityJobRunDisposition::DuplicateReplayed, report)),
+            |request, _, now, mut report, uow| {
+                let page = repository_page(&request.input.page);
+                match &request.input.retry_scope {
+                    IdentityPropagationRetryScopeDto::OutboxRetryable { topic_key_ref } => {
+                        let selected = self
+                            .deps
+                            .outbox_repository
+                            .list_retryable_outbox_records(topic_key_ref.clone(), page)?;
+                        for outbox_ref in &selected.items {
+                            let loaded = self
+                                .deps
+                                .outbox_repository
+                                .get_outbox_record_with_version(outbox_ref.value_ref.clone())?
+                                .ok_or_else(|| {
+                                    ApplicationError::consistency_defect(
+                                        "retryable outbox selected by list is missing from repository",
+                                    )
+                                })?;
+                            self.process_outbox_publish(loaded, now, uow, &mut report, true)?;
+                        }
+
+                        finish_retry_execution(now, selected.next_cursor, report)
+                    }
+                    IdentityPropagationRetryScopeDto::HandoffRetryable { target_ref } => {
+                        let selected = self
+                            .deps
+                            .handoff_intent_repository
+                            .list_retryable_handoff_intents(target_ref.clone(), page)?;
+                        for intent_ref in &selected.items {
+                            let loaded = self
+                                .deps
+                                .handoff_intent_repository
+                                .get_handoff_intent_with_version(intent_ref.value_ref.clone())?
+                                .ok_or_else(|| {
+                                    ApplicationError::consistency_defect(
+                                        "retryable handoff selected by list is missing from repository",
+                                    )
+                                })?;
+                            self.process_handoff_delivery(loaded, now, uow, &mut report, true)?;
+                        }
+
+                        finish_retry_execution(now, selected.next_cursor, report)
+                    }
+                }
+            },
+        )
+    }
+
+    fn process_outbox_publish(
+        &self,
+        loaded: Versioned<identity_domain::outbox::IdentityOutboxRecord>,
+        now: IdentityTimestamp,
+        uow: &dyn IdentityUnitOfWork,
+        report: &mut IdentityJobRunReport,
+        retry_only: bool,
+    ) -> Result<(), ApplicationError> {
+        let mut record = loaded.value;
+        let record_ref = record.outbox_record_ref.clone();
+        report.outbox_record_refs.push(record_ref.clone());
+        push_unique_member_ref(&mut report.affected_member_refs, record.member_ref.clone());
+
+        if retry_only && !record.is_retryable() {
+            return Ok(());
+        }
+
+        let policy = OutboundEventPolicy::for_outbox(OutboundEventPolicyArgs {
+            subject_ref: record.subject_ref.clone(),
+            change_kind_ref: record.change_kind_ref.clone(),
+            payload_marker_ref: record.payload_marker_ref.clone(),
+            topic_key_ref: record.topic_key_ref.clone(),
+            visibility_context_ref: propagation_visibility_context_ref(),
+        })?;
+        policy.assert_from_accepted_change(&record.trace_record_ref)?;
+        policy.assert_payload_body_free()?;
+        policy.assert_visible_for_topic()?;
+        policy.assert_publish_not_acceptance_gate()?;
+
+        let binding = self.deps.topic_binding_port.resolve_topic_binding(
+            record.topic_key_ref.clone(),
+            record.payload_marker_ref.clone(),
+        )?;
+        if binding.topic_key_ref != record.topic_key_ref {
+            return Err(ApplicationError::consistency_defect(
+                "topic binding resolved a different topic key",
+            ));
+        }
+
+        match self.deps.outbox_publisher_port.publish_outbox_record(
+            record_ref.clone(),
+            binding,
+            record.payload_marker_ref.clone(),
+        )? {
+            crate::ports::OutboxPublishOutcome::Published { attempt_ref } => {
+                record.mark_published(OutboxState::published(attempt_ref, now))?;
+                self.deps
+                    .outbox_repository
+                    .update_outbox_state(record, loaded.version, uow)?;
+                report.published_outbox_refs.push(record_ref);
+            }
+            crate::ports::OutboxPublishOutcome::RetryableFailed { issue_ref, .. } => {
+                let mapped_issue = self
+                    .deps
+                    .maintenance_issue_mapper
+                    .outbox_retryable_issue(issue_ref.clone());
+                record.mark_retryable_failed(OutboxState::retryable_failed(issue_ref, now))?;
+                self.deps
+                    .outbox_repository
+                    .update_outbox_state(record, loaded.version, uow)?;
+                report.failed_outbox_refs.push(record_ref);
+                report.issue_refs.push(mapped_issue);
+            }
+            crate::ports::OutboxPublishOutcome::PermanentlyFailed { issue_ref, .. } => {
+                let mapped_issue = self
+                    .deps
+                    .maintenance_issue_mapper
+                    .outbox_permanent_issue(issue_ref.clone());
+                record.mark_failed(OutboxState::failed(issue_ref, now))?;
+                self.deps
+                    .outbox_repository
+                    .update_outbox_state(record, loaded.version, uow)?;
+                report.failed_outbox_refs.push(record_ref);
+                report.issue_refs.push(mapped_issue);
+            }
+            crate::ports::OutboxPublishOutcome::SkippedByPolicy { issue_ref } => {
+                let mapped_issue = self
+                    .deps
+                    .maintenance_issue_mapper
+                    .outbox_skipped_issue(issue_ref.clone());
+                record.mark_skipped_by_policy(OutboxState::skipped_by_policy(issue_ref, now))?;
+                self.deps
+                    .outbox_repository
+                    .update_outbox_state(record, loaded.version, uow)?;
+                report.failed_outbox_refs.push(record_ref);
+                report.issue_refs.push(mapped_issue);
+            }
+            crate::ports::OutboxPublishOutcome::UnsupportedTopic { issue_ref } => {
+                let mapped_issue = self
+                    .deps
+                    .maintenance_issue_mapper
+                    .outbox_unsupported_topic_issue(issue_ref.clone());
+                record.mark_failed(OutboxState::failed(issue_ref, now))?;
+                self.deps
+                    .outbox_repository
+                    .update_outbox_state(record, loaded.version, uow)?;
+                report.failed_outbox_refs.push(record_ref);
+                report.issue_refs.push(mapped_issue);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn process_handoff_delivery(
+        &self,
+        loaded: Versioned<identity_domain::handoff::TraceHandoffIntent>,
+        now: IdentityTimestamp,
+        uow: &dyn IdentityUnitOfWork,
+        report: &mut IdentityJobRunReport,
+        retry_only: bool,
+    ) -> Result<(), ApplicationError> {
+        let mut intent = loaded.value;
+        let intent_ref = intent.handoff_intent_ref.clone();
+        report.handoff_intent_refs.push(intent_ref.clone());
+        push_unique_member_ref(&mut report.affected_member_refs, intent.member_ref.clone());
+
+        if (retry_only && !intent.is_retryable())
+            || (!retry_only && intent.handoff_state.is_terminal())
+        {
+            return Ok(());
+        }
+
+        let policy = HandoffPolicy::for_handoff(HandoffPolicyArgs {
+            handoff_target_ref: intent.handoff_target_ref.clone(),
+            handoff_scope_ref: intent.handoff_scope_ref.clone(),
+            safe_material_ref: intent.safe_material_ref.clone(),
+            trace_record_refs: intent.trace_record_refs.clone(),
+            visibility_context_ref: propagation_visibility_context_ref(),
+        })?;
+        policy.assert_target_allowed()?;
+        policy.assert_trace_refs_present()?;
+        policy.assert_safe_material_body_free()?;
+        policy.assert_visible_for_handoff()?;
+
+        let resolution = self.deps.handoff_target_port.resolve_handoff_target(
+            intent.handoff_target_ref.clone(),
+            intent.handoff_scope_ref.clone(),
+            intent.safe_material_ref.clone(),
+        )?;
+        if resolution.target_ref != intent.handoff_target_ref {
+            return Err(ApplicationError::consistency_defect(
+                "handoff target resolution returned a different target",
+            ));
+        }
+        if resolution.scope_ref != intent.handoff_scope_ref {
+            return Err(ApplicationError::consistency_defect(
+                "handoff target resolution returned a different scope",
+            ));
+        }
+
+        match self.deps.handoff_delivery_port.deliver_handoff(
+            intent_ref.clone(),
+            resolution,
+            intent.safe_material_ref.clone(),
+        )? {
+            crate::ports::HandoffDeliveryOutcome::Delivered {
+                attempt_ref,
+                receipt_ref,
+            } => {
+                HandoffPolicy::assert_receipt_is_marker(&receipt_ref)?;
+                intent.mark_delivered(HandoffState::delivered(
+                    attempt_ref,
+                    receipt_ref.clone(),
+                    now,
+                ))?;
+                self.deps.handoff_intent_repository.save_handoff_intent(
+                    intent,
+                    Some(loaded.version),
+                    uow,
+                )?;
+                report.delivered_handoff_refs.push(intent_ref);
+                report.handoff_receipt_refs.push(receipt_ref);
+            }
+            crate::ports::HandoffDeliveryOutcome::RetryableFailed {
+                attempt_ref,
+                issue_ref,
+            } => {
+                let mapped_issue = self
+                    .deps
+                    .maintenance_issue_mapper
+                    .handoff_retryable_issue(issue_ref.clone());
+                intent.mark_retryable_failed(HandoffState::retryable_failed(
+                    attempt_ref,
+                    issue_ref,
+                    now,
+                ))?;
+                self.deps.handoff_intent_repository.save_handoff_intent(
+                    intent,
+                    Some(loaded.version),
+                    uow,
+                )?;
+                report.failed_handoff_refs.push(intent_ref);
+                report.issue_refs.push(mapped_issue);
+            }
+            crate::ports::HandoffDeliveryOutcome::PermanentlyFailed {
+                attempt_ref,
+                issue_ref,
+            } => {
+                let mapped_issue = self
+                    .deps
+                    .maintenance_issue_mapper
+                    .handoff_permanent_issue(issue_ref.clone());
+                intent.mark_failed(HandoffState::failed(attempt_ref, issue_ref, now))?;
+                self.deps.handoff_intent_repository.save_handoff_intent(
+                    intent,
+                    Some(loaded.version),
+                    uow,
+                )?;
+                report.failed_handoff_refs.push(intent_ref);
+                report.issue_refs.push(mapped_issue);
+            }
+            crate::ports::HandoffDeliveryOutcome::CancelledByPolicy { issue_ref } => {
+                let mapped_issue = self
+                    .deps
+                    .maintenance_issue_mapper
+                    .handoff_cancelled_issue(issue_ref.clone());
+                intent.mark_cancelled(HandoffState::cancelled(issue_ref, now))?;
+                self.deps.handoff_intent_repository.save_handoff_intent(
+                    intent,
+                    Some(loaded.version),
+                    uow,
+                )?;
+                report.failed_handoff_refs.push(intent_ref);
+                report.issue_refs.push(mapped_issue);
+            }
+            crate::ports::HandoffDeliveryOutcome::UnsupportedTarget { issue_ref } => {
+                let mapped_issue = self
+                    .deps
+                    .maintenance_issue_mapper
+                    .handoff_unsupported_target_issue(issue_ref.clone());
+                intent.mark_cancelled(HandoffState::cancelled(issue_ref, now))?;
+                self.deps.handoff_intent_repository.save_handoff_intent(
+                    intent,
+                    Some(loaded.version),
+                    uow,
+                )?;
+                report.failed_handoff_refs.push(intent_ref);
+                report.issue_refs.push(mapped_issue);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Shared precheck that keeps the public job envelope aligned with the operation context.
     pub fn assert_job_context<T>(
         request: &IdentityJobRequest<T>,
@@ -998,6 +1422,89 @@ fn reconciliation_output(
     }
 }
 
+fn publish_counts(report: &IdentityJobRunReport) -> IdentityJobItemCounts {
+    let scanned_count = report.outbox_record_refs.len();
+    let changed_count = report.published_outbox_refs.len();
+    let failed_count = report.failed_outbox_refs.len();
+    IdentityJobItemCounts {
+        scanned_count: scanned_count as u32,
+        changed_count: changed_count as u32,
+        failed_count: failed_count as u32,
+        skipped_count: skipped_count(scanned_count, changed_count, failed_count),
+    }
+}
+
+fn publish_output(
+    disposition: IdentityJobRunDisposition,
+    report: &IdentityJobRunReport,
+) -> PublishIdentityOutboxJobOutput {
+    PublishIdentityOutboxJobOutput {
+        disposition,
+        counts: publish_counts(report),
+        scanned_outbox_refs: report.outbox_record_refs.clone(),
+        published_outbox_refs: report.published_outbox_refs.clone(),
+        failed_outbox_refs: report.failed_outbox_refs.clone(),
+        issue_refs: report.issue_refs.clone(),
+    }
+}
+
+fn deliver_counts(report: &IdentityJobRunReport) -> IdentityJobItemCounts {
+    let scanned_count = report.handoff_intent_refs.len();
+    let changed_count = report.delivered_handoff_refs.len();
+    let failed_count = report.failed_handoff_refs.len();
+    IdentityJobItemCounts {
+        scanned_count: scanned_count as u32,
+        changed_count: changed_count as u32,
+        failed_count: failed_count as u32,
+        skipped_count: skipped_count(scanned_count, changed_count, failed_count),
+    }
+}
+
+fn deliver_output(
+    disposition: IdentityJobRunDisposition,
+    report: &IdentityJobRunReport,
+) -> DeliverTraceHandoffJobOutput {
+    DeliverTraceHandoffJobOutput {
+        disposition,
+        counts: deliver_counts(report),
+        scanned_handoff_intent_refs: report.handoff_intent_refs.clone(),
+        delivered_handoff_intent_refs: report.delivered_handoff_refs.clone(),
+        failed_handoff_intent_refs: report.failed_handoff_refs.clone(),
+        receipt_refs: report.handoff_receipt_refs.clone(),
+        issue_refs: report.issue_refs.clone(),
+    }
+}
+
+fn retry_counts(report: &IdentityJobRunReport) -> IdentityJobItemCounts {
+    let scanned_count = report.outbox_record_refs.len() + report.handoff_intent_refs.len();
+    let changed_count = report.published_outbox_refs.len() + report.delivered_handoff_refs.len();
+    let failed_count = report.failed_outbox_refs.len() + report.failed_handoff_refs.len();
+    IdentityJobItemCounts {
+        scanned_count: scanned_count as u32,
+        changed_count: changed_count as u32,
+        failed_count: failed_count as u32,
+        skipped_count: skipped_count(scanned_count, changed_count, failed_count),
+    }
+}
+
+fn retry_output(
+    disposition: IdentityJobRunDisposition,
+    report: &IdentityJobRunReport,
+) -> RetryIdentityPropagationFailuresJobOutput {
+    RetryIdentityPropagationFailuresJobOutput {
+        disposition,
+        counts: retry_counts(report),
+        retried_outbox_refs: report.outbox_record_refs.clone(),
+        published_outbox_refs: report.published_outbox_refs.clone(),
+        failed_outbox_refs: report.failed_outbox_refs.clone(),
+        retried_handoff_intent_refs: report.handoff_intent_refs.clone(),
+        delivered_handoff_intent_refs: report.delivered_handoff_refs.clone(),
+        failed_handoff_intent_refs: report.failed_handoff_refs.clone(),
+        receipt_refs: report.handoff_receipt_refs.clone(),
+        issue_refs: report.issue_refs.clone(),
+    }
+}
+
 fn finish_rebuild_execution(
     now: IdentityTimestamp,
     next_cursor: Option<IdentityRepositoryCursor>,
@@ -1048,6 +1555,61 @@ fn finish_refresh_execution(
     Ok(IdentityJobExecution::new(output, report))
 }
 
+fn finish_publish_execution(
+    now: IdentityTimestamp,
+    next_cursor: Option<IdentityRepositoryCursor>,
+    mut report: IdentityJobRunReport,
+) -> Result<IdentityJobExecution<PublishIdentityOutboxJobOutput>, ApplicationError> {
+    let output_cursor_ref = job_cursor(next_cursor);
+    let issue_refs = report.issue_refs.clone();
+    report = if report.outbox_record_refs.is_empty() {
+        report.noop(output_cursor_ref, None, now)
+    } else if issue_refs.is_empty() {
+        if report.published_outbox_refs.is_empty() {
+            report.noop(output_cursor_ref, None, now)
+        } else {
+            report.succeed(output_cursor_ref, None, now)
+        }
+    } else if report.published_outbox_refs.is_empty() && issue_refs.iter().all(is_retryable_issue) {
+        report.retryable_fail(issue_refs, now)?
+    } else if report.published_outbox_refs.is_empty() {
+        report.fail(issue_refs, now)?
+    } else {
+        report.partial(issue_refs, output_cursor_ref, None, now)?
+    };
+
+    let output = publish_output(disposition_from_result_kind(report.result_kind), &report);
+    Ok(IdentityJobExecution::new(output, report))
+}
+
+fn finish_delivery_execution(
+    now: IdentityTimestamp,
+    next_cursor: Option<IdentityRepositoryCursor>,
+    mut report: IdentityJobRunReport,
+) -> Result<IdentityJobExecution<DeliverTraceHandoffJobOutput>, ApplicationError> {
+    let output_cursor_ref = job_cursor(next_cursor);
+    let issue_refs = report.issue_refs.clone();
+    report = if report.handoff_intent_refs.is_empty() {
+        report.noop(output_cursor_ref, None, now)
+    } else if issue_refs.is_empty() {
+        if report.delivered_handoff_refs.is_empty() {
+            report.noop(output_cursor_ref, None, now)
+        } else {
+            report.succeed(output_cursor_ref, None, now)
+        }
+    } else if report.delivered_handoff_refs.is_empty() && issue_refs.iter().all(is_retryable_issue)
+    {
+        report.retryable_fail(issue_refs, now)?
+    } else if report.delivered_handoff_refs.is_empty() {
+        report.fail(issue_refs, now)?
+    } else {
+        report.partial(issue_refs, output_cursor_ref, None, now)?
+    };
+
+    let output = deliver_output(disposition_from_result_kind(report.result_kind), &report);
+    Ok(IdentityJobExecution::new(output, report))
+}
+
 fn finish_reconciliation_execution(
     now: IdentityTimestamp,
     next_cursor: Option<IdentityRepositoryCursor>,
@@ -1068,6 +1630,42 @@ fn finish_reconciliation_execution(
 
     let output = reconciliation_output(disposition_from_result_kind(report.result_kind), &report);
     Ok(IdentityJobExecution::new(output, report))
+}
+
+fn finish_retry_execution(
+    now: IdentityTimestamp,
+    next_cursor: Option<IdentityRepositoryCursor>,
+    mut report: IdentityJobRunReport,
+) -> Result<IdentityJobExecution<RetryIdentityPropagationFailuresJobOutput>, ApplicationError> {
+    let output_cursor_ref = job_cursor(next_cursor);
+    let issue_refs = report.issue_refs.clone();
+    let success_count = report.published_outbox_refs.len() + report.delivered_handoff_refs.len();
+    report = if report.outbox_record_refs.is_empty() && report.handoff_intent_refs.is_empty() {
+        report.noop(output_cursor_ref, None, now)
+    } else if issue_refs.is_empty() {
+        if success_count == 0 {
+            report.noop(output_cursor_ref, None, now)
+        } else {
+            report.succeed(output_cursor_ref, None, now)
+        }
+    } else if success_count == 0 && issue_refs.iter().all(is_retryable_issue) {
+        report.retryable_fail(issue_refs, now)?
+    } else if success_count == 0 {
+        report.fail(issue_refs, now)?
+    } else {
+        report.partial(issue_refs, output_cursor_ref, None, now)?
+    };
+
+    let output = retry_output(disposition_from_result_kind(report.result_kind), &report);
+    Ok(IdentityJobExecution::new(output, report))
+}
+
+fn propagation_visibility_context_ref() -> VisibilityContextRef {
+    VisibilityContextRef::new("operations-job-propagation")
+}
+
+fn skipped_count(scanned_count: usize, changed_count: usize, failed_count: usize) -> u32 {
+    scanned_count.saturating_sub(changed_count + failed_count) as u32
 }
 
 fn push_unique_member_ref(member_refs: &mut Vec<GlobalMemberRef>, member_ref: GlobalMemberRef) {

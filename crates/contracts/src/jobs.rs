@@ -5,13 +5,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::protocol::{IdentityJobName, IdentityProtocolSchemaVersionRef};
 use crate::queries::IdentityPublicPageRequest;
-use crate::receipts::MaintenanceIssueRef;
+use crate::receipts::{MaintenanceIssueRef, TraceHandoffIntentRef};
 use crate::refs::{
     ExternalReferenceRef, GlobalMemberRef, HandoffReceiptRef, IdentityJobCursorRef,
     IdentityJobReportRef, IdentityJobRunMetadataRef, IdentityJobRunRef, IdentityJobScopeMarkerRef,
     IdentityMaintenanceTargetRef, IdentityOutboxRecordRef, IdentityProjectionRef,
     IdentityReferenceOwnerRef, IdentityStoredResultRef, IdentityTimestamp, MaintenanceScopeRef,
     ReconciliationFindingIntentRef, ReconciliationFindingMaterial, ReconciliationReportRef,
+    TopicKeyRef,
 };
 
 /// Public job request shell.
@@ -109,6 +110,22 @@ pub enum IdentityExternalReferenceRefreshScopeDto {
     ByKind(crate::refs::ExternalReferenceKind),
 }
 
+/// Propagation retry target scope.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityPropagationRetryScopeDto {
+    /// Retry retryable outbox records, optionally narrowed by topic.
+    OutboxRetryable {
+        /// Optional topic selector.
+        topic_key_ref: Option<TopicKeyRef>,
+    },
+    /// Retry retryable handoff intents, optionally narrowed by target.
+    HandoffRetryable {
+        /// Optional handoff target selector.
+        target_ref: Option<crate::refs::HandoffTargetRef>,
+    },
+}
+
 /// Reconciliation target expansion scope.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -117,6 +134,16 @@ pub enum IdentityReconciliationTargetScopeDto {
     ExplicitTargets(Vec<IdentityMaintenanceTargetRef>),
     /// Expand all targets from the outer maintenance scope.
     ByMaintenanceScope,
+}
+
+/// Handoff delivery target scope.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityHandoffDeliveryScopeDto {
+    /// Deliver only the explicitly listed handoff intents.
+    ExplicitIntentRefs(Vec<TraceHandoffIntentRef>),
+    /// Deliver handoff intents for one formal target.
+    ByTarget(crate::refs::HandoffTargetRef),
 }
 
 /// Public rebuild job input.
@@ -199,6 +226,94 @@ pub struct RunIdentityReconciliationJobOutput {
     pub report_refs: Vec<ReconciliationReportRef>,
     /// Targets inspected during this run.
     pub inspected_target_refs: Vec<IdentityMaintenanceTargetRef>,
+    /// Safe issue refs exposed by the run.
+    pub issue_refs: Vec<MaintenanceIssueRef>,
+}
+
+/// Public outbox publish job input.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PublishIdentityOutboxJobInput {
+    /// Optional topic selector.
+    pub topic_key_ref: Option<TopicKeyRef>,
+    /// Public page request for batched job execution.
+    pub page: IdentityPublicPageRequest,
+}
+
+/// Public outbox publish job output.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PublishIdentityOutboxJobOutput {
+    /// Public run disposition.
+    pub disposition: IdentityJobRunDisposition,
+    /// Public item counters.
+    pub counts: IdentityJobItemCounts,
+    /// Outbox refs scanned during this run.
+    pub scanned_outbox_refs: Vec<IdentityOutboxRecordRef>,
+    /// Outbox refs published during this run.
+    pub published_outbox_refs: Vec<IdentityOutboxRecordRef>,
+    /// Outbox refs that failed or were skipped during this run.
+    pub failed_outbox_refs: Vec<IdentityOutboxRecordRef>,
+    /// Safe issue refs exposed by the run.
+    pub issue_refs: Vec<MaintenanceIssueRef>,
+}
+
+/// Public handoff delivery job input.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeliverTraceHandoffJobInput {
+    /// Handoff delivery target selection.
+    pub delivery_scope: IdentityHandoffDeliveryScopeDto,
+    /// Public page request for batched job execution.
+    pub page: IdentityPublicPageRequest,
+}
+
+/// Public handoff delivery job output.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeliverTraceHandoffJobOutput {
+    /// Public run disposition.
+    pub disposition: IdentityJobRunDisposition,
+    /// Public item counters.
+    pub counts: IdentityJobItemCounts,
+    /// Handoff intent refs scanned during this run.
+    pub scanned_handoff_intent_refs: Vec<TraceHandoffIntentRef>,
+    /// Handoff intent refs delivered during this run.
+    pub delivered_handoff_intent_refs: Vec<TraceHandoffIntentRef>,
+    /// Handoff intent refs that failed or were cancelled during this run.
+    pub failed_handoff_intent_refs: Vec<TraceHandoffIntentRef>,
+    /// Formal receipt refs produced during this run.
+    pub receipt_refs: Vec<HandoffReceiptRef>,
+    /// Safe issue refs exposed by the run.
+    pub issue_refs: Vec<MaintenanceIssueRef>,
+}
+
+/// Public retry propagation job input.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RetryIdentityPropagationFailuresJobInput {
+    /// Retry family selector.
+    pub retry_scope: IdentityPropagationRetryScopeDto,
+    /// Public page request for batched job execution.
+    pub page: IdentityPublicPageRequest,
+}
+
+/// Public retry propagation job output.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RetryIdentityPropagationFailuresJobOutput {
+    /// Public run disposition.
+    pub disposition: IdentityJobRunDisposition,
+    /// Public item counters.
+    pub counts: IdentityJobItemCounts,
+    /// Retryable outbox refs retried during this run.
+    pub retried_outbox_refs: Vec<IdentityOutboxRecordRef>,
+    /// Outbox refs published during this run.
+    pub published_outbox_refs: Vec<IdentityOutboxRecordRef>,
+    /// Outbox refs that failed during this run.
+    pub failed_outbox_refs: Vec<IdentityOutboxRecordRef>,
+    /// Retryable handoff intent refs retried during this run.
+    pub retried_handoff_intent_refs: Vec<TraceHandoffIntentRef>,
+    /// Handoff intent refs delivered during this run.
+    pub delivered_handoff_intent_refs: Vec<TraceHandoffIntentRef>,
+    /// Handoff intent refs that failed during this run.
+    pub failed_handoff_intent_refs: Vec<TraceHandoffIntentRef>,
+    /// Formal receipt refs produced during this run.
+    pub receipt_refs: Vec<HandoffReceiptRef>,
     /// Safe issue refs exposed by the run.
     pub issue_refs: Vec<MaintenanceIssueRef>,
 }

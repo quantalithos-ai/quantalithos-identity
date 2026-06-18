@@ -19,13 +19,13 @@ use identity_application::ports::{
     IdentityHandoffDeliveryPort, IdentityHandoffTargetPort, IdentityIdGeneratorPort,
     IdentityIdempotencyRepository, IdentityJobReportRepository,
     IdentityMaintenanceInspectionContext, IdentityMaintenanceRepository,
-    IdentityMarkerSubjectMapper, IdentityOperationContextFactoryPort, IdentityOutboxRepository,
-    IdentityProjectionRepository, IdentityReadVisibilityRepository,
+    IdentityMarkerSubjectMapper, IdentityOperationContextFactoryPort, IdentityOutboxPublisherPort,
+    IdentityOutboxRepository, IdentityProjectionRepository, IdentityReadVisibilityRepository,
     IdentityReconciliationReportRepository, IdentityReferenceStateRepository,
-    IdentityStoredResultRepository, IdentityTraceRecordRepository,
+    IdentityStoredResultRepository, IdentityTopicBindingPort, IdentityTraceRecordRepository,
     IdentityTruthChangeSubjectMapper, IdentityUnitOfWork, IdentityUnitOfWorkManagerPort,
-    MemberSummaryProjectionRebuildPlan, MemoryReferenceRepository, RoleCapabilityRepository,
-    TraceHandoffIntentRepository,
+    MemberSummaryProjectionRebuildPlan, MemoryReferenceRepository, OutboxPublishOutcome,
+    RoleCapabilityRepository, TopicBindingResolution, TraceHandoffIntentRepository,
 };
 use identity_application::support::{
     AuditTrailId, IdempotencyReserveOutcome, IdentityAcceptedAuditTrailMarkers,
@@ -398,6 +398,62 @@ impl IdentityInMemoryRuntimeBuilder {
         self.store
             .outbox_records
             .insert(key, StoredOutboxRecord { record, version });
+        self
+    }
+
+    pub fn seed_topic_binding_resolution(
+        mut self,
+        topic_key_ref: TopicKeyRef,
+        payload_marker_ref: IdentityOutboxPayloadMarkerRef,
+        resolution: TopicBindingResolution,
+    ) -> Self {
+        self.store.topic_bindings.insert(
+            topic_binding_key(&topic_key_ref, &payload_marker_ref),
+            resolution,
+        );
+        self
+    }
+
+    pub fn seed_outbox_publish_outcome(
+        mut self,
+        outbox_ref: IdentityOutboxRecordRef,
+        outcome: OutboxPublishOutcome,
+    ) -> Self {
+        self.store
+            .outbox_publish_outcomes
+            .insert(outbox_ref.as_str().to_owned(), outcome);
+        self
+    }
+
+    pub fn seed_handoff_target_resolution(
+        mut self,
+        target_ref: HandoffTargetRef,
+        scope_ref: HandoffScopeRef,
+        safe_material_ref: TraceHandoffSafeMaterialRef,
+        resolution: HandoffTargetResolution,
+    ) -> Self {
+        self.store.handoff_target_resolutions.insert(
+            handoff_target_resolution_key(&target_ref, &scope_ref, &safe_material_ref),
+            resolution,
+        );
+        self
+    }
+
+    pub fn seed_handoff_delivery_outcome(
+        mut self,
+        intent_ref: TraceHandoffIntentRef,
+        outcome: HandoffDeliveryOutcome,
+    ) -> Self {
+        self.store
+            .handoff_delivery_outcomes
+            .insert(intent_ref.as_str().to_owned(), outcome);
+        self
+    }
+
+    pub fn seed_handoff_receipt_resolution(mut self, resolution: HandoffReceiptResolution) -> Self {
+        self.store
+            .handoff_receipt_resolutions
+            .insert(resolution.receipt_ref.as_str().to_owned(), resolution);
         self
     }
 
@@ -1205,6 +1261,11 @@ struct RuntimeStore {
     job_report_by_name: HashMap<String, String>,
     job_report_by_result: HashMap<String, String>,
     adapter_availability: HashMap<String, IdentityAdapterAvailability>,
+    topic_bindings: HashMap<String, TopicBindingResolution>,
+    outbox_publish_outcomes: HashMap<String, OutboxPublishOutcome>,
+    handoff_target_resolutions: HashMap<String, HandoffTargetResolution>,
+    handoff_delivery_outcomes: HashMap<String, HandoffDeliveryOutcome>,
+    handoff_receipt_resolutions: HashMap<String, HandoffReceiptResolution>,
     member_summary_access: HashMap<String, IdentityVisibilityAccessSummary>,
     trace_read_access: HashMap<String, IdentityVisibilityAccessSummary>,
     trace_member_page_access: HashMap<String, IdentityVisibilityAccessSummary>,
@@ -4118,18 +4179,84 @@ impl IdentityAdapterAvailabilityPort for IdentityInMemoryRuntime {
     }
 }
 
+impl IdentityTopicBindingPort for IdentityInMemoryRuntime {
+    fn resolve_topic_binding(
+        &self,
+        topic_key_ref: TopicKeyRef,
+        payload_marker_ref: IdentityOutboxPayloadMarkerRef,
+    ) -> Result<TopicBindingResolution, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        store
+            .topic_bindings
+            .get(&topic_binding_key(&topic_key_ref, &payload_marker_ref))
+            .cloned()
+            .ok_or_else(|| ApplicationError::dependency_unavailable("topic binding not seeded"))
+    }
+}
+
+impl IdentityOutboxPublisherPort for IdentityInMemoryRuntime {
+    fn publish_outbox_record(
+        &self,
+        record_ref: IdentityOutboxRecordRef,
+        topic_binding: TopicBindingResolution,
+        payload_marker_ref: IdentityOutboxPayloadMarkerRef,
+    ) -> Result<OutboxPublishOutcome, ApplicationError> {
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        let stored = store
+            .outbox_records
+            .get(record_ref.as_str())
+            .ok_or_else(|| ApplicationError::not_found("outbox record not found"))?;
+        if stored.record.topic_key_ref != topic_binding.topic_key_ref {
+            return Err(ApplicationError::invalid_request("outbox topic mismatch"));
+        }
+        if stored.record.payload_marker_ref != payload_marker_ref {
+            return Err(ApplicationError::invalid_request(
+                "outbox payload marker mismatch",
+            ));
+        }
+        Ok(store
+            .outbox_publish_outcomes
+            .get(record_ref.as_str())
+            .cloned()
+            .unwrap_or_else(|| OutboxPublishOutcome::UnsupportedTopic {
+                issue_ref: identity_contracts::refs::OutboxDeliveryIssueRef::new(
+                    identity_source_ref(IdentitySourceOwner::Identity, "outbox-unsupported"),
+                ),
+            }))
+    }
+}
+
 impl IdentityHandoffTargetPort for IdentityInMemoryRuntime {
     fn resolve_handoff_target(
         &self,
         target_ref: HandoffTargetRef,
         scope_ref: HandoffScopeRef,
-        _safe_material_ref: TraceHandoffSafeMaterialRef,
+        safe_material_ref: TraceHandoffSafeMaterialRef,
     ) -> Result<HandoffTargetResolution, ApplicationError> {
         let availability = {
             let store =
                 self.shared.store.lock().map_err(|_| {
                     ApplicationError::consistency_defect("runtime store lock poisoned")
                 })?;
+            if let Some(resolution) =
+                store
+                    .handoff_target_resolutions
+                    .get(&handoff_target_resolution_key(
+                        &target_ref,
+                        &scope_ref,
+                        &safe_material_ref,
+                    ))
+            {
+                return Ok(resolution.clone());
+            }
             store
                 .adapter_availability
                 .values()
@@ -4173,23 +4300,36 @@ impl IdentityHandoffDeliveryPort for IdentityInMemoryRuntime {
                 "handoff material mismatch",
             ));
         }
-        Ok(HandoffDeliveryOutcome::UnsupportedTarget {
-            issue_ref: HandoffIssueRef::new(identity_source_ref(
-                IdentitySourceOwner::Identity,
-                "handoff-unsupported",
-            )),
-        })
+        Ok(store
+            .handoff_delivery_outcomes
+            .get(intent_ref.as_str())
+            .cloned()
+            .unwrap_or_else(|| HandoffDeliveryOutcome::UnsupportedTarget {
+                issue_ref: HandoffIssueRef::new(identity_source_ref(
+                    IdentitySourceOwner::Identity,
+                    "handoff-unsupported",
+                )),
+            }))
     }
 
     fn resolve_handoff_receipt(
         &self,
         receipt_ref: HandoffReceiptRef,
     ) -> Result<HandoffReceiptResolution, ApplicationError> {
-        Ok(HandoffReceiptResolution {
-            receipt_ref,
-            receipt_state: ReferenceResolutionStateKind::Resolved,
-            issue_ref: None,
-        })
+        let store = self
+            .shared
+            .store
+            .lock()
+            .map_err(|_| ApplicationError::consistency_defect("runtime store lock poisoned"))?;
+        Ok(store
+            .handoff_receipt_resolutions
+            .get(receipt_ref.as_str())
+            .cloned()
+            .unwrap_or(HandoffReceiptResolution {
+                receipt_ref,
+                receipt_state: ReferenceResolutionStateKind::Resolved,
+                issue_ref: None,
+            }))
     }
 }
 
@@ -6814,6 +6954,17 @@ fn outbox_record_access_key(
     format!("{outbox_token}::{subject_token}::{topic_token}")
 }
 
+fn topic_binding_key(
+    topic_key_ref: &TopicKeyRef,
+    payload_marker_ref: &IdentityOutboxPayloadMarkerRef,
+) -> String {
+    format!(
+        "{}::{}",
+        topic_key_ref.as_str(),
+        payload_marker_ref.as_str()
+    )
+}
+
 fn outbox_trace_event_key(
     trace_record_ref: &IdentityTraceRecordRef,
     material_kind: AcceptedOutboundMaterialKind,
@@ -6822,6 +6973,19 @@ fn outbox_trace_event_key(
         "{}::{}",
         trace_record_ref.as_str(),
         material_kind.event_name().as_str()
+    )
+}
+
+fn handoff_target_resolution_key(
+    target_ref: &HandoffTargetRef,
+    scope_ref: &HandoffScopeRef,
+    safe_material_ref: &TraceHandoffSafeMaterialRef,
+) -> String {
+    format!(
+        "{}::{}::{}",
+        target_ref.as_str(),
+        scope_ref.as_str(),
+        safe_material_ref.as_str()
     )
 }
 
@@ -7097,10 +7261,12 @@ mod tests {
         WorkParticipationAcceptedPayload,
     };
     use identity_contracts::jobs::{
-        IdentityExternalReferenceRefreshScopeDto, IdentityJobRequest, IdentityJobRunDisposition,
-        IdentityProjectionRebuildScopeDto, IdentityReconciliationTargetScopeDto,
+        DeliverTraceHandoffJobInput, IdentityExternalReferenceRefreshScopeDto,
+        IdentityHandoffDeliveryScopeDto, IdentityJobRequest, IdentityJobRunDisposition,
+        IdentityProjectionRebuildScopeDto, IdentityPropagationRetryScopeDto,
+        IdentityReconciliationTargetScopeDto, PublishIdentityOutboxJobInput,
         RebuildIdentityProjectionJobInput, RefreshExternalReferenceStateJobInput,
-        RunIdentityReconciliationJobInput,
+        RetryIdentityPropagationFailuresJobInput, RunIdentityReconciliationJobInput,
     };
     use identity_contracts::metadata::{
         IdentityCommandMetadata, IdentityDegradedKind, IdentityQueryDisposition,
@@ -7417,6 +7583,40 @@ mod tests {
         )
     }
 
+    fn topic_binding_resolution(topic_key_ref: TopicKeyRef) -> TopicBindingResolution {
+        TopicBindingResolution {
+            topic_key_ref,
+            adapter_ref: IdentityAdapterRef::new("adapter-1"),
+            adapter_mode_ref: IdentityAdapterModeRef::new("fake"),
+            publish_scope_ref: identity_source_ref(
+                IdentitySourceOwner::Identity,
+                "publish-scope-1",
+            ),
+        }
+    }
+
+    fn outbox_attempt_ref(token: &str) -> identity_contracts::refs::OutboxDeliveryAttemptRef {
+        identity_contracts::refs::OutboxDeliveryAttemptRef::new(identity_source_ref(
+            IdentitySourceOwner::Identity,
+            token,
+        ))
+    }
+
+    fn outbox_issue_ref(token: &str) -> identity_contracts::refs::OutboxDeliveryIssueRef {
+        identity_contracts::refs::OutboxDeliveryIssueRef::new(identity_source_ref(
+            IdentitySourceOwner::Identity,
+            token,
+        ))
+    }
+
+    fn handoff_attempt_ref(token: &str) -> HandoffAttemptRef {
+        HandoffAttemptRef::new(identity_source_ref(IdentitySourceOwner::Identity, token))
+    }
+
+    fn handoff_receipt_ref(token: &str) -> HandoffReceiptRef {
+        HandoffReceiptRef::new(format!("handoff-receipt-{token}"))
+    }
+
     fn request_digest(token: &str) -> identity_application::support::IdentityRequestDigest {
         identity_application::support::IdentityRequestDigest::from_canonical_marker(
             IdentityCanonicalRequestMarkerRef::new(format!("canonical-{token}")),
@@ -7525,6 +7725,12 @@ mod tests {
             reference_state_repository: runtime,
             external_reference_resolver: runtime,
             reconciliation_report_repository: runtime,
+            outbox_repository: runtime,
+            topic_binding_port: runtime,
+            outbox_publisher_port: runtime,
+            handoff_intent_repository: runtime,
+            handoff_target_port: runtime,
+            handoff_delivery_port: runtime,
             maintenance_issue_mapper,
         })
     }
@@ -10295,6 +10501,512 @@ mod tests {
                 .expect("list reports")
                 .items
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn publish_outbox_job_updates_state_and_preserves_member_truth() {
+        let member = GlobalMember::establish(
+            member_ref("member-publish-1"),
+            identity_source_ref(IdentitySourceOwner::Identity, "member-source-publish-1"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let mut record = outbox_record("publish-success", OutboxState::pending(timestamp(1)));
+        record.member_ref = member.member_ref.clone();
+
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member.clone(), IdentityVersion::new(1))
+            .seed_outbox_record(record.clone(), IdentityVersion::new(1))
+            .seed_topic_binding_resolution(
+                record.topic_key_ref.clone(),
+                record.payload_marker_ref.clone(),
+                topic_binding_resolution(record.topic_key_ref.clone()),
+            )
+            .seed_outbox_publish_outcome(
+                record.outbox_record_ref.clone(),
+                OutboxPublishOutcome::Published {
+                    attempt_ref: outbox_attempt_ref("outbox-attempt-publish-1"),
+                },
+            )
+            .build();
+        let mapper = DefaultIdentityMaintenanceIssueMapper;
+        let service = job_service(&runtime, &mapper);
+
+        let response = service
+            .publish_identity_outbox(
+                typed_job_request(
+                    "PublishIdentityOutbox",
+                    "idem-job-publish-1",
+                    "job-run-publish-1",
+                    "job-publish-1",
+                    PublishIdentityOutboxJobInput {
+                        topic_key_ref: Some(record.topic_key_ref.clone()),
+                        page: job_page(10),
+                    },
+                ),
+                job_context(
+                    "PublishIdentityOutbox",
+                    "idem-job-publish-1",
+                    "job-publish-1",
+                    "job-run-publish-1",
+                ),
+            )
+            .expect("publish job");
+
+        assert_eq!(
+            response.output.disposition,
+            IdentityJobRunDisposition::Completed
+        );
+        assert_eq!(
+            response.output.scanned_outbox_refs,
+            vec![record.outbox_record_ref.clone()]
+        );
+        assert_eq!(
+            response.output.published_outbox_refs,
+            vec![record.outbox_record_ref.clone()]
+        );
+        assert!(response.output.failed_outbox_refs.is_empty());
+        assert!(response.output.issue_refs.is_empty());
+
+        let persisted = runtime
+            .get_outbox_record_with_version(record.outbox_record_ref.clone())
+            .expect("load outbox")
+            .expect("outbox");
+        assert_eq!(persisted.version, IdentityVersion::new(2));
+        assert_eq!(
+            persisted.value.outbox_state.state_kind,
+            OutboxStateKind::Published
+        );
+        assert_eq!(
+            persisted.value.outbox_state.attempt_ref,
+            Some(outbox_attempt_ref("outbox-attempt-publish-1"))
+        );
+        let persisted_member = runtime
+            .get_member_with_version(member.member_ref.clone())
+            .expect("load member")
+            .expect("member");
+        assert_eq!(persisted_member.value, member);
+    }
+
+    #[test]
+    fn publish_outbox_job_maps_retryable_and_unsupported_outcomes() {
+        let published = outbox_record("publish-mixed", OutboxState::pending(timestamp(1)));
+        let retryable = outbox_record("retryable-mixed", OutboxState::pending(timestamp(1)));
+        let unsupported = outbox_record("unsupported-mixed", OutboxState::pending(timestamp(1)));
+
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_outbox_record(published.clone(), IdentityVersion::new(1))
+            .seed_outbox_record(retryable.clone(), IdentityVersion::new(1))
+            .seed_outbox_record(unsupported.clone(), IdentityVersion::new(1))
+            .seed_topic_binding_resolution(
+                published.topic_key_ref.clone(),
+                published.payload_marker_ref.clone(),
+                topic_binding_resolution(published.topic_key_ref.clone()),
+            )
+            .seed_topic_binding_resolution(
+                retryable.topic_key_ref.clone(),
+                retryable.payload_marker_ref.clone(),
+                topic_binding_resolution(retryable.topic_key_ref.clone()),
+            )
+            .seed_topic_binding_resolution(
+                unsupported.topic_key_ref.clone(),
+                unsupported.payload_marker_ref.clone(),
+                topic_binding_resolution(unsupported.topic_key_ref.clone()),
+            )
+            .seed_outbox_publish_outcome(
+                published.outbox_record_ref.clone(),
+                OutboxPublishOutcome::Published {
+                    attempt_ref: outbox_attempt_ref("outbox-attempt-mixed"),
+                },
+            )
+            .seed_outbox_publish_outcome(
+                retryable.outbox_record_ref.clone(),
+                OutboxPublishOutcome::RetryableFailed {
+                    attempt_ref: Some(outbox_attempt_ref("outbox-attempt-retryable")),
+                    issue_ref: outbox_issue_ref("outbox-issue-retryable"),
+                },
+            )
+            .seed_outbox_publish_outcome(
+                unsupported.outbox_record_ref.clone(),
+                OutboxPublishOutcome::UnsupportedTopic {
+                    issue_ref: outbox_issue_ref("outbox-issue-unsupported"),
+                },
+            )
+            .build();
+        let mapper = DefaultIdentityMaintenanceIssueMapper;
+        let service = job_service(&runtime, &mapper);
+
+        let response = service
+            .publish_identity_outbox(
+                typed_job_request(
+                    "PublishIdentityOutbox",
+                    "idem-job-publish-mixed",
+                    "job-run-publish-mixed",
+                    "job-publish-mixed",
+                    PublishIdentityOutboxJobInput {
+                        topic_key_ref: None,
+                        page: job_page(10),
+                    },
+                ),
+                job_context(
+                    "PublishIdentityOutbox",
+                    "idem-job-publish-mixed",
+                    "job-publish-mixed",
+                    "job-run-publish-mixed",
+                ),
+            )
+            .expect("publish mixed job");
+
+        assert_eq!(
+            response.output.disposition,
+            IdentityJobRunDisposition::Partial
+        );
+        assert_eq!(response.output.scanned_outbox_refs.len(), 3);
+        assert_eq!(
+            response.output.published_outbox_refs,
+            vec![published.outbox_record_ref.clone()]
+        );
+        let mut failed_outbox_refs = response.output.failed_outbox_refs.clone();
+        failed_outbox_refs.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        assert_eq!(
+            failed_outbox_refs,
+            vec![
+                retryable.outbox_record_ref.clone(),
+                unsupported.outbox_record_ref.clone(),
+            ]
+        );
+        assert_eq!(response.output.issue_refs.len(), 2);
+        assert_eq!(
+            runtime
+                .get_outbox_record_with_version(retryable.outbox_record_ref.clone())
+                .expect("load retryable")
+                .expect("retryable")
+                .value
+                .outbox_state
+                .state_kind,
+            OutboxStateKind::RetryableFailed
+        );
+        assert_eq!(
+            runtime
+                .get_outbox_record_with_version(unsupported.outbox_record_ref.clone())
+                .expect("load unsupported")
+                .expect("unsupported")
+                .value
+                .outbox_state
+                .state_kind,
+            OutboxStateKind::Failed
+        );
+    }
+
+    #[test]
+    fn publish_outbox_job_duplicate_replay_returns_stored_report_without_rerun() {
+        let context = job_context(
+            "PublishIdentityOutbox",
+            "idem-job-publish-dup",
+            "job-publish-dup",
+            "job-run-publish-dup",
+        );
+        let stored_result = StoredIdentityOperationResult::job_report(
+            stored_result_ref("job-publish-dup"),
+            context.context_ref.clone(),
+            identity_application::support::IdentityStoredSurfaceMarkerRef::new(
+                "surface-job-publish-dup",
+            ),
+            timestamp(2),
+        );
+        let outbox_ref = IdentityOutboxRecordRef::new("outbox-publish-dup");
+        let mut report = IdentityJobRunReport::start(
+            IdentityJobReportRef::new("job-report-publish-dup"),
+            IdentityJobRunRef::new("job-run-publish-dup"),
+            IdentityJobName::new("PublishIdentityOutbox"),
+            IdentityJobScopeMarkerRef::new("job-scope-job-publish-dup"),
+            Some(identity_contracts::refs::IdentityJobCursorRef::new(
+                "job-input-cursor-publish-dup",
+            )),
+            timestamp(1),
+        )
+        .succeed(
+            None,
+            Some(stored_result_ref("job-publish-dup")),
+            timestamp(2),
+        );
+        report.outbox_record_refs.push(outbox_ref.clone());
+        report.published_outbox_refs.push(outbox_ref.clone());
+
+        let record = IdentityIdempotencyRecord {
+            record_ref: IdentityIdempotencyRecordRef::new("idem-record-job-publish-dup"),
+            operation_name: context.operation_name.clone(),
+            channel: IdentityOperationChannel::Job,
+            idempotency_key: IdentityIdempotencyKey::new("idem-job-publish-dup"),
+            request_digest: context.request_digest.clone(),
+            state: identity_application::support::IdentityIdempotencyStateKind::Completed,
+            stored_result_ref: Some(stored_result_ref("job-publish-dup")),
+            reserved_at: timestamp(1),
+            completed_at: Some(timestamp(2)),
+        };
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_idempotency_record(record, IdentityVersion::new(2))
+            .seed_stored_result(stored_result)
+            .seed_job_report(report.clone(), IdentityVersion::new(1))
+            .build();
+        let mapper = DefaultIdentityMaintenanceIssueMapper;
+        let service = job_service(&runtime, &mapper);
+
+        let response = service
+            .publish_identity_outbox(
+                typed_job_request(
+                    "PublishIdentityOutbox",
+                    "idem-job-publish-dup",
+                    "job-run-publish-dup",
+                    "job-publish-dup",
+                    PublishIdentityOutboxJobInput {
+                        topic_key_ref: None,
+                        page: job_page(10),
+                    },
+                ),
+                context,
+            )
+            .expect("duplicate replay");
+
+        assert_eq!(
+            response.output.disposition,
+            IdentityJobRunDisposition::DuplicateReplayed
+        );
+        assert_eq!(
+            response.output.scanned_outbox_refs,
+            vec![outbox_ref.clone()]
+        );
+        assert_eq!(response.output.published_outbox_refs, vec![outbox_ref]);
+        assert_eq!(response.report, report.to_surface());
+    }
+
+    #[test]
+    fn deliver_trace_handoff_job_delivers_with_formal_receipt() {
+        let member = GlobalMember::establish(
+            member_ref("member-handoff-1"),
+            identity_source_ref(IdentitySourceOwner::Identity, "member-source-handoff-1"),
+            ActorRef::new("actor-1", ActorKind::Human),
+            timestamp(1),
+        )
+        .expect("member");
+        let mut intent = handoff_intent();
+        intent.member_ref = member.member_ref.clone();
+
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_member(member.clone(), IdentityVersion::new(1))
+            .seed_handoff_intent(intent.clone(), IdentityVersion::new(1))
+            .seed_adapter_availability(adapter_availability())
+            .seed_handoff_delivery_outcome(
+                intent.handoff_intent_ref.clone(),
+                HandoffDeliveryOutcome::Delivered {
+                    attempt_ref: handoff_attempt_ref("handoff-attempt-1"),
+                    receipt_ref: handoff_receipt_ref("handoff-receipt-1"),
+                },
+            )
+            .build();
+        let mapper = DefaultIdentityMaintenanceIssueMapper;
+        let service = job_service(&runtime, &mapper);
+
+        let response = service
+            .deliver_trace_handoff(
+                typed_job_request(
+                    "DeliverTraceHandoff",
+                    "idem-job-handoff-1",
+                    "job-run-handoff-1",
+                    "job-handoff-1",
+                    DeliverTraceHandoffJobInput {
+                        delivery_scope: IdentityHandoffDeliveryScopeDto::ExplicitIntentRefs(vec![
+                            intent.handoff_intent_ref.clone(),
+                        ]),
+                        page: job_page(10),
+                    },
+                ),
+                job_context(
+                    "DeliverTraceHandoff",
+                    "idem-job-handoff-1",
+                    "job-handoff-1",
+                    "job-run-handoff-1",
+                ),
+            )
+            .expect("deliver handoff job");
+
+        assert_eq!(
+            response.output.disposition,
+            IdentityJobRunDisposition::Completed
+        );
+        assert_eq!(
+            response.output.delivered_handoff_intent_refs,
+            vec![intent.handoff_intent_ref.clone()]
+        );
+        assert_eq!(
+            response.output.receipt_refs,
+            vec![handoff_receipt_ref("handoff-receipt-1")]
+        );
+        assert!(response.output.failed_handoff_intent_refs.is_empty());
+        let persisted = runtime
+            .get_handoff_intent_with_version(intent.handoff_intent_ref.clone())
+            .expect("load handoff")
+            .expect("handoff");
+        assert_eq!(persisted.version, IdentityVersion::new(2));
+        assert_eq!(
+            persisted.value.handoff_state.state_kind,
+            HandoffStateKind::Delivered
+        );
+        assert_eq!(
+            persisted.value.handoff_state.receipt_ref,
+            Some(handoff_receipt_ref("handoff-receipt-1"))
+        );
+        let persisted_member = runtime
+            .get_member_with_version(member.member_ref.clone())
+            .expect("load member")
+            .expect("member");
+        assert_eq!(persisted_member.value, member);
+    }
+
+    #[test]
+    fn deliver_trace_handoff_job_default_fake_does_not_synthesize_success() {
+        let intent = handoff_intent();
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_handoff_intent(intent.clone(), IdentityVersion::new(1))
+            .seed_adapter_availability(adapter_availability())
+            .build();
+        let mapper = DefaultIdentityMaintenanceIssueMapper;
+        let service = job_service(&runtime, &mapper);
+
+        let response = service
+            .deliver_trace_handoff(
+                typed_job_request(
+                    "DeliverTraceHandoff",
+                    "idem-job-handoff-default",
+                    "job-run-handoff-default",
+                    "job-handoff-default",
+                    DeliverTraceHandoffJobInput {
+                        delivery_scope: IdentityHandoffDeliveryScopeDto::ByTarget(
+                            intent.handoff_target_ref.clone(),
+                        ),
+                        page: job_page(10),
+                    },
+                ),
+                job_context(
+                    "DeliverTraceHandoff",
+                    "idem-job-handoff-default",
+                    "job-handoff-default",
+                    "job-run-handoff-default",
+                ),
+            )
+            .expect("deliver handoff default");
+
+        assert_eq!(
+            response.output.disposition,
+            IdentityJobRunDisposition::Failed
+        );
+        assert!(response.output.delivered_handoff_intent_refs.is_empty());
+        assert_eq!(
+            response.output.failed_handoff_intent_refs,
+            vec![intent.handoff_intent_ref.clone()]
+        );
+        assert_eq!(
+            runtime
+                .get_handoff_intent_with_version(intent.handoff_intent_ref.clone())
+                .expect("load handoff")
+                .expect("handoff")
+                .value
+                .handoff_state
+                .state_kind,
+            HandoffStateKind::Cancelled
+        );
+    }
+
+    #[test]
+    fn retry_propagation_job_retries_only_retryable_outbox_family() {
+        let retryable = outbox_record(
+            "retry-family",
+            OutboxState::retryable_failed(
+                outbox_issue_ref("outbox-issue-retry-family"),
+                timestamp(1),
+            ),
+        );
+        let terminal = outbox_record(
+            "terminal-family",
+            OutboxState::published(outbox_attempt_ref("outbox-attempt-terminal"), timestamp(1)),
+        );
+
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_outbox_record(retryable.clone(), IdentityVersion::new(1))
+            .seed_outbox_record(terminal.clone(), IdentityVersion::new(1))
+            .seed_topic_binding_resolution(
+                retryable.topic_key_ref.clone(),
+                retryable.payload_marker_ref.clone(),
+                topic_binding_resolution(retryable.topic_key_ref.clone()),
+            )
+            .seed_outbox_publish_outcome(
+                retryable.outbox_record_ref.clone(),
+                OutboxPublishOutcome::Published {
+                    attempt_ref: outbox_attempt_ref("outbox-attempt-retry-family"),
+                },
+            )
+            .build();
+        let mapper = DefaultIdentityMaintenanceIssueMapper;
+        let service = job_service(&runtime, &mapper);
+
+        let response = service
+            .retry_identity_propagation_failures(
+                typed_job_request(
+                    "RetryIdentityPropagationFailures",
+                    "idem-job-retry-family",
+                    "job-run-retry-family",
+                    "job-retry-family",
+                    RetryIdentityPropagationFailuresJobInput {
+                        retry_scope: IdentityPropagationRetryScopeDto::OutboxRetryable {
+                            topic_key_ref: Some(retryable.topic_key_ref.clone()),
+                        },
+                        page: job_page(10),
+                    },
+                ),
+                job_context(
+                    "RetryIdentityPropagationFailures",
+                    "idem-job-retry-family",
+                    "job-retry-family",
+                    "job-run-retry-family",
+                ),
+            )
+            .expect("retry propagation job");
+
+        assert_eq!(
+            response.output.disposition,
+            IdentityJobRunDisposition::Completed
+        );
+        assert_eq!(
+            response.output.retried_outbox_refs,
+            vec![retryable.outbox_record_ref.clone()]
+        );
+        assert_eq!(
+            response.output.published_outbox_refs,
+            vec![retryable.outbox_record_ref.clone()]
+        );
+        assert!(response.output.failed_outbox_refs.is_empty());
+        assert!(response.output.retried_handoff_intent_refs.is_empty());
+        assert_eq!(
+            runtime
+                .get_outbox_record_with_version(retryable.outbox_record_ref.clone())
+                .expect("load retried outbox")
+                .expect("retried outbox")
+                .value
+                .outbox_state
+                .state_kind,
+            OutboxStateKind::Published
+        );
+        assert_eq!(
+            runtime
+                .get_outbox_record_with_version(terminal.outbox_record_ref.clone())
+                .expect("load terminal outbox")
+                .expect("terminal outbox")
+                .value
+                .outbox_state
+                .state_kind,
+            OutboxStateKind::Published
         );
     }
 
