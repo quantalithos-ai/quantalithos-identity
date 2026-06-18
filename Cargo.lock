@@ -50,6 +50,8 @@ dependencies = [
  "identity-application",
  "identity-contracts",
  "identity-domain",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

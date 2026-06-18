@@ -4175,6 +4175,11 @@ impl IdentityAdapterAvailabilityPort for IdentityInMemoryRuntime {
                 ));
             }
         }
+        if !availability.allows_attempt() {
+            return Err(ApplicationError::dependency_unavailable(
+                "adapter attempt is not allowed",
+            ));
+        }
         Ok(availability)
     }
 }
@@ -4205,6 +4210,10 @@ impl IdentityOutboxPublisherPort for IdentityInMemoryRuntime {
         topic_binding: TopicBindingResolution,
         payload_marker_ref: IdentityOutboxPayloadMarkerRef,
     ) -> Result<OutboxPublishOutcome, ApplicationError> {
+        self.assert_adapter_attempt_allowed(
+            topic_binding.adapter_ref.clone(),
+            Some(topic_binding.adapter_mode_ref.clone()),
+        )?;
         let store = self
             .shared
             .store
@@ -4283,6 +4292,10 @@ impl IdentityHandoffDeliveryPort for IdentityInMemoryRuntime {
         target_resolution: HandoffTargetResolution,
         safe_material_ref: TraceHandoffSafeMaterialRef,
     ) -> Result<HandoffDeliveryOutcome, ApplicationError> {
+        self.assert_adapter_attempt_allowed(
+            target_resolution.adapter_ref.clone(),
+            Some(target_resolution.adapter_mode_ref.clone()),
+        )?;
         let store = self
             .shared
             .store
@@ -10519,6 +10532,7 @@ mod tests {
         let runtime = IdentityInMemoryRuntime::builder()
             .seed_member(member.clone(), IdentityVersion::new(1))
             .seed_outbox_record(record.clone(), IdentityVersion::new(1))
+            .seed_adapter_availability(adapter_availability())
             .seed_topic_binding_resolution(
                 record.topic_key_ref.clone(),
                 record.payload_marker_ref.clone(),
@@ -10600,6 +10614,7 @@ mod tests {
             .seed_outbox_record(published.clone(), IdentityVersion::new(1))
             .seed_outbox_record(retryable.clone(), IdentityVersion::new(1))
             .seed_outbox_record(unsupported.clone(), IdentityVersion::new(1))
+            .seed_adapter_availability(adapter_availability())
             .seed_topic_binding_resolution(
                 published.topic_key_ref.clone(),
                 published.payload_marker_ref.clone(),
@@ -11010,6 +11025,7 @@ mod tests {
         let runtime = IdentityInMemoryRuntime::builder()
             .seed_outbox_record(retryable.clone(), IdentityVersion::new(1))
             .seed_outbox_record(terminal.clone(), IdentityVersion::new(1))
+            .seed_adapter_availability(adapter_availability())
             .seed_topic_binding_resolution(
                 retryable.topic_key_ref.clone(),
                 retryable.payload_marker_ref.clone(),
