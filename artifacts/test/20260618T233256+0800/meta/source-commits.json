@@ -1,0 +1,11 @@
+{
+  "additional_source_refs": [],
+  "artifact_digest": "sha256:c6e0ff4ff6f4d5a8af0c1f93d5fea98d554ef40cad6f62a529180e0ecb85bc9c",
+  "artifact_digest_algorithm": "sha256",
+  "core_contracts_source_ref": "git:ef0d24941fe6e00c24d423ac330347e6e1acb2da",
+  "design_source_ref": "git:3e981ab87b05062c4d29895d5a364db05fb47607",
+  "generated_at": "2026-06-18T15:38:18Z",
+  "implementation_source_ref": "git:db3b895313a53975c9e06c7d6cdfae3f85935bfb",
+  "run_id": "20260618T233256+0800",
+  "schema_version": "identity.artifact.v1"
+}

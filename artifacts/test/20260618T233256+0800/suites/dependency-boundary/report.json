@@ -1,0 +1,21 @@
+{
+  "artifact_digest": "sha256:f9888826a3589c7aa21536ca2b19aa20962f0cf3c49dd4239c036c84fc50e3f2",
+  "artifact_digest_algorithm": "sha256",
+  "case_digests": {
+    "arch-001-entry-facade-dependency-boundary": "sha256:3dae35e178ecac7d9548497d2fce8af72ae74767263e3330992701f9f8f323c2"
+  },
+  "case_refs": [
+    "arch-001-entry-facade-dependency-boundary"
+  ],
+  "config_profile": "ci-test",
+  "duration_ms": 210,
+  "failure_reason_ref": null,
+  "finished_at": "2026-06-18T15:38:20Z",
+  "run_id": "20260618T233256+0800",
+  "schema_version": "identity.artifact.v1",
+  "started_at": "2026-06-18T15:38:19Z",
+  "status": "passed",
+  "stderr_digest": "sha256:01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+  "stdout_digest": "sha256:01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+  "suite": "dependency-boundary"
+}

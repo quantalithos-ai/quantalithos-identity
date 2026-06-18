@@ -1,0 +1,42 @@
+{
+  "artifact_digest": "sha256:42e90f0302d3352fa98d8e49139630fe5f01de376d11e38050900cc3143e8b4a",
+  "artifact_digest_algorithm": "sha256",
+  "assertions": [
+    {
+      "assertion_id": "config-003-disabled-adapter-no-fake-success-assertion-01",
+      "assertion_kind": "state",
+      "assertion_ref": "config.runtime.disabled_adapter_is_visible",
+      "assertion_status": "passed",
+      "failure_reason_ref": null,
+      "safe_detail_refs": [],
+      "safe_message": "Disabled optional adapters stay explicitly Disabled in the runtime registry, so the runtime never synthesizes a fake available publisher or handoff adapter.",
+      "safe_message_ref": "config.runtime.disabled_adapter_is_visible"
+    },
+    {
+      "assertion_id": "config-003-disabled-adapter-no-fake-success-assertion-02",
+      "assertion_kind": "flow",
+      "assertion_ref": "config.runtime.disabled_adapter_degrades_not_passes",
+      "assertion_status": "passed",
+      "failure_reason_ref": null,
+      "safe_detail_refs": [],
+      "safe_message": "When optional adapters are disabled, the builder surfaces a degraded assembly state instead of reporting a clean success path that would hide missing runtime wiring.",
+      "safe_message_ref": "config.runtime.disabled_adapter_degrades_not_passes"
+    }
+  ],
+  "case_id": "config-003-disabled-adapter-no-fake-success",
+  "duration_ms": 0,
+  "evidence_candidate_refs": [
+    "EV-CAND-ID-CONFIG-003"
+  ],
+  "evidence_refs": [
+    "EV-ID-CONFIG-001"
+  ],
+  "failure_reason_ref": null,
+  "run_id": "20260618T233256+0800",
+  "schema_version": "identity.artifact.v1",
+  "status": "passed",
+  "suite": "config-redline",
+  "tc_refs": [
+    "TC-ID-CONFIG-003"
+  ]
+}

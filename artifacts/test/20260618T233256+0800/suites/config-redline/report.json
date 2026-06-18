@@ -1,0 +1,27 @@
+{
+  "artifact_digest": "sha256:afaecd190feb114a28c81b83e45d97f04009f53eac9692893b86922af624f483",
+  "artifact_digest_algorithm": "sha256",
+  "case_digests": {
+    "config-001-formal-profile-matrix": "sha256:e651fa812d61b6ad09c91d0ec773c65570bdb7f02d67e1a87517f2ad83b3dddf",
+    "config-002-invalid-config-fails-closed": "sha256:98c2e12a8d16c78a3def731704eab13bde1405572e8c02e987aa8e01aec04f49",
+    "config-003-disabled-adapter-no-fake-success": "sha256:42e90f0302d3352fa98d8e49139630fe5f01de376d11e38050900cc3143e8b4a",
+    "config-004-topic-target-completeness": "sha256:f16ec991295aa3ddd9766a4012113940a725a1308cd7438a6540ddbcf623e036"
+  },
+  "case_refs": [
+    "config-001-formal-profile-matrix",
+    "config-002-invalid-config-fails-closed",
+    "config-003-disabled-adapter-no-fake-success",
+    "config-004-topic-target-completeness"
+  ],
+  "config_profile": "ci-test",
+  "duration_ms": 430,
+  "failure_reason_ref": null,
+  "finished_at": "2026-06-18T15:38:19Z",
+  "run_id": "20260618T233256+0800",
+  "schema_version": "identity.artifact.v1",
+  "started_at": "2026-06-18T15:38:18Z",
+  "status": "passed",
+  "stderr_digest": "sha256:01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+  "stdout_digest": "sha256:01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+  "suite": "config-redline"
+}
