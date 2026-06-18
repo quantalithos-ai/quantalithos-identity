@@ -8,3 +8,11 @@ rust-version.workspace = true
 [lib]
 name = "identity_api"
 path = "src/lib.rs"
+
+[dependencies]
+core-contracts.workspace = true
+identity-application = { path = "../application" }
+identity-contracts = { path = "../contracts" }
+
+[dev-dependencies]
+identity-infra = { path = "../infra" }

@@ -3,7 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use identity_contracts::metadata::IdentityDegradedKind;
-use identity_contracts::protocol::IdentityJobName;
+use identity_contracts::protocol::{
+    IdentityCommandName, IdentityInboundConsumerName, IdentityJobName, IdentityQueryName,
+};
 use identity_contracts::receipts::{
     MaintenanceIssueKind, MaintenanceIssueRef, TraceHandoffIntentRef,
 };
@@ -734,6 +736,122 @@ impl DefaultIdentityDispatchTargetCatalog {
     /// Creates an empty dispatch target catalog.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Returns the formal API command route marker for one public command.
+    pub fn api_command_route_ref(command_name: &IdentityCommandName) -> IdentityApiRouteRef {
+        IdentityApiRouteRef::new(format!("api.command.{}", command_name.as_str()))
+    }
+
+    /// Returns the formal API query route marker for one public query.
+    pub fn api_query_route_ref(query_name: &IdentityQueryName) -> IdentityApiRouteRef {
+        IdentityApiRouteRef::new(format!("api.query.{}", query_name.as_str()))
+    }
+
+    /// Returns the formal worker consumer binding marker for one public consumer.
+    pub fn worker_consumer_binding_ref(
+        consumer_name: &IdentityInboundConsumerName,
+    ) -> IdentityConsumerBindingRef {
+        IdentityConsumerBindingRef::new(format!("worker.consumer.{}", consumer_name.as_str()))
+    }
+
+    /// Returns the formal worker callback binding marker for one public callback.
+    pub fn worker_callback_binding_ref(
+        consumer_name: &IdentityInboundConsumerName,
+    ) -> IdentityConsumerBindingRef {
+        IdentityConsumerBindingRef::new(format!("worker.callback.{}", consumer_name.as_str()))
+    }
+
+    /// Builds the default dispatch catalog for the formal identity protocol inventory.
+    pub fn identity_default() -> Self {
+        let commands = [
+            "EstablishGlobalMember",
+            "UpdateGlobalLifecycleState",
+            "MaintainRoleCapabilitySummary",
+            "AppendCareerRecord",
+            "MaintainMemoryReference",
+            "PrepareTraceHandoff",
+        ];
+        let queries = [
+            "GetGlobalMemberAnchor",
+            "GetGlobalLifecycleSummary",
+            "GetRoleCapabilitySummary",
+            "ListCareerRecords",
+            "ListMemoryReferences",
+            "ReadMemberSummary",
+            "ReadIdentityTrace",
+            "ReadAuditTrail",
+            "GetProjectionState",
+            "GetReferenceResolutionState",
+            "ReadReconciliationReport",
+            "ListPendingIdentityOutbox",
+            "GetIdentityOutboxState",
+            "GetTraceHandoffState",
+        ];
+        let consumers = [
+            "HandleRoleCapabilitySourceChanged",
+            "HandleWorkParticipationAccepted",
+            "HandleMemoryReferenceSourceStateChanged",
+        ];
+        let callbacks = ["HandleArchiveHandoffResult", "HandleTraceHandoffResult"];
+        let jobs = [
+            "RebuildIdentityProjection",
+            "RefreshExternalReferenceState",
+            "RunIdentityReconciliation",
+            "PublishIdentityOutbox",
+            "DeliverTraceHandoff",
+            "RetryIdentityPropagationFailures",
+        ];
+
+        let mut catalog = Self::new();
+        for command_name in commands {
+            let command_name = IdentityCommandName::new(command_name);
+            catalog = catalog.with_api_command_target(
+                Self::api_command_route_ref(&command_name),
+                IdentityDispatchTargetRef::new(format!(
+                    "application.command.{}",
+                    command_name.as_str()
+                )),
+            );
+        }
+        for query_name in queries {
+            let query_name = IdentityQueryName::new(query_name);
+            catalog = catalog.with_api_query_target(
+                Self::api_query_route_ref(&query_name),
+                IdentityDispatchTargetRef::new(format!(
+                    "application.query.{}",
+                    query_name.as_str()
+                )),
+            );
+        }
+        for consumer_name in consumers {
+            let consumer_name = IdentityInboundConsumerName::new(consumer_name);
+            catalog = catalog.with_worker_consumer_target(
+                Self::worker_consumer_binding_ref(&consumer_name),
+                IdentityDispatchTargetRef::new(format!(
+                    "application.consumer.{}",
+                    consumer_name.as_str()
+                )),
+            );
+        }
+        for consumer_name in callbacks {
+            let consumer_name = IdentityInboundConsumerName::new(consumer_name);
+            catalog = catalog.with_worker_callback_target(
+                Self::worker_callback_binding_ref(&consumer_name),
+                IdentityDispatchTargetRef::new(format!(
+                    "application.callback.{}",
+                    consumer_name.as_str()
+                )),
+            );
+        }
+        for job_name in jobs {
+            let job_name = IdentityJobName::new(job_name);
+            catalog = catalog.with_job_target(
+                job_name.clone(),
+                IdentityDispatchTargetRef::new(format!("application.job.{}", job_name.as_str())),
+            );
+        }
+        catalog
     }
 
     /// Registers an API command route target.

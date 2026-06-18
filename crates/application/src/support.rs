@@ -18,14 +18,14 @@ use identity_contracts::protocol::{
 use identity_contracts::receipts::{MaintenanceIssueRef, TraceHandoffIntentRef};
 use identity_contracts::refs::{
     AuditScopeRef, AuditTrailRef, ExternalReferenceRef, GlobalMemberRef, HandoffReceiptRef,
-    IdentityApiRequestMarkerRef, IdentityConsumerBindingRef, IdentityConsumerReceiptRef,
-    IdentityDegradedMarkerRef, IdentityEventEnvelopeMarkerRef, IdentityJobCursorRef,
-    IdentityJobReportRef, IdentityJobRunMetadataRef, IdentityJobRunRef, IdentityJobScopeMarkerRef,
-    IdentityMaintenanceTargetRef, IdentityOutboxRecordRef, IdentityProjectionRef,
-    IdentityReadSubjectRef, IdentityRedactionMarkerRef, IdentitySourceEventRef,
-    IdentityStoredResultRef, IdentityTimestamp, IdentityTraceContextRef, IdentityTraceRecordRef,
-    IdentityTraceSubjectRef, IdentityTruthCursor, ReconciliationReportRef, VisibilityContextRef,
-    VisibilityResultRef, VisibilityScopeRef,
+    IdentityApiRequestMarkerRef, IdentityCanonicalRequestMarkerRef, IdentityConsumerBindingRef,
+    IdentityConsumerReceiptRef, IdentityDegradedMarkerRef, IdentityEventEnvelopeMarkerRef,
+    IdentityJobCursorRef, IdentityJobReportRef, IdentityJobRunMetadataRef, IdentityJobRunRef,
+    IdentityJobScopeMarkerRef, IdentityMaintenanceTargetRef, IdentityOutboxRecordRef,
+    IdentityProjectionRef, IdentityReadSubjectRef, IdentityRedactionMarkerRef,
+    IdentityRequestDigestValue, IdentitySourceEventRef, IdentityStoredResultRef, IdentityTimestamp,
+    IdentityTraceContextRef, IdentityTraceRecordRef, IdentityTraceSubjectRef, IdentityTruthCursor,
+    ReconciliationReportRef, VisibilityContextRef, VisibilityResultRef, VisibilityScopeRef,
 };
 use serde::{Deserialize, Serialize};
 
@@ -146,6 +146,13 @@ string_newtype!(
     ReconciliationReportId,
     "Stable reconciliation report identifier."
 );
+
+impl IdentityRequestMetadataRef {
+    /// Builds a stable metadata marker from one formal entry marker.
+    pub fn from_entry_marker(kind: &str, marker_ref: &str) -> Self {
+        Self::new(format!("entry-metadata:{kind}:{marker_ref}"))
+    }
+}
 
 /// Stable optimistic version attached to persisted application objects or sidecars.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -361,6 +368,49 @@ impl IdentityRequestDigest {
     pub fn conflicts_with(&self, other: &Self) -> bool {
         !self.matches(other)
     }
+
+    /// Builds a stable request digest from body-free entry canonical material.
+    pub fn from_entry_canonical_material(
+        family: &str,
+        schema_version_ref: IdentityProtocolSchemaVersionRef,
+        material: &impl Serialize,
+    ) -> Result<Self, ApplicationError> {
+        let bytes = serde_json::to_vec(material).map_err(|error| {
+            ApplicationError::invalid_request(format!(
+                "failed to canonicalize entry request material: {error}"
+            ))
+        })?;
+        let digest_value = IdentityRequestDigestValue::new(stable_digest_hex(&bytes));
+        let canonical_marker_ref = IdentityCanonicalRequestMarkerRef::new(format!(
+            "entry-canonical:{family}:{}",
+            digest_value.as_str()
+        ));
+        Ok(Self::from_canonical_marker(
+            canonical_marker_ref,
+            digest_value,
+            schema_version_ref,
+            IdentityDigestAlgorithmMarkerRef::new("sha256-v1"),
+        ))
+    }
+}
+
+fn stable_digest_hex(bytes: &[u8]) -> String {
+    const SEEDS: [u64; 4] = [
+        0xcbf29ce484222325,
+        0x84222325cbf29ce4,
+        0x9e3779b97f4a7c15,
+        0x517cc1b727220a95,
+    ];
+    let mut digest = String::new();
+    for seed in SEEDS {
+        let mut hash = seed;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        digest.push_str(&format!("{hash:016x}"));
+    }
+    digest
 }
 
 /// Application operation metadata shared by command, query, consumer, job, and callback flows.
@@ -1900,6 +1950,63 @@ pub struct IdentityApiEntryValidation {
     pub issue_refs: Vec<IdentityEntryValidationIssueRef>,
 }
 
+impl IdentityApiEntryValidation {
+    /// Marks an API entry as ready for dispatch.
+    pub fn dispatchable(
+        api_entry_ref: IdentityApiEntryRef,
+        route_ref: IdentityApiRouteRef,
+    ) -> Self {
+        Self {
+            api_entry_ref,
+            route_ref,
+            validation_kind: IdentityEntryValidationKind::Dispatchable,
+            issue_refs: Vec::new(),
+        }
+    }
+
+    /// Marks an API entry as rejected before dispatch.
+    pub fn rejected_at_entry(
+        api_entry_ref: IdentityApiEntryRef,
+        route_ref: IdentityApiRouteRef,
+        issue_refs: Vec<IdentityEntryValidationIssueRef>,
+    ) -> Self {
+        Self {
+            api_entry_ref,
+            route_ref,
+            validation_kind: IdentityEntryValidationKind::RejectedAtEntry,
+            issue_refs,
+        }
+    }
+
+    /// Marks an API route as not routable in the current catalog.
+    pub fn not_routable(
+        api_entry_ref: IdentityApiEntryRef,
+        route_ref: IdentityApiRouteRef,
+        issue_refs: Vec<IdentityEntryValidationIssueRef>,
+    ) -> Self {
+        Self {
+            api_entry_ref,
+            route_ref,
+            validation_kind: IdentityEntryValidationKind::NotRoutable,
+            issue_refs,
+        }
+    }
+
+    /// Marks the runtime as unavailable before API dispatch.
+    pub fn runtime_unavailable(
+        api_entry_ref: IdentityApiEntryRef,
+        route_ref: IdentityApiRouteRef,
+        issue_refs: Vec<IdentityEntryValidationIssueRef>,
+    ) -> Self {
+        Self {
+            api_entry_ref,
+            route_ref,
+            validation_kind: IdentityEntryValidationKind::RuntimeUnavailable,
+            issue_refs,
+        }
+    }
+}
+
 /// Body-free API dispatch result.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IdentityApiDispatchResult {
@@ -1913,6 +2020,55 @@ pub struct IdentityApiDispatchResult {
     pub dispatch_kind: IdentityEntryDispatchKind,
     /// Safe issue refs.
     pub issue_refs: Vec<IdentityEntryValidationIssueRef>,
+}
+
+impl IdentityApiDispatchResult {
+    /// Marks an API entry as dispatched to the application facade.
+    pub fn dispatched(
+        dispatch_ref: IdentityEntryDispatchRef,
+        api_entry_ref: IdentityApiEntryRef,
+        target_ref: IdentityDispatchTargetRef,
+    ) -> Self {
+        Self {
+            dispatch_ref,
+            api_entry_ref,
+            target_ref,
+            dispatch_kind: IdentityEntryDispatchKind::Dispatched,
+            issue_refs: Vec::new(),
+        }
+    }
+
+    /// Marks an API entry as skipped because the runtime is unavailable.
+    pub fn skipped_runtime_unavailable(
+        dispatch_ref: IdentityEntryDispatchRef,
+        api_entry_ref: IdentityApiEntryRef,
+        target_ref: IdentityDispatchTargetRef,
+        issue_refs: Vec<IdentityEntryValidationIssueRef>,
+    ) -> Self {
+        Self {
+            dispatch_ref,
+            api_entry_ref,
+            target_ref,
+            dispatch_kind: IdentityEntryDispatchKind::SkippedRuntimeUnavailable,
+            issue_refs,
+        }
+    }
+
+    /// Marks an API entry as failed before the application facade was called.
+    pub fn failed_before_application(
+        dispatch_ref: IdentityEntryDispatchRef,
+        api_entry_ref: IdentityApiEntryRef,
+        target_ref: IdentityDispatchTargetRef,
+        issue_refs: Vec<IdentityEntryValidationIssueRef>,
+    ) -> Self {
+        Self {
+            dispatch_ref,
+            api_entry_ref,
+            target_ref,
+            dispatch_kind: IdentityEntryDispatchKind::FailedBeforeApplication,
+            issue_refs,
+        }
+    }
 }
 
 /// Worker entry validation kind.
@@ -1965,6 +2121,77 @@ pub struct IdentityWorkerEntryValidation {
     pub issue_refs: Vec<IdentityEntryValidationIssueRef>,
 }
 
+impl IdentityWorkerEntryValidation {
+    /// Marks a worker entry as ready for dispatch.
+    pub fn dispatchable(
+        worker_entry_ref: IdentityWorkerEntryRef,
+        consumer_binding_ref: IdentityConsumerBindingRef,
+    ) -> Self {
+        Self {
+            worker_entry_ref,
+            consumer_binding_ref,
+            validation_kind: IdentityWorkerEntryValidationKind::Dispatchable,
+            issue_refs: Vec::new(),
+        }
+    }
+
+    /// Marks a worker entry binding as unrecognized.
+    pub fn unrecognized_binding(
+        worker_entry_ref: IdentityWorkerEntryRef,
+        consumer_binding_ref: IdentityConsumerBindingRef,
+        issue_refs: Vec<IdentityEntryValidationIssueRef>,
+    ) -> Self {
+        Self {
+            worker_entry_ref,
+            consumer_binding_ref,
+            validation_kind: IdentityWorkerEntryValidationKind::UnrecognizedBinding,
+            issue_refs,
+        }
+    }
+
+    /// Marks a worker entry as missing a formal dedupe key.
+    pub fn missing_dedupe_key(
+        worker_entry_ref: IdentityWorkerEntryRef,
+        consumer_binding_ref: IdentityConsumerBindingRef,
+        issue_refs: Vec<IdentityEntryValidationIssueRef>,
+    ) -> Self {
+        Self {
+            worker_entry_ref,
+            consumer_binding_ref,
+            validation_kind: IdentityWorkerEntryValidationKind::MissingDedupeKey,
+            issue_refs,
+        }
+    }
+
+    /// Marks a worker entry as carrying an invalid or mismatched envelope marker.
+    pub fn invalid_envelope_marker(
+        worker_entry_ref: IdentityWorkerEntryRef,
+        consumer_binding_ref: IdentityConsumerBindingRef,
+        issue_refs: Vec<IdentityEntryValidationIssueRef>,
+    ) -> Self {
+        Self {
+            worker_entry_ref,
+            consumer_binding_ref,
+            validation_kind: IdentityWorkerEntryValidationKind::InvalidEnvelopeMarker,
+            issue_refs,
+        }
+    }
+
+    /// Marks the runtime as unavailable before worker dispatch.
+    pub fn runtime_unavailable(
+        worker_entry_ref: IdentityWorkerEntryRef,
+        consumer_binding_ref: IdentityConsumerBindingRef,
+        issue_refs: Vec<IdentityEntryValidationIssueRef>,
+    ) -> Self {
+        Self {
+            worker_entry_ref,
+            consumer_binding_ref,
+            validation_kind: IdentityWorkerEntryValidationKind::RuntimeUnavailable,
+            issue_refs,
+        }
+    }
+}
+
 /// Body-free worker dispatch result.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IdentityWorkerDispatchResult {
@@ -1978,6 +2205,55 @@ pub struct IdentityWorkerDispatchResult {
     pub dispatch_kind: IdentityEntryDispatchKind,
     /// Safe issue refs.
     pub issue_refs: Vec<IdentityEntryValidationIssueRef>,
+}
+
+impl IdentityWorkerDispatchResult {
+    /// Marks a worker entry as dispatched to the application facade.
+    pub fn dispatched(
+        dispatch_ref: IdentityWorkerDispatchRef,
+        worker_entry_ref: IdentityWorkerEntryRef,
+        target_ref: IdentityDispatchTargetRef,
+    ) -> Self {
+        Self {
+            dispatch_ref,
+            worker_entry_ref,
+            target_ref,
+            dispatch_kind: IdentityEntryDispatchKind::Dispatched,
+            issue_refs: Vec::new(),
+        }
+    }
+
+    /// Marks a worker entry as skipped because the runtime is unavailable.
+    pub fn skipped_runtime_unavailable(
+        dispatch_ref: IdentityWorkerDispatchRef,
+        worker_entry_ref: IdentityWorkerEntryRef,
+        target_ref: IdentityDispatchTargetRef,
+        issue_refs: Vec<IdentityEntryValidationIssueRef>,
+    ) -> Self {
+        Self {
+            dispatch_ref,
+            worker_entry_ref,
+            target_ref,
+            dispatch_kind: IdentityEntryDispatchKind::SkippedRuntimeUnavailable,
+            issue_refs,
+        }
+    }
+
+    /// Marks a worker entry as failed before the application facade was called.
+    pub fn failed_before_application(
+        dispatch_ref: IdentityWorkerDispatchRef,
+        worker_entry_ref: IdentityWorkerEntryRef,
+        target_ref: IdentityDispatchTargetRef,
+        issue_refs: Vec<IdentityEntryValidationIssueRef>,
+    ) -> Self {
+        Self {
+            dispatch_ref,
+            worker_entry_ref,
+            target_ref,
+            dispatch_kind: IdentityEntryDispatchKind::FailedBeforeApplication,
+            issue_refs,
+        }
+    }
 }
 
 /// Job entry validation kind.
@@ -2034,6 +2310,88 @@ pub struct IdentityJobEntryValidation {
     pub issue_refs: Vec<IdentityEntryValidationIssueRef>,
 }
 
+impl IdentityJobEntryValidation {
+    /// Marks a job entry as ready for dispatch.
+    pub fn dispatchable(job_entry_ref: IdentityJobEntryRef, job_name: IdentityJobName) -> Self {
+        Self {
+            job_entry_ref,
+            job_name,
+            validation_kind: IdentityJobEntryValidationKind::Dispatchable,
+            issue_refs: Vec::new(),
+        }
+    }
+
+    /// Marks a job name as unknown to the current catalog.
+    pub fn unknown_job(
+        job_entry_ref: IdentityJobEntryRef,
+        job_name: IdentityJobName,
+        issue_refs: Vec<IdentityEntryValidationIssueRef>,
+    ) -> Self {
+        Self {
+            job_entry_ref,
+            job_name,
+            validation_kind: IdentityJobEntryValidationKind::UnknownJob,
+            issue_refs,
+        }
+    }
+
+    /// Marks a job scope as invalid before dispatch.
+    pub fn invalid_scope(
+        job_entry_ref: IdentityJobEntryRef,
+        job_name: IdentityJobName,
+        issue_refs: Vec<IdentityEntryValidationIssueRef>,
+    ) -> Self {
+        Self {
+            job_entry_ref,
+            job_name,
+            validation_kind: IdentityJobEntryValidationKind::InvalidScope,
+            issue_refs,
+        }
+    }
+
+    /// Marks a job cursor as invalid before dispatch.
+    pub fn invalid_cursor(
+        job_entry_ref: IdentityJobEntryRef,
+        job_name: IdentityJobName,
+        issue_refs: Vec<IdentityEntryValidationIssueRef>,
+    ) -> Self {
+        Self {
+            job_entry_ref,
+            job_name,
+            validation_kind: IdentityJobEntryValidationKind::InvalidCursor,
+            issue_refs,
+        }
+    }
+
+    /// Marks a job entry as missing a formal idempotency key.
+    pub fn missing_idempotency_key(
+        job_entry_ref: IdentityJobEntryRef,
+        job_name: IdentityJobName,
+        issue_refs: Vec<IdentityEntryValidationIssueRef>,
+    ) -> Self {
+        Self {
+            job_entry_ref,
+            job_name,
+            validation_kind: IdentityJobEntryValidationKind::MissingIdempotencyKey,
+            issue_refs,
+        }
+    }
+
+    /// Marks the runtime as unavailable before job dispatch.
+    pub fn runtime_unavailable(
+        job_entry_ref: IdentityJobEntryRef,
+        job_name: IdentityJobName,
+        issue_refs: Vec<IdentityEntryValidationIssueRef>,
+    ) -> Self {
+        Self {
+            job_entry_ref,
+            job_name,
+            validation_kind: IdentityJobEntryValidationKind::RuntimeUnavailable,
+            issue_refs,
+        }
+    }
+}
+
 /// Body-free job dispatch result.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IdentityJobDispatchResult {
@@ -2047,6 +2405,55 @@ pub struct IdentityJobDispatchResult {
     pub dispatch_kind: IdentityEntryDispatchKind,
     /// Safe issue refs.
     pub issue_refs: Vec<IdentityEntryValidationIssueRef>,
+}
+
+impl IdentityJobDispatchResult {
+    /// Marks a job entry as dispatched to the application facade.
+    pub fn dispatched(
+        dispatch_ref: IdentityJobDispatchRef,
+        job_entry_ref: IdentityJobEntryRef,
+        target_ref: IdentityDispatchTargetRef,
+    ) -> Self {
+        Self {
+            dispatch_ref,
+            job_entry_ref,
+            target_ref,
+            dispatch_kind: IdentityEntryDispatchKind::Dispatched,
+            issue_refs: Vec::new(),
+        }
+    }
+
+    /// Marks a job entry as skipped because the runtime is unavailable.
+    pub fn skipped_runtime_unavailable(
+        dispatch_ref: IdentityJobDispatchRef,
+        job_entry_ref: IdentityJobEntryRef,
+        target_ref: IdentityDispatchTargetRef,
+        issue_refs: Vec<IdentityEntryValidationIssueRef>,
+    ) -> Self {
+        Self {
+            dispatch_ref,
+            job_entry_ref,
+            target_ref,
+            dispatch_kind: IdentityEntryDispatchKind::SkippedRuntimeUnavailable,
+            issue_refs,
+        }
+    }
+
+    /// Marks a job entry as failed before the application facade was called.
+    pub fn failed_before_application(
+        dispatch_ref: IdentityJobDispatchRef,
+        job_entry_ref: IdentityJobEntryRef,
+        target_ref: IdentityDispatchTargetRef,
+        issue_refs: Vec<IdentityEntryValidationIssueRef>,
+    ) -> Self {
+        Self {
+            dispatch_ref,
+            job_entry_ref,
+            target_ref,
+            dispatch_kind: IdentityEntryDispatchKind::FailedBeforeApplication,
+            issue_refs,
+        }
+    }
 }
 
 /// Shared entry guard that prevents dispatch from bypassing the application facade.
