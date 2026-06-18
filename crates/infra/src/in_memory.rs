@@ -10920,6 +10920,80 @@ mod tests {
     }
 
     #[test]
+    fn deliver_trace_handoff_job_maps_retryable_failure_with_attempt() {
+        let intent = handoff_intent();
+        let runtime = IdentityInMemoryRuntime::builder()
+            .seed_handoff_intent(intent.clone(), IdentityVersion::new(1))
+            .seed_adapter_availability(adapter_availability())
+            .seed_handoff_delivery_outcome(
+                intent.handoff_intent_ref.clone(),
+                HandoffDeliveryOutcome::RetryableFailed {
+                    attempt_ref: handoff_attempt_ref("handoff-attempt-retryable"),
+                    issue_ref: HandoffIssueRef::new(identity_source_ref(
+                        IdentitySourceOwner::Identity,
+                        "handoff-issue-retryable",
+                    )),
+                },
+            )
+            .build();
+        let mapper = DefaultIdentityMaintenanceIssueMapper;
+        let service = job_service(&runtime, &mapper);
+
+        let response = service
+            .deliver_trace_handoff(
+                typed_job_request(
+                    "DeliverTraceHandoff",
+                    "idem-job-handoff-retryable",
+                    "job-run-handoff-retryable",
+                    "job-handoff-retryable",
+                    DeliverTraceHandoffJobInput {
+                        delivery_scope: IdentityHandoffDeliveryScopeDto::ExplicitIntentRefs(vec![
+                            intent.handoff_intent_ref.clone(),
+                        ]),
+                        page: job_page(10),
+                    },
+                ),
+                job_context(
+                    "DeliverTraceHandoff",
+                    "idem-job-handoff-retryable",
+                    "job-handoff-retryable",
+                    "job-run-handoff-retryable",
+                ),
+            )
+            .expect("deliver retryable handoff");
+
+        assert_eq!(
+            response.output.disposition,
+            IdentityJobRunDisposition::RetryableFailed
+        );
+        assert!(response.output.delivered_handoff_intent_refs.is_empty());
+        assert_eq!(
+            response.output.failed_handoff_intent_refs,
+            vec![intent.handoff_intent_ref.clone()]
+        );
+        assert_eq!(
+            runtime
+                .get_handoff_intent_with_version(intent.handoff_intent_ref.clone())
+                .expect("load handoff")
+                .expect("handoff")
+                .value
+                .handoff_state
+                .state_kind,
+            HandoffStateKind::RetryableFailed
+        );
+        assert!(
+            runtime
+                .get_handoff_intent_with_version(intent.handoff_intent_ref.clone())
+                .expect("load handoff")
+                .expect("handoff")
+                .value
+                .handoff_state
+                .attempt_ref
+                .is_some()
+        );
+    }
+
+    #[test]
     fn retry_propagation_job_retries_only_retryable_outbox_family() {
         let retryable = outbox_record(
             "retry-family",
