@@ -859,16 +859,27 @@ impl IdentityDispatchTargetCatalogPort for DefaultIdentityDispatchTargetCatalog 
 
     fn assert_application_target(
         &self,
-        _surface_kind: IdentityEntrySurfaceKind,
+        surface_kind: IdentityEntrySurfaceKind,
         target_ref: IdentityDispatchTargetRef,
     ) -> Result<(), ApplicationError> {
-        if self.allowed_targets.contains(target_ref.as_str()) {
-            Ok(())
-        } else {
+        if !self.allowed_targets.contains(target_ref.as_str()) {
             Err(ApplicationError::invalid_request(format!(
                 "unknown application target: {}",
                 target_ref.as_str()
             )))
+        } else if !IdentityEntrySurfaceKind::is_application_target(&target_ref) {
+            Err(ApplicationError::invalid_request(format!(
+                "target is not an application service target: {}",
+                target_ref.as_str()
+            )))
+        } else if !surface_kind.matches_application_target(&target_ref) {
+            Err(ApplicationError::invalid_request(format!(
+                "target {} does not match entry surface {:?}",
+                target_ref.as_str(),
+                surface_kind
+            )))
+        } else {
+            Ok(())
         }
     }
 }
@@ -879,8 +890,8 @@ mod tests {
     use identity_contracts::refs::{
         ExternalReferenceKind, ExternalReferenceRef, ExternalSourceRef, GlobalMemberId,
         GlobalMemberRef, HandoffReceiptRef, IdentityConsumerBindingRef, IdentityJobRunRef,
-        IdentityProjectionRef, IdentitySourceOwner, IdentitySourceRef, IdentityTraceSubjectRef,
-        RoleCapabilitySourceSnapshotId, RoleCapabilitySummaryId,
+        IdentityProjectionKind, IdentityProjectionRef, IdentitySourceOwner, IdentitySourceRef,
+        IdentityTraceSubjectRef, RoleCapabilitySourceSnapshotId, RoleCapabilitySummaryId,
     };
 
     use super::{
@@ -947,16 +958,25 @@ mod tests {
     #[test]
     fn marker_subject_mapper_uses_formal_marker_keys() {
         let mapper = DefaultIdentityMarkerSubjectMapper;
-        let source_ref = IdentitySourceRef::new(
+        let work_source_ref = IdentitySourceRef::new(
             IdentitySourceOwner::Work,
             ExternalSourceRef::new("source-1".to_owned()).expect("valid external source"),
         )
         .expect("valid identity source");
-        let external_reference_ref =
-            ExternalReferenceRef::new(ExternalReferenceKind::WorkParticipation, source_ref.clone());
+        let projection_source_ref = IdentitySourceRef::new(
+            IdentitySourceOwner::Identity,
+            ExternalSourceRef::new("projection-1".to_owned()).expect("valid external source"),
+        )
+        .expect("valid projection source");
+        let external_reference_ref = ExternalReferenceRef::new(
+            ExternalReferenceKind::WorkParticipation,
+            work_source_ref.clone(),
+        );
 
         assert_eq!(
-            mapper.source_marker_subject(source_ref.clone()).as_str(),
+            mapper
+                .source_marker_subject(work_source_ref.clone())
+                .as_str(),
             "identity:marker:source:source-1"
         );
         assert_eq!(
@@ -967,7 +987,13 @@ mod tests {
         );
         assert_eq!(
             mapper
-                .projection_marker_subject(IdentityProjectionRef::new("projection-1"))
+                .projection_marker_subject(
+                    IdentityProjectionRef::new(
+                        IdentityProjectionKind::MemberSummary,
+                        projection_source_ref,
+                    )
+                    .expect("valid projection ref"),
+                )
                 .as_str(),
             "identity:marker:projection:projection-1"
         );
@@ -1054,5 +1080,22 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn dispatch_target_catalog_rejects_cross_surface_target() {
+        let catalog = DefaultIdentityDispatchTargetCatalog::new().with_api_command_target(
+            IdentityApiRouteRef::new("api.command.member.establish"),
+            IdentityDispatchTargetRef::new("application.command.establish_global_member"),
+        );
+
+        let error = catalog
+            .assert_application_target(
+                crate::support::IdentityEntrySurfaceKind::ApiQuery,
+                IdentityDispatchTargetRef::new("application.command.establish_global_member"),
+            )
+            .expect_err("surface mismatch must fail");
+
+        assert!(error.to_string().contains("does not match entry surface"));
     }
 }

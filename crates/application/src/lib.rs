@@ -5,6 +5,7 @@
 pub mod command;
 pub mod consumer;
 pub mod errors;
+pub mod facade;
 pub mod jobs;
 pub mod mapper;
 pub mod outbound_material;
@@ -12,11 +13,16 @@ pub mod ports;
 pub mod query;
 pub mod support;
 
-pub use crate::command::{
-    IdentityApplicationFacade, IdentityCommandService, IdentityCommandServiceDeps,
-};
+pub use crate::command::{IdentityCommandService, IdentityCommandServiceDeps};
 pub use crate::consumer::{IdentityConsumerService, IdentityConsumerServiceDeps};
 pub use crate::errors::{ApplicationError, ApplicationErrorKind};
+pub use crate::facade::{
+    IdentityApplicationCallbackRequest, IdentityApplicationCommandRequest,
+    IdentityApplicationCommandResponse, IdentityApplicationFacade,
+    IdentityApplicationInboundEventRequest, IdentityApplicationJobRequest,
+    IdentityApplicationJobResponse, IdentityApplicationQueryRequest,
+    IdentityApplicationQueryResponse,
+};
 pub use crate::jobs::{IdentityJobExecution, IdentityJobService, IdentityJobServiceDeps};
 pub use crate::mapper::{
     DefaultIdentityAcceptedAuditTrailMarkerMapper, DefaultIdentityDispatchTargetCatalog,
@@ -41,13 +47,14 @@ pub use crate::support::{
     IdentityCommandAcceptedResultEnvelope, IdentityCommandEffectSummary,
     IdentityCommandEffectSummaryRef, IdentityCommandRejectedResultEnvelope,
     IdentityCommandTypedResult, IdentityConsumerReceiptEnvelope, IdentityDispatchTargetRef,
-    IdentityEntrySurfaceKind, IdentityIdempotencyKey, IdentityIdempotencyRecord,
-    IdentityIdempotencyRecordRef, IdentityIdempotencyStateKind, IdentityJobRunReport,
-    IdentityOperationContext, IdentityOperationContextRef, IdentityOperationName,
-    IdentityProjectionRefSet, IdentityQueryMaterialDegradationSummary, IdentityReadDispositionKind,
-    IdentityRepositoryCursor, IdentityRepositoryPage, IdentityRequestDigest,
-    IdentityRequestMetadataRef, IdentityStoredResultKind, IdentityStoredSurfaceMarkerRef,
-    IdentityTransactionRef, IdentityTruthRef, IdentityVersion, IdentityVersionedRef,
-    IdentityVisibilityDecision, Page, StoredIdentityOperationResult, Versioned,
+    IdentityEntryDispatchGuard, IdentityEntrySurfaceKind, IdentityIdempotencyKey,
+    IdentityIdempotencyRecord, IdentityIdempotencyRecordRef, IdentityIdempotencyStateKind,
+    IdentityJobRunReport, IdentityOperationContext, IdentityOperationContextRef,
+    IdentityOperationName, IdentityProjectionRefSet, IdentityQueryMaterialDegradationSummary,
+    IdentityReadDispositionKind, IdentityRepositoryCursor, IdentityRepositoryPage,
+    IdentityRequestDigest, IdentityRequestMetadataRef, IdentityStoredResultKind,
+    IdentityStoredSurfaceMarkerRef, IdentityTransactionRef, IdentityTruthRef, IdentityVersion,
+    IdentityVersionedRef, IdentityVisibilityDecision, Page, StoredIdentityOperationResult,
+    Versioned,
 };
 pub use identity_contracts::refs::IdentityReadSubjectRef;

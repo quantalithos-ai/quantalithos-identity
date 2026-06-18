@@ -9,7 +9,6 @@ use identity_contracts::commands::{
     MemoryReferenceCommandResult, PrepareTraceHandoffRequest, RoleCapabilityCommandResult,
     TraceHandoffCommandResult, UpdateGlobalLifecycleStateRequest,
 };
-use identity_contracts::jobs::{IdentityJobRequest, IdentityJobResponse};
 use identity_contracts::metadata::{
     IdentityDegradedKind, IdentityDegradedMarker, IdentityProtocolRejection,
     IdentityProtocolRejectionKind, IdentityProtocolValidationIssueRef,
@@ -49,7 +48,6 @@ use identity_domain::role_capability::{
 use identity_domain::trace::IdentityTraceRecord;
 
 use crate::errors::{ApplicationError, ApplicationErrorKind};
-use crate::jobs::{IdentityJobExecution, IdentityJobService};
 use crate::outbound_material::AcceptedOutboundMaterialKind;
 use crate::ports::{
     CareerRecordRepository, GlobalLifecycleRepository, GlobalMemberRepository,
@@ -64,9 +62,8 @@ use crate::ports::{
 use crate::support::{
     IdempotencyReserveOutcome, IdentityAcceptedEffectKind, IdentityAcceptedSubjectRefs,
     IdentityCommandAcceptedResultEnvelope, IdentityCommandEffectSummary,
-    IdentityCommandRejectedResultEnvelope, IdentityCommandTypedResult, IdentityJobRunReport,
-    IdentityOperationContext, IdentityRequestDigest, IdentityTruthRef,
-    StoredIdentityOperationResult, Versioned,
+    IdentityCommandRejectedResultEnvelope, IdentityCommandTypedResult, IdentityOperationContext,
+    IdentityRequestDigest, IdentityTruthRef, StoredIdentityOperationResult, Versioned,
 };
 
 /// Shared dependencies for command write-path orchestration.
@@ -3877,63 +3874,6 @@ impl<'a> IdentityCommandService<'a> {
     }
 }
 
-/// Application-facade shell that will route command entrypoints through the shared command service.
-pub struct IdentityApplicationFacade<'a> {
-    command_service: IdentityCommandService<'a>,
-    job_service: Option<IdentityJobService<'a>>,
-}
-
-impl<'a> IdentityApplicationFacade<'a> {
-    /// Creates an application facade from the shared command service.
-    pub fn new(command_service: IdentityCommandService<'a>) -> Self {
-        Self {
-            command_service,
-            job_service: None,
-        }
-    }
-
-    /// Attaches the shared operations-job service used by later entry wiring.
-    pub fn with_job_service(mut self, job_service: IdentityJobService<'a>) -> Self {
-        self.job_service = Some(job_service);
-        self
-    }
-
-    /// Returns the command service used by the facade shell.
-    pub fn command_service(&self) -> &IdentityCommandService<'a> {
-        &self.command_service
-    }
-
-    /// Returns the configured job service, if this boundary wired one.
-    pub fn job_service(&self) -> Option<&IdentityJobService<'a>> {
-        self.job_service.as_ref()
-    }
-
-    /// Dispatches one operations job through the shared application job scaffold.
-    pub fn dispatch_job<TRequest, TOutput, FReplay, FHandler>(
-        &self,
-        context: IdentityOperationContext,
-        request: IdentityJobRequest<TRequest>,
-        replay_output: FReplay,
-        handler: FHandler,
-    ) -> Result<IdentityJobResponse<TOutput>, ApplicationError>
-    where
-        FReplay: FnOnce(&IdentityJobRunReport) -> Result<TOutput, ApplicationError>,
-        FHandler: FnOnce(
-            &IdentityJobRequest<TRequest>,
-            Versioned<crate::support::IdentityIdempotencyRecord>,
-            IdentityTimestamp,
-            IdentityJobRunReport,
-            &dyn IdentityUnitOfWork,
-        ) -> Result<IdentityJobExecution<TOutput>, ApplicationError>,
-    {
-        let service = self
-            .job_service
-            .as_ref()
-            .ok_or_else(|| ApplicationError::invalid_request("job service is not configured"))?;
-        service.dispatch_job_scaffold(context, request, replay_output, handler)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use core_contracts::actor::{ActorKind, ActorRef};
@@ -3954,7 +3894,7 @@ mod tests {
     use identity_contracts::refs::{
         ExternalSourceRef, GlobalLifecycleStateKind, GlobalMemberId, GlobalMemberRef,
         IdentityApiRequestMarkerRef, IdentityAuditSubjectRef, IdentityCanonicalRequestMarkerRef,
-        IdentityRequestDigestValue, IdentitySourceOwner, IdentitySourceRef,
+        IdentityProjectionKind, IdentityRequestDigestValue, IdentitySourceOwner, IdentitySourceRef,
         IdentityStoredResultRef, IdentityTimestamp, IdentityTruthCursor, LifecycleReasonKind,
         LifecycleReasonRef,
     };
@@ -3975,6 +3915,14 @@ mod tests {
             ExternalSourceRef::new("source-1".to_owned()).expect("valid external source ref"),
         )
         .expect("valid source ref")
+    }
+
+    fn projection_ref() -> identity_contracts::refs::IdentityProjectionRef {
+        identity_contracts::refs::IdentityProjectionRef::new(
+            IdentityProjectionKind::MemberSummary,
+            source_ref(),
+        )
+        .expect("valid projection ref")
     }
 
     fn lifecycle_reason_ref() -> LifecycleReasonRef {
@@ -4065,7 +4013,7 @@ mod tests {
             vec!["trace-1".into()],
             None,
             vec!["outbox-1".into()],
-            vec!["projection-1".into()],
+            vec![projection_ref()],
             IdentityStoredResultRef::new("stored-result-1"),
         );
         let result = GlobalMemberCommandResult {

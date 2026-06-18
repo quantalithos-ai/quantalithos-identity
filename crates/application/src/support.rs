@@ -268,6 +268,42 @@ pub enum IdentityEntrySurfaceKind {
     OperationsJob,
 }
 
+impl IdentityEntrySurfaceKind {
+    fn application_target_prefix(self) -> &'static str {
+        match self {
+            Self::ApiCommand => "application.command.",
+            Self::ApiQuery => "application.query.",
+            Self::WorkerConsumer => "application.consumer.",
+            Self::WorkerCallback => "application.callback.",
+            Self::OperationsJob => "application.job.",
+        }
+    }
+
+    /// Returns whether the target points at any formal application service family.
+    pub fn is_application_target(target_ref: &IdentityDispatchTargetRef) -> bool {
+        [
+            Self::ApiCommand,
+            Self::ApiQuery,
+            Self::WorkerConsumer,
+            Self::WorkerCallback,
+            Self::OperationsJob,
+        ]
+        .iter()
+        .any(|surface_kind| {
+            target_ref
+                .as_str()
+                .starts_with(surface_kind.application_target_prefix())
+        })
+    }
+
+    /// Returns whether the target belongs to the application family allowed for this surface.
+    pub fn matches_application_target(self, target_ref: &IdentityDispatchTargetRef) -> bool {
+        target_ref
+            .as_str()
+            .starts_with(self.application_target_prefix())
+    }
+}
+
 /// Stable application-local idempotency key wrapper.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -2013,6 +2049,129 @@ pub struct IdentityJobDispatchResult {
     pub issue_refs: Vec<IdentityEntryValidationIssueRef>,
 }
 
+/// Shared entry guard that prevents dispatch from bypassing the application facade.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityEntryDispatchGuard {
+    /// Entry surface being dispatched.
+    pub surface_kind: IdentityEntrySurfaceKind,
+    /// Application dispatch target resolved by the catalog.
+    pub target_ref: IdentityDispatchTargetRef,
+    /// Runtime assembly state copied from the current builder/runtime shell.
+    pub runtime_state_kind: IdentityRuntimeAssemblyStateKind,
+    /// Adapter refs that were checked during runtime assembly.
+    pub adapter_availability_refs: Vec<IdentityAdapterRef>,
+}
+
+impl IdentityEntryDispatchGuard {
+    /// Creates a guard for one API entry dispatch attempt.
+    pub fn for_api(
+        context: &IdentityApiEntryContext,
+        runtime_state: &IdentityRuntimeAssemblyState,
+        target_ref: IdentityDispatchTargetRef,
+    ) -> Self {
+        Self {
+            surface_kind: context.surface_kind,
+            target_ref,
+            runtime_state_kind: runtime_state.state_kind,
+            adapter_availability_refs: runtime_state.adapter_availability_refs.clone(),
+        }
+    }
+
+    /// Creates a guard for one worker entry dispatch attempt.
+    pub fn for_worker(
+        context: &IdentityWorkerEntryContext,
+        runtime_state: &IdentityRuntimeAssemblyState,
+        target_ref: IdentityDispatchTargetRef,
+    ) -> Self {
+        Self {
+            surface_kind: context.surface_kind,
+            target_ref,
+            runtime_state_kind: runtime_state.state_kind,
+            adapter_availability_refs: runtime_state.adapter_availability_refs.clone(),
+        }
+    }
+
+    /// Creates a guard for one operations job dispatch attempt.
+    pub fn for_job(
+        _context: &IdentityJobEntryContext,
+        runtime_state: &IdentityRuntimeAssemblyState,
+        target_ref: IdentityDispatchTargetRef,
+    ) -> Self {
+        Self {
+            surface_kind: IdentityEntrySurfaceKind::OperationsJob,
+            target_ref,
+            runtime_state_kind: runtime_state.state_kind,
+            adapter_availability_refs: runtime_state.adapter_availability_refs.clone(),
+        }
+    }
+
+    /// Asserts that the target points to a formal application service family.
+    pub fn assert_application_dispatch_only(&self) -> Result<(), IdentityEntryValidationIssueRef> {
+        if IdentityEntrySurfaceKind::is_application_target(&self.target_ref) {
+            Ok(())
+        } else {
+            Err(Self::issue("dispatch-target-not-application"))
+        }
+    }
+
+    /// Asserts that the runtime has reached a dispatchable assembled state.
+    pub fn assert_runtime_dispatchable(&self) -> Result<(), IdentityEntryValidationIssueRef> {
+        if matches!(
+            self.runtime_state_kind,
+            IdentityRuntimeAssemblyStateKind::Assembled
+                | IdentityRuntimeAssemblyStateKind::Degraded
+        ) {
+            Ok(())
+        } else {
+            Err(Self::issue("runtime-not-dispatchable"))
+        }
+    }
+
+    /// Asserts that the target family matches the entry surface.
+    pub fn assert_surface_target_matches(&self) -> Result<(), IdentityEntryValidationIssueRef> {
+        if self
+            .surface_kind
+            .matches_application_target(&self.target_ref)
+        {
+            Ok(())
+        } else {
+            Err(Self::issue("dispatch-target-surface-mismatch"))
+        }
+    }
+
+    /// Collects deterministic safe issue markers for the current dispatch attempt.
+    pub fn issue_refs(&self) -> Vec<IdentityEntryValidationIssueRef> {
+        let mut issue_refs = Vec::new();
+        let application_check = self.assert_application_dispatch_only();
+        if let Err(issue_ref) = application_check {
+            issue_refs.push(issue_ref);
+        }
+        if let Err(issue_ref) = self.assert_runtime_dispatchable() {
+            issue_refs.push(issue_ref);
+        }
+        if IdentityEntrySurfaceKind::is_application_target(&self.target_ref) {
+            if let Err(issue_ref) = self.assert_surface_target_matches() {
+                issue_refs.push(issue_ref);
+            }
+        }
+        issue_refs
+    }
+
+    /// Returns `Ok(())` when the entry may call the application facade.
+    pub fn validate(&self) -> Result<(), Vec<IdentityEntryValidationIssueRef>> {
+        let issue_refs = self.issue_refs();
+        if issue_refs.is_empty() {
+            Ok(())
+        } else {
+            Err(issue_refs)
+        }
+    }
+
+    fn issue(code: &str) -> IdentityEntryValidationIssueRef {
+        IdentityEntryValidationIssueRef::new(format!("entry-dispatch:{code}"))
+    }
+}
+
 /// Convenience alias for API request markers that already exist in shared contracts.
 pub type IdentityPublicRequestMarkerRef = IdentityApiRequestMarkerRef;
 /// Convenience alias for public consumer binding refs that already exist in shared contracts.
@@ -2021,3 +2180,120 @@ pub type IdentityPublicConsumerBindingRef = IdentityConsumerBindingRef;
 pub type IdentityPublicConsumerReceiptRef = IdentityConsumerReceiptRef;
 /// Convenience alias for public job metadata refs that already exist in shared contracts.
 pub type IdentityPublicJobRunMetadataRef = IdentityJobRunMetadataRef;
+
+#[cfg(test)]
+mod tests {
+    use core_contracts::actor::{ActorKind, ActorRef};
+    use core_contracts::metadata::IdempotencyKey;
+
+    use super::{
+        IdentityAdapterRef, IdentityApiEntryContext, IdentityApiRouteRef,
+        IdentityConfigEvidenceRef, IdentityDispatchTargetRef, IdentityEntryDispatchGuard,
+        IdentityEntrySurfaceKind, IdentityIdempotencyKey, IdentityRequestMetadataRef,
+        IdentityRuntimeAssemblyRef, IdentityRuntimeAssemblyState, IdentityRuntimeConfigShell,
+        IdentityRuntimeProfileRef,
+    };
+    use crate::support::IdentityRuntimeAssemblyStateKind;
+    use identity_contracts::refs::{
+        IdentityApiRequestMarkerRef, IdentityTimestamp, VisibilityContextRef,
+    };
+
+    fn actor_ref() -> ActorRef {
+        ActorRef::new("actor-1", ActorKind::Human)
+    }
+
+    fn validated_shell() -> IdentityRuntimeConfigShell {
+        IdentityRuntimeConfigShell::validated(
+            IdentityRuntimeProfileRef::new("profile.test"),
+            IdentityConfigEvidenceRef::new("config-evidence.test"),
+            Vec::new(),
+            Some(super::IdentityApiRouteCatalogRef::new("api-catalog")),
+            None,
+            None,
+        )
+    }
+
+    fn assembled_runtime() -> IdentityRuntimeAssemblyState {
+        IdentityRuntimeAssemblyState::assembled(
+            IdentityRuntimeAssemblyRef::new("runtime-1"),
+            &validated_shell(),
+            vec![IdentityAdapterRef::new("adapter.runtime")],
+            IdentityTimestamp::from_clock(1).expect("valid timestamp"),
+        )
+    }
+
+    fn api_context(surface_kind: IdentityEntrySurfaceKind) -> IdentityApiEntryContext {
+        IdentityApiEntryContext {
+            api_entry_ref: super::IdentityApiEntryRef::new("api-entry-1"),
+            route_ref: IdentityApiRouteRef::new("api.route.test"),
+            surface_kind,
+            request_marker_ref: IdentityApiRequestMarkerRef::new("request-marker-1"),
+            actor_ref: actor_ref(),
+            request_metadata_ref: IdentityRequestMetadataRef::new("request-metadata-1"),
+            idempotency_key: Some(IdentityIdempotencyKey::new(IdempotencyKey::new(
+                "idem-1".to_owned(),
+            ))),
+            visibility_context_ref: Some(VisibilityContextRef::new("visibility-context-1")),
+            received_at: IdentityTimestamp::from_clock(1).expect("valid timestamp"),
+        }
+    }
+
+    #[test]
+    fn entry_surface_matches_expected_application_target_family() {
+        assert!(
+            IdentityEntrySurfaceKind::ApiCommand.matches_application_target(
+                &IdentityDispatchTargetRef::new("application.command.establish_global_member")
+            )
+        );
+        assert!(
+            IdentityEntrySurfaceKind::ApiQuery.matches_application_target(
+                &IdentityDispatchTargetRef::new("application.query.read_member_summary")
+            )
+        );
+        assert!(
+            !IdentityEntrySurfaceKind::ApiQuery.matches_application_target(
+                &IdentityDispatchTargetRef::new("application.command.establish_global_member")
+            )
+        );
+    }
+
+    #[test]
+    fn dispatch_guard_accepts_matching_assembled_api_dispatch() {
+        let guard = IdentityEntryDispatchGuard::for_api(
+            &api_context(IdentityEntrySurfaceKind::ApiCommand),
+            &assembled_runtime(),
+            IdentityDispatchTargetRef::new("application.command.establish_global_member"),
+        );
+
+        assert_eq!(
+            guard.runtime_state_kind,
+            IdentityRuntimeAssemblyStateKind::Assembled
+        );
+        assert!(guard.validate().is_ok());
+    }
+
+    #[test]
+    fn dispatch_guard_rejects_not_started_runtime_and_cross_surface_target() {
+        let runtime_state = IdentityRuntimeAssemblyState::not_started(
+            IdentityRuntimeAssemblyRef::new("runtime-1"),
+            IdentityRuntimeProfileRef::new("profile.test"),
+        );
+        let guard = IdentityEntryDispatchGuard::for_api(
+            &api_context(IdentityEntrySurfaceKind::ApiQuery),
+            &runtime_state,
+            IdentityDispatchTargetRef::new("application.command.establish_global_member"),
+        );
+
+        let issue_refs = guard.validate().expect_err("guard must reject");
+        assert!(
+            issue_refs.contains(&super::IdentityEntryValidationIssueRef::new(
+                "entry-dispatch:runtime-not-dispatchable"
+            ))
+        );
+        assert!(
+            issue_refs.contains(&super::IdentityEntryValidationIssueRef::new(
+                "entry-dispatch:dispatch-target-surface-mismatch"
+            ))
+        );
+    }
+}
