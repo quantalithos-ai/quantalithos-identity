@@ -46,6 +46,15 @@ def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def load_evidence_items(path: Path) -> list[dict[str, Any]]:
+    payload = read_json(path)
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict) and isinstance(payload.get("evidence"), list):
+        return payload["evidence"]
+    raise ValueError(f"Unsupported evidence index shape in {path}")
+
+
 def ensure_text(path: Path, content: str = "") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -81,6 +90,10 @@ def suite_stderr_path(artifact_root: Path, suite: str) -> Path:
 
 def suite_report_markdown_path(report_root: Path, suite: str) -> Path:
     return report_root / "suites" / f"{suite}.md"
+
+
+def iter_suite_report_artifacts(artifact_root: Path) -> list[Path]:
+    return sorted((artifact_root / "suites").glob("*/report.json"))
 
 
 def build_assertion(
